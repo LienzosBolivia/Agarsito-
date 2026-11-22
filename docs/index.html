@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="es">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Retoque local · Diagnóstico</title>
+<style>
+body{font:1rem system-ui;background:#f5f1e9;color:#222c27;margin:0}
+main{max-width:38rem;margin:12vh auto;padding:1.5rem}
+h1{font-size:clamp(2rem,8vw,3.5rem);line-height:1.05}
+button{padding:.8rem 1.2rem;background:#244e3e;color:white;border:0;border-radius:.5rem;font:inherit}
+dd{margin:0 0 .8rem}dt{font-weight:700}p{line-height:1.5}
+</style>
+<main>
+<h1>Diagnóstico de GPU</h1>
+<p>Comprueba si tu navegador puede ejecutar una operación WebGPU en segundo plano. La prueba no usa fotos ni mide la VRAM libre.</p>
+<button id="run">Probar este dispositivo</button>
+<p id="status" role="status"></p>
+<dl id="result"></dl>
+</main>
+<script id="worker" type="text/plain">
+self.onmessage = async () => {
+  let device, buffer;
+  let report = {};
+  try {
+    const adapter = await self.navigator.gpu?.requestAdapter();
+    if (!adapter) {
+      self.postMessage({status: 'WebGPU no disponible en este navegador.', report});
+      return;
+    }
+    device = await adapter.requestDevice();
+    report = {
+      'FP16 disponible en el adaptador': adapter.features.has('shader-f16') ? 'Sí' : 'No',
+      'Límite por búfer del adaptador': adapter.limits.maxBufferSize / 1048576 + ' MiB',
+      'Límite por enlace de almacenamiento': adapter.limits.maxStorageBufferBindingSize / 1048576 + ' MiB'
+    };
+    const bytes = 8 * 1048576;
+    device.pushErrorScope('out-of-memory');
+    device.pushErrorScope('validation');
+    let validation, memory;
+    try {
+      buffer = device.createBuffer({size: bytes, usage: GPUBufferUsage.COPY_DST});
+      const encoder = device.createCommandEncoder();
+      encoder.clearBuffer(buffer);
+      device.queue.submit([encoder.finish()]);
+      await device.queue.onSubmittedWorkDone();
+    } finally {
+      const validationResult = device.popErrorScope();
+      const memoryResult = device.popErrorScope();
+      [validation, memory] = await Promise.all([validationResult, memoryResult]);
+    }
+    if (validation || memory) throw new Error((validation || memory).message);
+    self.postMessage({status: 'WebGPU completó la prueba de 8 MiB.', report});
+  } catch (error) {
+    self.postMessage({status: 'WebGPU no pudo completar la prueba. ' + error.message, report});
+  } finally {
+    buffer?.destroy();
+    device?.destroy();
+  }
+};
+</script>
+<script>
+const button = document.querySelector('#run');
+const status = document.querySelector('#status');
+const result = document.querySelector('#result');
+button.onclick = () => {
+  const url = URL.createObjectURL(new Blob([document.querySelector('#worker').textContent], {type: 'text/javascript'}));
+  let worker, timeout;
+  button.disabled = true;
+  result.replaceChildren();
+  status.textContent = 'Probando WebGPU…';
+  function finish(message, report = {}) {
+    clearTimeout(timeout);
+    worker?.terminate();
+    URL.revokeObjectURL(url);
+    status.textContent = message;
+    for (const [label, value] of Object.entries(report)) {
+      const term = document.createElement('dt');
+      const detail = document.createElement('dd');
+      term.textContent = label;
+      detail.textContent = value;
+      result.append(term, detail);
+    }
+    button.disabled = false;
+  }
+  try {
+    worker = new Worker(url);
+    worker.onmessage = ({data}) => finish(data.status, data.report);
+    worker.onerror = () => finish('El navegador no pudo ejecutar el diagnóstico.');
+    timeout = setTimeout(() => finish('La prueba superó los 12 segundos.'), 12000);
+    worker.postMessage(null);
+  } catch {
+    finish('El navegador no pudo iniciar el diagnóstico.');
+  }
+};
+</script>
+</html>
