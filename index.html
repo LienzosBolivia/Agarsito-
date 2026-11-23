@@ -19,7 +19,7 @@ input{display:block;margin:1rem 0;max-width:100%}
 <p>Probá U²-Net con una foto de hasta 20 MB y 16 megapíxeles. El procesamiento se realiza en este navegador.</p>
 <label for="photo">Elegí una foto</label>
 <input id="photo" type="file" accept="image/*">
-<p><label for="fine"><input id="fine" type="checkbox" checked> Bordes finos y reducción de halo</label></p>
+<p><label for="fine"><input id="fine" type="checkbox" checked> Bordes finos y limpieza de halo por color local</label></p>
 <button id="cut" disabled>Quitar fondo</button>
 <button id="cut-cpu" disabled>Probar en CPU</button>
 <p id="photo-status" role="status"></p>
@@ -171,9 +171,64 @@ function nearestSeeds(prior, side, foreground) {
   return {seeds, distance};
 }
 
+function localColors(guide, prior, side, isSubject) {
+  const colors = new Float32Array(prior.length * 3);
+  const chroma = new Float32Array(prior.length * 2);
+  const spread = new Float32Array(prior.length);
+  for (let i = 0; i < prior.length; i++) {
+    if (isSubject ? prior[i] < 0.97 : prior[i] > 0.03) continue;
+    const x = i % side;
+    const y = Math.floor(i / side);
+    let count = 0;
+    let sumU = 0;
+    let sumV = 0;
+    let sumSquares = 0;
+    for (let sy = Math.max(0, y - 2); sy <= Math.min(side - 1, y + 2); sy++) {
+      for (let sx = Math.max(0, x - 2); sx <= Math.min(side - 1, x + 2); sx++) {
+        const j = sy * side + sx;
+        if (isSubject ? prior[j] < 0.97 : prior[j] > 0.03) continue;
+        const r = guide[j * 4], g = guide[j * 4 + 1], b = guide[j * 4 + 2];
+        colors[i * 3] += r;
+        colors[i * 3 + 1] += g;
+        colors[i * 3 + 2] += b;
+        const total = r + g + b + 32;
+        const u = (r - g) / total;
+        const v = (b - g) / total;
+        sumU += u;
+        sumV += v;
+        sumSquares += u * u + v * v;
+        count++;
+      }
+    }
+    for (let c = 0; c < 3; c++) colors[i * 3 + c] /= count;
+    chroma[i * 2] = sumU / count;
+    chroma[i * 2 + 1] = sumV / count;
+    spread[i] = Math.max(0, sumSquares / count - (sumU ** 2 + sumV ** 2) / count ** 2);
+  }
+  return {colors, chroma, spread};
+}
+
+function backgroundMatch(data, pixel, subject, f, background, b) {
+  const fu = subject.chroma[f * 2], fv = subject.chroma[f * 2 + 1];
+  const bu = background.chroma[b * 2], bv = background.chroma[b * 2 + 1];
+  const separation = (fu - bu) ** 2 + (fv - bv) ** 2;
+  const tolerance = 0.0025 + subject.spread[f] + background.spread[b];
+  const total = data[pixel] + data[pixel + 1] + data[pixel + 2] + 32;
+  if (separation < 4 * tolerance || total < 80) return 0;
+  const u = (data[pixel] - data[pixel + 1]) / total;
+  const v = (data[pixel + 2] - data[pixel + 1]) / total;
+  const toSubject = (u - fu) ** 2 + (v - fv) ** 2;
+  const toBackground = (u - bu) ** 2 + (v - bv) ** 2;
+  const nearBackground = Math.max(0, 1 - toBackground / (2 * tolerance));
+  const advantage = Math.max(0, Math.min(1, (toSubject - toBackground) / separation));
+  return nearBackground * advantage;
+}
+
 function refineEdges(context, guide, prior, side, width, height) {
   const foreground = nearestSeeds(prior, side, true);
   const background = nearestSeeds(prior, side, false);
+  const subjectColors = localColors(guide, prior, side, true);
+  const backgroundColors = localColors(guide, prior, side, false);
   const clamp = value => Math.max(0, Math.min(1, value));
   // Work in strips so the full-resolution RGBA buffer is never copied at once.
   for (let top = 0; top < height; top += 64) {
@@ -191,38 +246,44 @@ function refineEdges(context, guide, prior, side, width, height) {
         const x1 = Math.min(side - 1, x0 + 1);
         const rx = sx - x0;
         const i = row + Math.round(sx);
-        const f = foreground.seeds[i] * 4;
-        const b = background.seeds[i] * 4;
+        const f = foreground.seeds[i];
+        const b = background.seeds[i];
         const pixel = (y * width + x) * 4;
         const near = prior[y0 * side + x0] * (1 - rx) + prior[y0 * side + x1] * rx;
         const far = prior[y1 * side + x0] * (1 - rx) + prior[y1 * side + x1] * rx;
         let alpha = near * (1 - ry) + far * ry;
         let confidence = 0;
         if (f >= 0 && b >= 0 && (alpha > 0.03 && alpha < 0.97 || Math.min(foreground.distance[i] || 99, background.distance[i] || 99) <= 3)) {
+          const nearSubject = foreground.distance[i];
+          const nearBackground = background.distance[i];
+          const match = backgroundMatch(data, pixel, subjectColors, f, backgroundColors, b);
+          const edgeWeight = clamp(1 - nearBackground / 15);
+          const cleanup = alpha < 0.97 && nearSubject > 0 ? match * edgeWeight : 0;
           let contrast = 0;
           let projection = 0;
           for (let c = 0; c < 3; c++) {
-            const difference = guide[f + c] - guide[b + c];
+            const difference = subjectColors.colors[f * 3 + c] - backgroundColors.colors[b * 3 + c];
             contrast += difference * difference;
-            projection += (data[pixel + c] - guide[b + c]) * difference;
+            projection += (data[pixel + c] - backgroundColors.colors[b * 3 + c]) * difference;
           }
           if (contrast > 400) {
             const estimated = clamp(projection / contrast);
             let residual = 0;
             for (let c = 0; c < 3; c++) {
-              const predicted = guide[b + c] + estimated * (guide[f + c] - guide[b + c]);
+              const predicted = backgroundColors.colors[b * 3 + c] + estimated * (subjectColors.colors[f * 3 + c] - backgroundColors.colors[b * 3 + c]);
               residual += (data[pixel + c] - predicted) ** 2;
             }
             confidence = 0.9 * clamp((contrast - 400) / 2800) * clamp(1 - residual / 4800);
             alpha += confidence * (estimated - alpha);
           }
+          alpha *= 1 - cleanup;
         }
         if (alpha >= 0.97) continue;
         if (alpha <= 0.035) alpha = 0;
         if (confidence > 0 && alpha > 0.08 && alpha < 0.95) {
           for (let c = 0; c < 3; c++) {
             const original = data[pixel + c];
-            const recovered = (original - (1 - alpha) * guide[b + c]) / Math.max(alpha, 0.22);
+            const recovered = (original - (1 - alpha) * backgroundColors.colors[b * 3 + c]) / Math.max(alpha, 0.22);
             const correction = Math.max(-65, Math.min(65, recovered - original));
             data[pixel + c] = original + confidence * correction;
           }
