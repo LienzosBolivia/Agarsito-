@@ -43,6 +43,8 @@ input{display:block;margin:1rem 0;max-width:100%}
 <button id="mark-hair" aria-pressed="false">Marcar cabello</button>
 <button id="clear-hair" disabled>Borrar marcas</button>
 <button id="apply-hair" disabled>Integrar cabello</button>
+<button id="generate-hair" disabled>Reconstruir borde con IA</button>
+<p>MI-GAN se descarga al usar esta opción (28,1 MB). La foto se procesa en el dispositivo.</p>
 </div>
 <a id="save-composite" download="foto-con-fondo.png" hidden>Descargar foto con fondo</a>
 </section>
@@ -81,7 +83,7 @@ function fitHairColor(pixels, pixel, guide, hair, original, background) {
   return {coverage, confidence};
 }
 
-function integrateHair(ctx, subject, originalPhoto, width, height, strokes) {
+function integrateHair(ctx, subject, originalPhoto, width, height, strokes, generate) {
   const scale = Math.min(1, 480 / Math.max(width, height));
   const w = Math.max(1, Math.round(width * scale));
   const h = Math.max(1, Math.round(height * scale));
@@ -111,6 +113,7 @@ function integrateHair(ctx, subject, originalPhoto, width, height, strokes) {
   const seeds = new Int32Array(w * h).fill(-1);
   const strength = new Float32Array(w * h);
   const backgroundSeeds = new Int32Array(w * h).fill(-1);
+  const weights = generate ? new Uint8Array(w * h) : null;
   let anchors = 0;
   const alphaAt = (x, y) => guide[(Math.min(h - 1, Math.max(0, y)) * w + Math.min(w - 1, Math.max(0, x))) * 4 + 3];
   const clamp = value => Math.max(0, Math.min(1, value));
@@ -147,6 +150,9 @@ function integrateHair(ctx, subject, originalPhoto, width, height, strokes) {
       }
       if (backgroundSeeds[i] >= 0) {
         const fit = fitHairColor(originalGuide, i * 4, guide, seeds[i] * 4, originalGuide, backgroundSeeds[i] * 4);
+        if (weights && a >= 22 && a < 225 && fit.confidence > 0.38 && fit.coverage < 0.56) {
+          weights[i] = Math.round(225 * Math.min(1, (0.62 - fit.coverage) * 2.4) * fit.confidence);
+        }
         if (fit.confidence > 0.45 && fit.coverage < 0.18) continue;
       }
       if (a < 74 || a > 182 || (x * 37 + y * 59) % 19 !== 0) continue;
@@ -221,10 +227,107 @@ function integrateHair(ctx, subject, originalPhoto, width, height, strokes) {
     tileContext.putImageData(strip, 0, 0);
     ctx.drawImage(tile, 0, 0, width, rows, 0, top, width, rows);
   }
-  return true;
+  return {weights, w, h};
 }
 
-self.onmessage = async ({data: {cutout, background, strokes, original}}) => {
+async function regenerateEdge(ctx, edge, subject, width, height) {
+  const {weights, w, h} = edge;
+  let left = w, top = h, right = -1, bottom = -1;
+  for (let i = 0; i < weights.length; i++) {
+    if (!weights[i]) continue;
+    const x = i % w;
+    const y = Math.floor(i / w);
+    left = Math.min(left, x);
+    top = Math.min(top, y);
+    right = Math.max(right, x);
+    bottom = Math.max(bottom, y);
+  }
+  if (right < 0) return false;
+  // Keep some unmasked hair and new background as context.
+  const x0 = Math.max(0, Math.floor((left - 20) * width / w));
+  const y0 = Math.max(0, Math.floor((top - 20) * height / h));
+  const cropWidth = Math.min(width, Math.ceil((right + 21) * width / w)) - x0;
+  const cropHeight = Math.min(height, Math.ceil((bottom + 21) * height / h)) - y0;
+  const scale = Math.min(1, 512 / Math.max(cropWidth, cropHeight));
+  const cw = Math.max(1, Math.round(cropWidth * scale));
+  const ch = Math.max(1, Math.round(cropHeight * scale));
+  const plane = cw * ch;
+  const tile = new OffscreenCanvas(cw, ch);
+  const sample = tile.getContext('2d', {willReadFrequently: true});
+  sample.drawImage(ctx.canvas, x0, y0, cropWidth, cropHeight, 0, 0, cw, ch);
+  const input = sample.getImageData(0, 0, cw, ch);
+  const image = new Uint8Array(plane * 3);
+  const mask = new Uint8Array(plane).fill(255);
+  const alpha = new Uint8Array(plane);
+  let holes = 0;
+  for (let y = 0; y < ch; y++) {
+    const gy = Math.min(h - 1, Math.floor((y0 + (y + 0.5) * cropHeight / ch) * h / height));
+    for (let x = 0; x < cw; x++) {
+      const gx = Math.min(w - 1, Math.floor((x0 + (x + 0.5) * cropWidth / cw) * w / width));
+      const i = y * cw + x;
+      for (let c = 0; c < 3; c++) image[c * plane + i] = input.data[4 * i + c];
+      alpha[i] = weights[gy * w + gx];
+      if (alpha[i]) { mask[i] = 0; holes++; }
+    }
+  }
+  if (!holes) return false;
+  const runtime = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
+  self.postMessage({progress: 'Cargando MI-GAN (28,1 MB) para reconstruir el borde…'});
+  const ort = await import(runtime + 'ort.wasm.min.mjs');
+  ort.env.wasm.wasmPaths = runtime;
+  ort.env.wasm.numThreads = 1;
+  const response = await fetch('https://huggingface.co/edgetools/migan/resolve/main/migan_pipeline_v2.onnx');
+  if (!response.ok) throw new Error('No se pudo descargar MI-GAN (HTTP ' + response.status + ').');
+  const model = await response.arrayBuffer();
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', model));
+  const checksum = Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join('');
+  if (checksum !== '6f1f3530a1a2324b19752018ce756088b07973cda8d7d890034ace5c8a48c40b') {
+    throw new Error('La descarga de MI-GAN no coincide con la versión verificada.');
+  }
+  const session = await ort.InferenceSession.create(model, {executionProviders: ['wasm']});
+  const imageTensor = new ort.Tensor('uint8', image, [1, 3, ch, cw]);
+  const maskTensor = new ort.Tensor('uint8', mask, [1, 1, ch, cw]);
+  let outputs;
+  try {
+    self.postMessage({progress: 'MI-GAN está reconstruyendo la zona marcada…'});
+    outputs = await session.run({image: imageTensor, mask: maskTensor});
+    const result = outputs.result;
+    if (!result || result.dims.join(',') !== [1, 3, ch, cw].join(',')) {
+      throw new Error('MI-GAN devolvió un formato inesperado.');
+    }
+    const patch = sample.createImageData(cw, ch);
+    for (let i = 0; i < plane; i++) {
+      for (let c = 0; c < 3; c++) patch.data[4 * i + c] = result.data[c * plane + i];
+      patch.data[4 * i + 3] = alpha[i];
+    }
+    sample.putImageData(patch, 0, 0);
+    // Nearest-neighbor keeps the edit inside the selected low-resolution cells.
+    const band = new OffscreenCanvas(cropWidth, Math.min(64, cropHeight)).getContext('2d', {willReadFrequently: true});
+    band.imageSmoothingEnabled = false;
+    for (let row = 0; row < cropHeight; row += 64) {
+      const rows = Math.min(64, cropHeight - row);
+      band.clearRect(0, 0, cropWidth, rows);
+      band.drawImage(subject, x0, y0 + row, cropWidth, rows, 0, 0, cropWidth, rows);
+      const protectedPixels = band.getImageData(0, 0, cropWidth, rows).data;
+      band.clearRect(0, 0, cropWidth, rows);
+      band.drawImage(tile, 0, -row, cropWidth, cropHeight);
+      const patchBand = band.getImageData(0, 0, cropWidth, rows);
+      for (let p = 3; p < patchBand.data.length; p += 4) {
+        if (protectedPixels[p] >= 245) patchBand.data[p] = 0;
+      }
+      band.putImageData(patchBand, 0, 0);
+      ctx.drawImage(band.canvas, 0, 0, cropWidth, rows, x0, y0 + row, cropWidth, rows);
+    }
+    return true;
+  } finally {
+    imageTensor.dispose();
+    maskTensor.dispose();
+    for (const output of Object.values(outputs || {})) output.dispose();
+    await session.release();
+  }
+}
+
+self.onmessage = async ({data: {cutout, background, strokes, original, generate}}) => {
   let subject, backdrop, originalPhoto;
   try {
     subject = await createImageBitmap(cutout);
@@ -248,11 +351,14 @@ self.onmessage = async ({data: {cutout, background, strokes, original}}) => {
       originalPhoto = await createImageBitmap(original);
       if (originalPhoto.width !== width || originalPhoto.height !== height) throw new Error('La foto original y el recorte tienen dimensiones distintas.');
     }
-    const integrated = strokes.length > 0 && integrateHair(ctx, subject, originalPhoto, width, height, strokes);
+    const integrated = strokes.length > 0 && integrateHair(ctx, subject, originalPhoto, width, height, strokes, generate);
     if (!integrated) ctx.drawImage(subject, 0, 0);
+    originalPhoto?.close();
+    originalPhoto = undefined;
+    const generated = !!(generate && integrated && await regenerateEdge(ctx, integrated, subject, width, height));
     subject.close();
     subject = undefined;
-    self.postMessage({image: await canvas.convertToBlob({type: 'image/png'}), integrated});
+    self.postMessage({image: await canvas.convertToBlob({type: 'image/png'}), integrated: !!integrated, generated});
   } catch (error) {
     self.postMessage({error: error.message});
   } finally {
@@ -678,6 +784,7 @@ const hairTools = document.querySelector('#hair-tools');
 const markHair = document.querySelector('#mark-hair');
 const clearHair = document.querySelector('#clear-hair');
 const applyHair = document.querySelector('#apply-hair');
+const generateHair = document.querySelector('#generate-hair');
 const guideCanvas = document.querySelector('#hair-guide');
 let strokes = [];
 let activeStroke;
@@ -690,6 +797,7 @@ function refreshHairControls() {
   guideCanvas.hidden = !marking;
   clearHair.disabled = composing || !strokes.length;
   applyHair.disabled = composing || !strokes.length;
+  generateHair.disabled = applyHair.disabled;
   markHair.disabled = composing;
 }
 function drawStrokes() {
@@ -778,7 +886,10 @@ composeButton.onclick = () => {
 applyHair.onclick = () => {
   if (!applyHair.disabled) composeBackground(strokes);
 };
-function composeBackground(selectedStrokes) {
+generateHair.onclick = () => {
+  if (!generateHair.disabled) composeBackground(strokes, true);
+};
+function composeBackground(selectedStrokes, generate = false) {
   composing = true;
   marking = false;
   refreshHairControls();
@@ -787,7 +898,7 @@ function composeBackground(selectedStrokes) {
   const code = document.querySelector('#compose-worker').textContent;
   const url = URL.createObjectURL(new Blob([code], {type: 'text/javascript'}));
   let worker, timeout;
-  const finish = ({image, error, integrated}) => {
+  const finish = ({image, error, integrated, generated}) => {
     worker?.terminate();
     clearTimeout(timeout);
     URL.revokeObjectURL(url);
@@ -805,14 +916,17 @@ function composeBackground(selectedStrokes) {
     composite.closest('figure').hidden = false;
     saveComposite.href = compositeUrl;
     saveComposite.hidden = false;
-    composeStatus.textContent = integrated ? 'Composición con cabello integrado y halo corregido.' : selectedStrokes.length ? 'Marcá una zona donde el cabello toque el fondo.' : 'Fondo aplicado. Ya podés marcar el cabello.';
+    composeStatus.textContent = generated ? 'Borde reconstruido con MI-GAN.' : generate ? 'No se detectaron restos de fondo con suficiente confianza para reconstruir.' : integrated ? 'Composición con cabello integrado y halo corregido.' : selectedStrokes.length ? 'Marcá una zona donde el cabello toque el fondo.' : 'Fondo aplicado. Ya podés marcar el cabello.';
   };
   try {
     worker = new Worker(url);
-    worker.onmessage = ({data}) => finish(data);
+    worker.onmessage = ({data}) => {
+      if (data.progress) composeStatus.textContent = data.progress;
+      else finish(data);
+    };
     worker.onerror = () => finish({error: 'El navegador interrumpió la composición.'});
-    timeout = setTimeout(() => finish({error: 'La composición superó el tiempo límite.'}), 45000);
-    worker.postMessage({cutout: cutoutBlob, background: background.files[0], strokes: selectedStrokes, original: picker.files[0]});
+    timeout = setTimeout(() => finish({error: 'La composición superó el tiempo límite.'}), generate ? 150000 : 45000);
+    worker.postMessage({cutout: cutoutBlob, background: background.files[0], strokes: selectedStrokes, original: picker.files[0], generate});
   } catch (error) {
     finish({error: error.message});
   }
