@@ -9,9 +9,23 @@ main{max-width:38rem;margin:12vh auto;padding:1.5rem}
 h1{font-size:clamp(2rem,8vw,3.5rem);line-height:1.05}
 button{padding:.8rem 1.2rem;background:#244e3e;color:white;border:0;border-radius:.5rem;font:inherit}
 dd{margin:0 0 .8rem}dt{font-weight:700}p{line-height:1.5}
+.previews{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,14rem),1fr));gap:1rem;margin:1rem 0}
+figure{margin:0;min-width:0} figure img{width:100%;max-height:24rem;object-fit:contain;background:repeating-conic-gradient(#ddd 0 25%,#fff 0 50%) 0 0/20px 20px}
+input{display:block;margin:1rem 0;max-width:100%}
 </style>
 <main>
-<h1>Diagnóstico de GPU</h1>
+<h1>Quitar fondo</h1>
+<p>Probá U²-Net con una foto de hasta 20 MB y 16 megapíxeles. El procesamiento se realiza en este navegador.</p>
+<label for="photo">Elegí una foto</label>
+<input id="photo" type="file" accept="image/*">
+<button id="cut" disabled>Quitar fondo</button>
+<p id="photo-status" role="status"></p>
+<div class="previews">
+<figure hidden><figcaption>Original</figcaption><img id="before" alt="Foto original"></figure>
+<figure hidden><figcaption>Fondo transparente</figcaption><img id="after" alt="Foto recortada"></figure>
+</div>
+<a id="download" download="foto-sin-fondo.png" hidden>Descargar PNG transparente</a>
+<h2>Diagnóstico de GPU</h2>
 <p>Ejecuta una convolución sintética en cuatro tamaños hasta 2048 × 2048. El resultado muestra la mayor carga completada en esta prueba. La VRAM libre y el rendimiento de un modelo ONNX requieren mediciones distintas.</p>
 <button id="run">Probar este dispositivo y el modelo</button>
 <p id="status" role="status"></p>
@@ -26,7 +40,7 @@ dd{margin:0 0 .8rem}dt{font-weight:700}p{line-height:1.5}
 </dl>
 <p id="decision" role="status"></p>
 <script id="model-worker" type="text/plain">
-self.onmessage = async ({data: backend}) => {
+self.onmessage = async ({data: {backend, photo}}) => {
 const runtimeBase = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
 const modelURL = 'https://huggingface.co/nfa04/u2netp-onnx/resolve/main/u2netp.onnx';
 // Equivalencia para MaxPool 2×2, stride 2 y sin padding explícito.
@@ -52,8 +66,14 @@ async function sha256(bytes) {
   const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
   return Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join('');
 }
-let session, input, outputs;
+let session, input, outputs, bitmap;
 try {
+  if (photo) {
+    bitmap = await createImageBitmap(photo);
+    if (bitmap.width * bitmap.height > 16000000 || Math.max(bitmap.width, bitmap.height) > 8192) {
+      throw new Error('La foto supera 16 megapíxeles o 8192 píxeles por lado.');
+    }
+  }
   const ort = await import(runtimeBase + (backend === 'webgpu' ? 'ort.webgpu.min.mjs' : 'ort.wasm.min.mjs'));
   ort.env.wasm.wasmPaths = runtimeBase;
   ort.env.wasm.numThreads = 1;
@@ -75,7 +95,23 @@ try {
   });
   const side = 320;
   const pixels = new Float32Array(3 * side * side);
-  for (let y = 80; y < 240; y++) {
+  if (bitmap) {
+    const sample = new OffscreenCanvas(side, side).getContext('2d', {willReadFrequently: true});
+    sample.imageSmoothingQuality = 'high';
+    sample.drawImage(bitmap, 0, 0, side, side);
+    const rgba = sample.getImageData(0, 0, side, side).data;
+    const means = [0.485, 0.456, 0.406];
+    const deviations = [0.229, 0.224, 0.225];
+    let maximum = 1;
+    for (let i = 0; i < rgba.length; i += 4) {
+      maximum = Math.max(maximum, rgba[i], rgba[i + 1], rgba[i + 2]);
+    }
+    for (let channel = 0; channel < 3; channel++) {
+      for (let i = 0; i < side * side; i++) {
+        pixels[channel * side * side + i] = (rgba[4 * i + channel] / maximum - means[channel]) / deviations[channel];
+      }
+    }
+  } else for (let y = 80; y < 240; y++) {
     for (let channel = 0; channel < 3; channel++) {
       pixels.fill(1, (channel * side + y) * side + 80, (channel * side + y) * side + 240);
     }
@@ -88,10 +124,43 @@ try {
   if (mask.length !== side * side || !mask.every(Number.isFinite)) {
     throw new Error('La máscara ONNX no pasó la validación.');
   }
-  self.postMessage({ok: true, message: 'Inferencia completada en ' + (backend === 'webgpu' ? 'WebGPU' : 'CPU/WASM') + ' en ' + Math.round(elapsed) + ' ms. Archivo ONNX verificado: ' + downloadMiB.toFixed(2) + ' MiB.'});
+  let png;
+  if (bitmap) {
+    let low = Infinity;
+    let high = -Infinity;
+    for (const value of mask) {
+      low = Math.min(low, value);
+      high = Math.max(high, value);
+    }
+    if (high <= low) throw new Error('El modelo devolvió una máscara sin variación.');
+    const alphaCanvas = new OffscreenCanvas(side, side);
+    const alphaContext = alphaCanvas.getContext('2d');
+    const alpha = alphaContext.createImageData(side, side);
+    for (let i = 0; i < mask.length; i++) {
+      alpha.data[4 * i + 3] = (mask[i] - low) * 255 / (high - low);
+    }
+    alphaContext.putImageData(alpha, 0, 0);
+    outputs[session.outputNames[0]].dispose();
+    outputs = undefined;
+    input.dispose();
+    input = undefined;
+    await session.release();
+    session = undefined;
+    const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+    const context = canvas.getContext('2d');
+    context.drawImage(bitmap, 0, 0);
+    bitmap.close();
+    bitmap = undefined;
+    context.globalCompositeOperation = 'destination-in';
+    context.imageSmoothingQuality = 'high';
+    context.drawImage(alphaCanvas, 0, 0, canvas.width, canvas.height);
+    png = await canvas.convertToBlob({type: 'image/png'});
+  }
+  self.postMessage({ok: true, png, message: 'Inferencia completada en ' + (backend === 'webgpu' ? 'WebGPU' : 'CPU/WASM') + ' en ' + Math.round(elapsed) + ' ms. Archivo ONNX verificado: ' + downloadMiB.toFixed(2) + ' MiB.'});
 } catch (error) {
   self.postMessage({message: 'No se completó la prueba del modelo. ' + error.message});
 } finally {
+  bitmap?.close();
   input?.dispose();
   for (const tensor of Object.values(outputs || {})) tensor.dispose();
   await session?.release();
@@ -186,6 +255,55 @@ const storageKey = 'agarsito-gpu-convolution-v2';
 const decision = document.querySelector('#decision');
 const budget = document.querySelector('#budget');
 let profile;
+const picker = document.querySelector('#photo');
+const cut = document.querySelector('#cut');
+const photoStatus = document.querySelector('#photo-status');
+const before = document.querySelector('#before');
+const after = document.querySelector('#after');
+const download = document.querySelector('#download');
+let originalUrl, outputUrl;
+
+function clearOutput() {
+  if (outputUrl) URL.revokeObjectURL(outputUrl);
+  outputUrl = undefined;
+  after.removeAttribute('src');
+  after.parentElement.hidden = true;
+  download.hidden = true;
+  download.removeAttribute('href');
+}
+function busy(value) {
+  button.disabled = value;
+  picker.disabled = value;
+  cut.disabled = value || !picker.files[0] || picker.files[0].size > 20000000;
+}
+picker.onchange = () => {
+  clearOutput();
+  if (originalUrl) URL.revokeObjectURL(originalUrl);
+  before.removeAttribute('src');
+  before.parentElement.hidden = true;
+  const file = picker.files[0];
+  photoStatus.textContent = '';
+  if (file && file.size <= 20000000) {
+    originalUrl = URL.createObjectURL(file);
+    before.src = originalUrl;
+    before.parentElement.hidden = false;
+  } else if (file) {
+    photoStatus.textContent = 'La foto supera el límite de 20 MB.';
+  }
+  busy(false);
+};
+cut.onclick = () => {
+  const file = picker.files[0];
+  if (!file || file.size > 20000000 || cut.disabled) return;
+  clearOutput();
+  if (profile) {
+    busy(true);
+    testModel(file);
+  } else {
+    photoStatus.textContent = 'Comprobando WebGPU antes de procesar la foto…';
+    startDiagnostic(file);
+  }
+};
 function updateProfile(next) {
   profile = next;
   budget.textContent = profile
@@ -194,51 +312,59 @@ function updateProfile(next) {
 }
 const pendingGpuKey = 'agarsito-u2netp-webgpu-adapted-pending';
 
-function testModel() {
+function testModel(photo) {
   let interrupted = false;
   try {
     interrupted = localStorage.getItem(pendingGpuKey) === '1';
     localStorage.removeItem(pendingGpuKey);
   } catch {}
   if (interrupted) {
-    runModel('wasm', 'La prueba WebGPU anterior se interrumpió. ');
+    runModel('wasm', 'La prueba WebGPU anterior se interrumpió. ', photo);
   } else if (profile?.probeMiB >= 32) {
-    runModel('webgpu');
+    runModel('webgpu', '', photo);
   } else {
-    runModel('wasm', 'El diagnóstico no completó los 32 MiB requeridos por este filtro inicial. ');
+    runModel('wasm', 'El diagnóstico no habilitó WebGPU. ', photo);
   }
 }
 
-function runModel(backend, note = '') {
+function runModel(backend, note = '', photo) {
+  const feedback = photo ? photoStatus : decision;
   const gpu = backend === 'webgpu';
   const name = gpu ? 'WebGPU' : 'CPU/WASM';
-  decision.textContent = note + 'Cargando U²-Net pequeño en ' + name + '…';
+  feedback.textContent = note + 'Cargando U²-Net pequeño en ' + name + '…';
   if (gpu) {
     try { localStorage.setItem(pendingGpuKey, '1'); } catch {}
   }
   const code = document.querySelector('#model-worker').textContent;
   const url = URL.createObjectURL(new Blob([code], {type: 'text/javascript'}));
   let worker, timeout;
-  const finish = ({ok, message}) => {
+  const finish = ({ok, message, png}) => {
     clearTimeout(timeout);
     worker?.terminate();
     URL.revokeObjectURL(url);
     if (gpu) {
       try { localStorage.removeItem(pendingGpuKey); } catch {}
       if (!ok) {
-        runModel('wasm', 'WebGPU falló: ' + message + ' ');
+        runModel('wasm', 'WebGPU falló: ' + message + ' ', photo);
         return;
       }
     }
-    decision.textContent = note + message;
-    button.disabled = false;
+    feedback.textContent = note + message;
+    if (png) {
+      outputUrl = URL.createObjectURL(png);
+      after.src = outputUrl;
+      after.parentElement.hidden = false;
+      download.href = outputUrl;
+      download.hidden = false;
+    }
+    busy(false);
   };
   try {
     worker = new Worker(url, {type: 'module'});
     worker.onmessage = ({data}) => finish(data);
     worker.onerror = () => finish({message: 'El navegador interrumpió el worker.'});
     timeout = setTimeout(() => finish({message: 'La prueba superó el tiempo límite.'}), gpu ? 45000 : 90000);
-    worker.postMessage(backend);
+    worker.postMessage({backend, photo});
   } catch (error) {
     finish({message: error.message});
   }
@@ -250,10 +376,11 @@ try {
     updateProfile(saved.profile);
   }
 } catch {}
-button.onclick = () => {
+button.onclick = () => startDiagnostic();
+function startDiagnostic(photo) {
   const url = URL.createObjectURL(new Blob([document.querySelector('#worker').textContent], {type: 'text/javascript'}));
   let worker, timeout, latestReport = {};
-  button.disabled = true;
+  busy(true);
   decision.textContent = '';
   updateProfile(null);
   try { localStorage.removeItem(storageKey); } catch {}
@@ -271,7 +398,7 @@ button.onclick = () => {
       detail.textContent = value;
       result.append(term, detail);
     }
-    testModel();
+    testModel(photo);
   }
   try {
     worker = new Worker(url);
