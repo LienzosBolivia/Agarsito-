@@ -16,6 +16,19 @@ dd{margin:0 0 .8rem}dt{font-weight:700}p{line-height:1.5}
 <button id="run">Probar este dispositivo</button>
 <p id="status" role="status"></p>
 <dl id="result"></dl>
+<section>
+<h2>Presupuesto del modelo</h2>
+<p id="budget" aria-live="polite">Ejecutá el diagnóstico para calcular el presupuesto.</p>
+<form id="estimate">
+<p>Ingresá valores estimados para una variante y un tamaño de entrada. Usá pesos residentes, pico de activaciones y memoria adicional del motor, en MiB.</p>
+<p><label>Pesos residentes <input name="weights" type="number" min="0.01" step="any" required></label></p>
+<p><label>Pico de activaciones <input name="activations" type="number" min="0.01" step="any" required></label></p>
+<p><label>Búferes adicionales del motor, entrada y salida <input name="workspace" type="number" min="0.01" step="any" required></label></p>
+<p><label><input name="fp16" type="checkbox"> La variante requiere FP16 nativo</label></p>
+<button id="calculate" disabled>Evaluar modelo</button>
+</form>
+<p id="decision" role="status"></p>
+</section>
 </main>
 <script id="worker" type="text/plain">
 const shader = `
@@ -84,12 +97,12 @@ self.onmessage = async () => {
       if (lost) throw new Error('Se perdió el dispositivo WebGPU.');
       lastPassed = side;
       report[side + ' × ' + side] = (bytes * 2 / 1048576) + ' MiB en búferes · ' + Math.round(performance.now() - start) + ' ms';
-      self.postMessage({progress: true, report});
+      self.postMessage({progress: true, report, lastPassed});
     }
-    self.postMessage({status: lastPassed ? 'Mayor carga completada: ' + lastPassed + ' × ' + lastPassed + '.' : 'El adaptador no admite la primera carga.', report});
+    self.postMessage({status: lastPassed ? 'Mayor carga completada: ' + lastPassed + ' × ' + lastPassed + '.' : 'El adaptador no admite la primera carga.', report, lastPassed});
   } catch (error) {
     const prefix = lastPassed ? 'Mayor carga completada: ' + lastPassed + ' × ' + lastPassed + '. ' : '';
-    self.postMessage({status: prefix + (lost ? 'Se perdió el dispositivo WebGPU.' : error.message), report});
+    self.postMessage({status: prefix + (lost ? 'Se perdió el dispositivo WebGPU.' : error.message), report, lastPassed: lost ? null : lastPassed});
   } finally {
     device?.destroy();
   }
@@ -99,15 +112,51 @@ self.onmessage = async () => {
 const button = document.querySelector('#run');
 const status = document.querySelector('#status');
 const result = document.querySelector('#result');
-const storageKey = 'agarsito-gpu-convolution-v1';
+const storageKey = 'agarsito-gpu-convolution-v2';
+function estimateMemory(probeMiB, weights, activations, workspace) {
+  const budget = probeMiB * 0.7;
+  const peak = weights + activations + workspace;
+  return {budget, peak, fits: peak <= budget};
+}
+const estimate = document.querySelector('#estimate');
+const calculate = document.querySelector('#calculate');
+const decision = document.querySelector('#decision');
+const budget = document.querySelector('#budget');
+let profile;
+function updateProfile(next) {
+  profile = next;
+  decision.textContent = '';
+  calculate.disabled = !profile;
+  budget.textContent = profile
+    ? 'Búferes probados: ' + profile.probeMiB + ' MiB. Presupuesto inicial (70 %): ' + (profile.probeMiB * 0.7).toFixed(1) + ' MiB. FP16 nativo: ' + (profile.fp16 ? 'sí' : 'no') + '.'
+    : 'Sin un escalón completado, evitá iniciar el modelo en WebGPU.';
+}
+estimate.oninput = () => { decision.textContent = ''; };
+estimate.onsubmit = event => {
+  event.preventDefault();
+  if (!profile) return;
+  const fields = estimate.elements;
+  const values = ['weights', 'activations', 'workspace'].map(name => fields.namedItem(name).valueAsNumber);
+  if (!values.every(value => Number.isFinite(value) && value > 0)) return;
+  const result = estimateMemory(profile.probeMiB, ...values);
+  let recommendation = 'Candidato para una prueba corta en WebGPU.';
+  if (!result.fits) recommendation = 'Supera el presupuesto. Probá una variante más liviana o un tamaño de entrada compatible más pequeño.';
+  if (fields.namedItem('fp16').checked && !profile.fp16) recommendation = 'El dispositivo no admite el FP16 nativo que requiere esta variante.';
+  decision.textContent = 'Pico estimado: ' + result.peak.toFixed(1) + ' MiB. ' + recommendation;
+};
 try {
   const saved = JSON.parse(localStorage.getItem(storageKey));
-  if (saved) status.textContent = 'Última prueba: ' + saved.status;
+  if (saved) {
+    status.textContent = 'Última prueba: ' + saved.status;
+    updateProfile(saved.profile);
+  }
 } catch {}
 button.onclick = () => {
   const url = URL.createObjectURL(new Blob([document.querySelector('#worker').textContent], {type: 'text/javascript'}));
   let worker, timeout, latestReport = {};
   button.disabled = true;
+  updateProfile(null);
+  try { localStorage.removeItem(storageKey); } catch {}
   result.replaceChildren();
   status.textContent = 'Probando WebGPU…';
   function finish(message, report = {}) {
@@ -128,15 +177,20 @@ button.onclick = () => {
     worker = new Worker(url);
     worker.onmessage = ({data}) => {
       latestReport = data.report;
+      if (!data.lastPassed) updateProfile(null);
+      if (data.lastPassed) updateProfile({
+        probeMiB: data.lastPassed ** 2 * 8 / 1048576,
+        fp16: data.report['FP16 disponible'] === 'Sí'
+      });
       if (data.progress) {
         status.textContent = 'Cargas completadas: ' + (Object.keys(latestReport).length - 1);
         return;
       }
-      try { localStorage.setItem(storageKey, JSON.stringify({status: data.status})); } catch {}
+      try { localStorage.setItem(storageKey, JSON.stringify({status: data.status, profile})); } catch {}
       finish(data.status, data.report);
     };
-    worker.onerror = () => finish('El navegador no pudo ejecutar el diagnóstico.');
-    timeout = setTimeout(() => finish('La prueba superó los 12 segundos.', latestReport), 12000);
+    worker.onerror = () => { updateProfile(null); finish('El navegador no pudo ejecutar el diagnóstico.'); };
+    timeout = setTimeout(() => { updateProfile(null); finish('La prueba superó los 12 segundos.', latestReport); }, 12000);
     worker.postMessage(null);
   } catch {
     finish('El navegador no pudo iniciar el diagnóstico.');
