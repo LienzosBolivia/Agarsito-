@@ -22,16 +22,16 @@ dd{margin:0 0 .8rem}dt{font-weight:700}p{line-height:1.5}
 <dl>
 <dt>Modelo</dt><dd>U²-Net pequeño · FP32</dd>
 <dt>Entrada sintética</dt><dd>320 × 320 · tensor RGB de 1,17 MiB</dd>
-<dt>Pico de memoria</dt><dd>Pendiente de medir para esta variante. La prueba utiliza CPU/WASM hasta validar un presupuesto WebGPU para el modelo.</dd>
+<dt>Pico de memoria</dt><dd>La prueba sintética orienta la selección inicial. El pico de memoria de U²-Net sigue sin medirse.</dd>
 </dl>
 <p id="decision" role="status"></p>
 <script id="model-worker" type="text/plain">
-self.onmessage = async () => {
+self.onmessage = async ({data: backend}) => {
 const runtimeBase = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
 const modelURL = 'https://huggingface.co/nfa04/u2netp-onnx/resolve/main/u2netp.onnx';
 let session, input, outputs;
 try {
-  const ort = await import(runtimeBase + 'ort.wasm.min.mjs');
+  const ort = await import(runtimeBase + (backend === 'webgpu' ? 'ort.webgpu.min.mjs' : 'ort.wasm.min.mjs'));
   ort.env.wasm.wasmPaths = runtimeBase;
   ort.env.wasm.numThreads = 1;
   const response = await fetch(modelURL);
@@ -43,7 +43,10 @@ try {
     throw new Error('El archivo recibido no coincide con la versión del modelo.');
   }
   const downloadMiB = bytes.byteLength / 1048576;
-  session = await ort.InferenceSession.create(bytes, {executionProviders: ['wasm']});
+  session = await ort.InferenceSession.create(bytes, {
+    executionProviders: [backend],
+    ...(backend === 'webgpu' ? {extra: {session: {disable_cpu_ep_fallback: '1'}}} : {})
+  });
   const side = 320;
   const pixels = new Float32Array(3 * side * side);
   for (let y = 80; y < 240; y++) {
@@ -59,7 +62,7 @@ try {
   if (mask.length !== side * side || !mask.every(Number.isFinite)) {
     throw new Error('La máscara ONNX no pasó la validación.');
   }
-  self.postMessage({message: 'Inferencia completada en CPU/WASM en ' + Math.round(elapsed) + ' ms. Archivo ONNX verificado: ' + downloadMiB.toFixed(2) + ' MiB.'});
+  self.postMessage({ok: true, message: 'Inferencia completada en ' + (backend === 'webgpu' ? 'WebGPU' : 'CPU/WASM') + ' en ' + Math.round(elapsed) + ' ms. Archivo ONNX verificado: ' + downloadMiB.toFixed(2) + ' MiB.'});
 } catch (error) {
   self.postMessage({message: 'No se completó la prueba del modelo. ' + error.message});
 } finally {
@@ -163,26 +166,55 @@ function updateProfile(next) {
     ? 'Búferes probados: ' + profile.probeMiB + ' MiB. Presupuesto inicial de GPU: ' + (profile.probeMiB * 0.7).toFixed(1) + ' MiB.'
     : 'Sin un presupuesto inicial de GPU para este diagnóstico.';
 }
+const pendingGpuKey = 'agarsito-u2netp-webgpu-pending';
+
 function testModel() {
-  decision.textContent = 'Cargando U²-Net pequeño y probando la inferencia en CPU/WASM…';
+  let interrupted = false;
+  try {
+    interrupted = localStorage.getItem(pendingGpuKey) === '1';
+    localStorage.removeItem(pendingGpuKey);
+  } catch {}
+  if (interrupted) {
+    runModel('wasm', 'La prueba WebGPU anterior se interrumpió. ');
+  } else if (profile?.probeMiB >= 32) {
+    runModel('webgpu');
+  } else {
+    runModel('wasm', 'El diagnóstico no completó los 32 MiB requeridos por este filtro inicial. ');
+  }
+}
+
+function runModel(backend, note = '') {
+  const gpu = backend === 'webgpu';
+  const name = gpu ? 'WebGPU' : 'CPU/WASM';
+  decision.textContent = note + 'Cargando U²-Net pequeño en ' + name + '…';
+  if (gpu) {
+    try { localStorage.setItem(pendingGpuKey, '1'); } catch {}
+  }
   const code = document.querySelector('#model-worker').textContent;
   const url = URL.createObjectURL(new Blob([code], {type: 'text/javascript'}));
   let worker, timeout;
-  const finish = message => {
+  const finish = ({ok, message}) => {
     clearTimeout(timeout);
     worker?.terminate();
     URL.revokeObjectURL(url);
-    decision.textContent = message;
+    if (gpu) {
+      try { localStorage.removeItem(pendingGpuKey); } catch {}
+      if (!ok) {
+        runModel('wasm', 'WebGPU falló: ' + message + ' ');
+        return;
+      }
+    }
+    decision.textContent = note + message;
     button.disabled = false;
   };
   try {
     worker = new Worker(url, {type: 'module'});
-    worker.onmessage = ({data}) => finish(data.message);
-    worker.onerror = () => finish('El navegador no pudo ejecutar la prueba del modelo.');
-    timeout = setTimeout(() => finish('La prueba del modelo superó 90 segundos.'), 90000);
-    worker.postMessage(null);
+    worker.onmessage = ({data}) => finish(data);
+    worker.onerror = () => finish({message: 'El navegador interrumpió el worker.'});
+    timeout = setTimeout(() => finish({message: 'La prueba superó el tiempo límite.'}), gpu ? 45000 : 90000);
+    worker.postMessage(backend);
   } catch (error) {
-    finish('El navegador no pudo iniciar la prueba del modelo. ' + error.message);
+    finish({message: error.message});
   }
 }
 try {
