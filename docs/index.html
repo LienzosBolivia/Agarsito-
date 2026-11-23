@@ -13,6 +13,9 @@ dd{margin:0 0 .8rem}dt{font-weight:700}p{line-height:1.5}
 figure{margin:0;min-width:0} figure img{width:100%;max-height:24rem;object-fit:contain;background:repeating-conic-gradient(#ddd 0 25%,#fff 0 50%) 0 0/20px 20px}
 label[for="fine"] input{display:inline}
 input{display:block;margin:1rem 0;max-width:100%}
+#composition-stage{position:relative}
+#composition-stage img{display:block;width:100%;height:auto;max-height:none}
+#hair-guide{position:absolute;inset:0;width:100%;height:100%;touch-action:none;cursor:crosshair}
 </style>
 <main>
 <h1>Quitar fondo</h1>
@@ -32,11 +35,15 @@ input{display:block;margin:1rem 0;max-width:100%}
 <h2>Colocar un fondo</h2>
 <label for="background">Elegí una imagen de fondo</label>
 <input id="background" type="file" accept="image/*">
-<label for="blur">Desenfoque del fondo <output id="blur-value">0</output></label>
-<input id="blur" type="range" min="0" max="20" value="0">
 <button id="compose" disabled>Aplicar fondo</button>
 <p id="compose-status" role="status"></p>
-<figure id="composition-view" hidden><figcaption>Foto con el fondo elegido</figcaption><img id="composite" alt="Retrato con el fondo elegido"></figure>
+<figure id="composition-view" hidden><figcaption>Foto con el fondo elegido</figcaption><div id="composition-stage"><img id="composite" alt="Retrato con el fondo elegido"><canvas id="hair-guide" aria-label="Área para marcar el borde del cabello" hidden></canvas></div></figure>
+<div id="hair-tools" hidden>
+<p>Trazá sobre el borde del cabello que querés integrar. El trazo solo indica dónde trabajar.</p>
+<button id="mark-hair" aria-pressed="false">Marcar cabello</button>
+<button id="clear-hair" disabled>Borrar marcas</button>
+<button id="apply-hair" disabled>Integrar cabello</button>
+</div>
 <a id="save-composite" download="foto-con-fondo.png" hidden>Descargar foto con fondo</a>
 </section>
 <h2>Diagnóstico de GPU</h2>
@@ -54,7 +61,111 @@ input{display:block;margin:1rem 0;max-width:100%}
 </dl>
 <p id="decision" role="status"></p>
 <script id="compose-worker" type="text/plain">
-self.onmessage = async ({data: {cutout, background, blur}}) => {
+function integrateHair(ctx, subject, width, height, strokes) {
+  const scale = Math.min(1, 480 / Math.max(width, height));
+  const w = Math.max(1, Math.round(width * scale));
+  const h = Math.max(1, Math.round(height * scale));
+  const sample = new OffscreenCanvas(w, h).getContext('2d', {willReadFrequently: true});
+  sample.drawImage(subject, 0, 0, w, h);
+  const guide = sample.getImageData(0, 0, w, h).data;
+  const paint = new OffscreenCanvas(w, h).getContext('2d');
+  const radius = Math.max(3, Math.min(w, h) * 0.035);
+  paint.lineWidth = radius * 2;
+  paint.lineCap = 'round';
+  paint.lineJoin = 'round';
+  for (const stroke of strokes) {
+    if (!stroke.length) continue;
+    const [[x, y]] = stroke;
+    paint.beginPath();
+    paint.arc(x * w, y * h, radius, 0, Math.PI * 2);
+    paint.fill();
+    paint.beginPath();
+    paint.moveTo(x * w, y * h);
+    for (const [px, py] of stroke.slice(1)) paint.lineTo(px * w, py * h);
+    paint.stroke();
+  }
+  const marked = paint.getImageData(0, 0, w, h).data;
+  const seeds = new Int32Array(w * h).fill(-1);
+  const strength = new Float32Array(w * h);
+  let anchors = 0;
+  const alphaAt = (x, y) => guide[(Math.min(h - 1, Math.max(0, y)) * w + Math.min(w - 1, Math.max(0, x))) * 4 + 3];
+  const clamp = value => Math.max(0, Math.min(1, value));
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const i = y * w + x;
+      const a = guide[i * 4 + 3];
+      if (marked[i * 4 + 3] < 100 || a < 6 || a > 245) continue;
+      const dx = alphaAt(x + 1, y) - alphaAt(x - 1, y);
+      const dy = alphaAt(x, y + 1) - alphaAt(x, y - 1);
+      const gradient = Math.hypot(dx, dy);
+      if (gradient < 9) continue;
+      const nx = dx / gradient, ny = dy / gradient;
+      for (let step = 2; step <= 13; step++) {
+        const px = Math.round(x + nx * step), py = Math.round(y + ny * step);
+        if (px < 0 || py < 0 || px >= w || py >= h) break;
+        const anchor = py * w + px;
+        if (guide[anchor * 4 + 3] >= 250) {
+          seeds[i] = anchor;
+          anchors++;
+          strength[i] = clamp(1 - (step - 2) / 17);
+          break;
+        }
+      }
+      if (seeds[i] < 0 || a < 74 || a > 182 || (x * 37 + y * 59) % 19 !== 0) continue;
+      // Draw a tapered-looking, low-opacity strand behind the cutout.
+      const src = seeds[i] * 4;
+      const sx = width / w, sy = height / h;
+      const length = 2 + (x * 19 + y * 13) % 4;
+      const bend = ((x + y) % 5 - 2) * 0.65;
+      const startX = (x + nx * 1.5) * sx, startY = (y + ny * 1.5) * sy;
+      const endX = (x - nx * length - ny * bend) * sx;
+      const endY = (y - ny * length + nx * bend) * sy;
+      const fade = ctx.createLinearGradient(startX, startY, endX, endY);
+      const rgb = [guide[src], guide[src + 1], guide[src + 2]].join(',');
+      fade.addColorStop(0, 'rgba(' + rgb + ',0.40)');
+      fade.addColorStop(1, 'rgba(' + rgb + ',0)');
+      ctx.strokeStyle = fade;
+      ctx.lineWidth = Math.max(0.55, Math.min(sx, sy) * 0.34);
+      ctx.beginPath();
+      ctx.moveTo(startX, startY);
+      ctx.quadraticCurveTo((x - nx * length * 0.45) * sx, (y - ny * length * 0.45) * sy, endX, endY);
+      ctx.stroke();
+    }
+  }
+  if (!anchors) return false;
+  const tile = new OffscreenCanvas(width, Math.min(height, 64));
+  const tileContext = tile.getContext('2d', {willReadFrequently: true});
+  for (let top = 0; top < height; top += 64) {
+    const rows = Math.min(64, height - top);
+    tileContext.clearRect(0, 0, width, rows);
+    tileContext.drawImage(subject, 0, top, width, rows, 0, 0, width, rows);
+    const strip = tileContext.getImageData(0, 0, width, rows);
+    const rgba = strip.data;
+    for (let y = 0; y < rows; y++) {
+      const row = Math.min(h - 1, Math.floor((y + top + 0.5) * h / height)) * w;
+      for (let x = 0; x < width; x++) {
+        const i = row + Math.min(w - 1, Math.floor((x + 0.5) * w / width));
+        const pixel = (y * width + x) * 4;
+        const a = rgba[pixel + 3] / 255;
+        if (seeds[i] < 0 || a < 0.025 || a >= 0.96) continue;
+        const src = seeds[i] * 4;
+        const mix = strength[i] * (0.34 + (1 - a) * 0.63);
+        const brightness = (rgba[pixel] + rgba[pixel + 1] + rgba[pixel + 2] + 48)
+          / (guide[src] + guide[src + 1] + guide[src + 2] + 48);
+        const shade = Math.max(0.76, Math.min(1.12, brightness));
+        for (let c = 0; c < 3; c++) {
+          rgba[pixel + c] += mix * (guide[src + c] * shade - rgba[pixel + c]);
+        }
+        rgba[pixel + 3] *= 1 - 0.72 * strength[i] * (1 - a) ** 2;
+      }
+    }
+    tileContext.putImageData(strip, 0, 0);
+    ctx.drawImage(tile, 0, 0, width, rows, 0, top, width, rows);
+  }
+  return true;
+}
+
+self.onmessage = async ({data: {cutout, background, strokes}}) => {
   let subject, backdrop;
   try {
     subject = await createImageBitmap(cutout);
@@ -67,22 +178,18 @@ self.onmessage = async ({data: {cutout, background, blur}}) => {
     const ctx = canvas.getContext('2d', {alpha: false});
     ctx.fillStyle = '#fff';
     ctx.fillRect(0, 0, width, height);
-    const radius = blur * Math.min(width, height) / 1000;
-    const padding = 3 * radius;
-    const scale = Math.max((width + padding * 2) / backdrop.width, (height + padding * 2) / backdrop.height);
+    const scale = Math.max(width / backdrop.width, height / backdrop.height);
     const bgWidth = backdrop.width * scale;
     const bgHeight = backdrop.height * scale;
-    if (radius && !('filter' in ctx)) throw new Error('Este navegador no admite el desenfoque. Probá con el control en cero.');
-    if (radius) ctx.filter = 'blur(' + radius + 'px)';
     ctx.imageSmoothingQuality = 'high';
     ctx.drawImage(backdrop, (width - bgWidth) / 2, (height - bgHeight) / 2, bgWidth, bgHeight);
     backdrop.close();
     backdrop = undefined;
-    if (radius) ctx.filter = 'none';
-    ctx.drawImage(subject, 0, 0);
+    const integrated = strokes.length > 0 && integrateHair(ctx, subject, width, height, strokes);
+    if (!integrated) ctx.drawImage(subject, 0, 0);
     subject.close();
     subject = undefined;
-    self.postMessage({image: await canvas.convertToBlob({type: 'image/png'})});
+    self.postMessage({image: await canvas.convertToBlob({type: 'image/png'}), integrated});
   } catch (error) {
     self.postMessage({error: error.message});
   } finally {
@@ -503,17 +610,93 @@ let originalUrl, outputUrl, cutoutBlob, compositeUrl;
 const fine = document.querySelector('#fine');
 const composition = document.querySelector('#composition');
 const background = document.querySelector('#background');
-const blur = document.querySelector('#blur');
+const hairTools = document.querySelector('#hair-tools');
+const markHair = document.querySelector('#mark-hair');
+const clearHair = document.querySelector('#clear-hair');
+const applyHair = document.querySelector('#apply-hair');
+const guideCanvas = document.querySelector('#hair-guide');
+let strokes = [];
+let activeStroke;
+let marking = false;
+let composing = false;
+
+function refreshHairControls() {
+  markHair.setAttribute('aria-pressed', String(marking));
+  markHair.textContent = marking ? 'Terminar de marcar' : 'Marcar cabello';
+  guideCanvas.hidden = !marking;
+  clearHair.disabled = composing || !strokes.length;
+  applyHair.disabled = composing || !strokes.length;
+  markHair.disabled = composing;
+}
+function drawStrokes() {
+  if (!marking) return;
+  const width = guideCanvas.clientWidth;
+  const height = guideCanvas.clientHeight;
+  if (!width || !height) return;
+  guideCanvas.width = width;
+  guideCanvas.height = height;
+  const ctx = guideCanvas.getContext('2d');
+  ctx.lineWidth = Math.max(6, Math.min(width, height) * 0.07);
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.strokeStyle = ctx.fillStyle = '#d19a30';
+  ctx.globalAlpha = 0.55;
+  for (const [[x, y], ...rest] of strokes) {
+    ctx.beginPath();
+    ctx.arc(x * width, y * height, ctx.lineWidth / 2, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(x * width, y * height);
+    for (const [px, py] of rest) ctx.lineTo(px * width, py * height);
+    ctx.stroke();
+  }
+}
+function pointerPoint(event) {
+  const rect = guideCanvas.getBoundingClientRect();
+  const unit = value => Math.max(0, Math.min(1, value));
+  return [unit((event.clientX - rect.left) / rect.width), unit((event.clientY - rect.top) / rect.height)];
+}
+guideCanvas.onpointerdown = event => {
+  if (!marking || composing || activeStroke || event.button !== 0) return;
+  activeStroke = [pointerPoint(event)];
+  strokes.push(activeStroke);
+  guideCanvas.setPointerCapture(event.pointerId);
+  drawStrokes();
+  refreshHairControls();
+};
+guideCanvas.onpointermove = event => {
+  if (!activeStroke || !guideCanvas.hasPointerCapture(event.pointerId)) return;
+  activeStroke.push(pointerPoint(event));
+  drawStrokes();
+};
+guideCanvas.onlostpointercapture = () => { activeStroke = undefined; };
+markHair.onclick = () => {
+  marking = !marking;
+  refreshHairControls();
+  drawStrokes();
+};
+clearHair.onclick = () => {
+  strokes = [];
+  activeStroke = undefined;
+  drawStrokes();
+  refreshHairControls();
+};
+window.addEventListener('resize', drawStrokes);
 const composeButton = document.querySelector('#compose');
 const composeStatus = document.querySelector('#compose-status');
 const composite = document.querySelector('#composite');
 const saveComposite = document.querySelector('#save-composite');
 
 function clearComposite() {
+  hairTools.hidden = true;
+  marking = false;
+  strokes = [];
+  activeStroke = undefined;
+  refreshHairControls();
   if (compositeUrl) URL.revokeObjectURL(compositeUrl);
   compositeUrl = undefined;
   composite.removeAttribute('src');
-  composite.parentElement.hidden = true;
+  composite.closest('figure').hidden = true;
   saveComposite.hidden = true;
   saveComposite.removeAttribute('href');
   composeStatus.textContent = '';
@@ -523,44 +706,53 @@ background.onchange = () => {
   busy(false);
   if (background.files[0]?.size > 20000000) composeStatus.textContent = 'El fondo supera los 20 MB.';
 };
-blur.oninput = () => {
-  document.querySelector('#blur-value').textContent = blur.value;
-  clearComposite();
-};
 composeButton.onclick = () => {
   if (composeButton.disabled) return;
   clearComposite();
+  composeBackground([]);
+};
+applyHair.onclick = () => {
+  if (!applyHair.disabled) composeBackground(strokes);
+};
+function composeBackground(selectedStrokes) {
+  composing = true;
+  marking = false;
+  refreshHairControls();
   busy(true);
-  composeStatus.textContent = 'Preparando la composición…';
+  composeStatus.textContent = selectedStrokes.length ? 'Integrando el borde del cabello…' : 'Preparando la composición…';
   const code = document.querySelector('#compose-worker').textContent;
   const url = URL.createObjectURL(new Blob([code], {type: 'text/javascript'}));
   let worker, timeout;
-  const finish = ({image, error}) => {
+  const finish = ({image, error, integrated}) => {
     worker?.terminate();
     clearTimeout(timeout);
     URL.revokeObjectURL(url);
+    composing = false;
+    refreshHairControls();
     busy(false);
     if (error) {
       composeStatus.textContent = error;
       return;
     }
+    if (compositeUrl) URL.revokeObjectURL(compositeUrl);
     compositeUrl = URL.createObjectURL(image);
+    hairTools.hidden = false;
     composite.src = compositeUrl;
-    composite.parentElement.hidden = false;
+    composite.closest('figure').hidden = false;
     saveComposite.href = compositeUrl;
     saveComposite.hidden = false;
-    composeStatus.textContent = 'Composición lista.';
+    composeStatus.textContent = integrated ? 'Composición con cabello integrado.' : selectedStrokes.length ? 'Marcá una zona donde el cabello toque el fondo.' : 'Fondo aplicado. Ya podés marcar el cabello.';
   };
   try {
     worker = new Worker(url);
     worker.onmessage = ({data}) => finish(data);
     worker.onerror = () => finish({error: 'El navegador interrumpió la composición.'});
     timeout = setTimeout(() => finish({error: 'La composición superó el tiempo límite.'}), 45000);
-    worker.postMessage({cutout: cutoutBlob, background: background.files[0], blur: Number(blur.value)});
+    worker.postMessage({cutout: cutoutBlob, background: background.files[0], strokes: selectedStrokes});
   } catch (error) {
     finish({error: error.message});
   }
-};
+}
 
 function clearOutput() {
   cutoutBlob = undefined;
@@ -577,7 +769,6 @@ function busy(value) {
   button.disabled = value;
   fine.disabled = value;
   background.disabled = value;
-  blur.disabled = value;
   composeButton.disabled = value || !cutoutBlob || !background.files[0] || background.files[0].size > 20000000;
   picker.disabled = value;
   cut.disabled = value || !picker.files[0] || picker.files[0].size > 20000000;
