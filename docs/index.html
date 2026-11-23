@@ -16,6 +16,10 @@ input{display:block;margin:1rem 0;max-width:100%}
 #composition-stage{position:relative}
 #composition-stage img{display:block;width:100%;height:auto;max-height:none}
 #hair-guide{position:absolute;inset:0;width:100%;height:100%;touch-action:none;cursor:crosshair}
+#cutout-stage{position:relative}
+#cutout-stage img{display:block;width:100%;height:auto;max-height:none}
+#erase-guide{position:absolute;inset:0;width:100%;height:100%;touch-action:none;cursor:crosshair}
+#mask-tools button{margin:.2rem 0}
 </style>
 <main>
 <h1>Quitar fondo</h1>
@@ -28,8 +32,20 @@ input{display:block;margin:1rem 0;max-width:100%}
 <p id="photo-status" role="status"></p>
 <div class="previews">
 <figure hidden><figcaption>Original</figcaption><img id="before" alt="Foto original"></figure>
-<figure hidden><figcaption>Fondo transparente</figcaption><img id="after" alt="Foto recortada"></figure>
+<figure hidden><figcaption>Fondo transparente</figcaption><div id="cutout-stage"><img id="after" alt="Foto recortada"><canvas id="erase-guide" aria-label="Marca restos del fondo" hidden></canvas></div></figure>
 </div>
+<section id="mask-tools" hidden>
+<h2>Corregir el recorte</h2>
+<button id="erase-toggle" aria-pressed="false">Quitar restos del fondo</button>
+<div id="erase-options" hidden>
+<p>Marcá los restos sobre el recorte. Usá un pincel más fino junto al cabello.</p>
+<label for="erase-size">Tamaño del pincel</label>
+<input id="erase-size" type="range" min="3" max="45" value="12">
+<button id="erase-apply" disabled>Aplicar borrado</button>
+</div>
+<button id="erase-undo" disabled>Deshacer borrado</button>
+<p id="erase-status" role="status"></p>
+</section>
 <a id="download" download="foto-sin-fondo.png" hidden>Descargar PNG transparente</a>
 <section id="composition" hidden>
 <h2>Colocar un fondo</h2>
@@ -777,6 +793,128 @@ const before = document.querySelector('#before');
 const after = document.querySelector('#after');
 const download = document.querySelector('#download');
 let originalUrl, outputUrl, cutoutBlob, compositeUrl;
+const maskTools = document.querySelector('#mask-tools');
+const eraseToggle = document.querySelector('#erase-toggle');
+const eraseOptions = document.querySelector('#erase-options');
+const eraseGuide = document.querySelector('#erase-guide');
+const eraseSize = document.querySelector('#erase-size');
+const eraseApply = document.querySelector('#erase-apply');
+const eraseUndo = document.querySelector('#erase-undo');
+const eraseStatus = document.querySelector('#erase-status');
+let eraseMode = false;
+let eraseStrokes = [];
+let activeErase;
+let previousCutout;
+
+function paintErase(ctx, width, height, marks) {
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  for (const {size, points} of marks) {
+    const [[x, y], ...rest] = points;
+    ctx.lineWidth = size * Math.min(width, height);
+    ctx.beginPath();
+    ctx.arc(x * width, y * height, ctx.lineWidth / 2, 0, Math.PI * 2);
+    ctx.fill();
+    if (rest.length) {
+      ctx.beginPath();
+      ctx.moveTo(x * width, y * height);
+      for (const [px, py] of rest) ctx.lineTo(px * width, py * height);
+      ctx.stroke();
+    }
+  }
+}
+function showEraseMarks() {
+  if (!eraseMode || !eraseGuide.clientWidth || !eraseGuide.clientHeight) return;
+  eraseGuide.width = eraseGuide.clientWidth;
+  eraseGuide.height = eraseGuide.clientHeight;
+  const ctx = eraseGuide.getContext('2d');
+  ctx.fillStyle = ctx.strokeStyle = 'rgba(211,47,47,.47)';
+  paintErase(ctx, eraseGuide.width, eraseGuide.height, eraseStrokes);
+}
+function setEraseMode(enabled) {
+  eraseMode = enabled;
+  eraseToggle.setAttribute('aria-pressed', String(enabled));
+  eraseToggle.textContent = enabled ? 'Cancelar marcas' : 'Quitar restos del fondo';
+  eraseOptions.hidden = eraseGuide.hidden = !enabled;
+  if (!enabled) {
+    eraseStrokes = [];
+    activeErase = undefined;
+  }
+  eraseApply.disabled = !eraseStrokes.length;
+  showEraseMarks();
+}
+function erasePoint(event) {
+  const box = eraseGuide.getBoundingClientRect();
+  const unit = v => Math.max(0, Math.min(1, v));
+  return [unit((event.clientX - box.left) / box.width), unit((event.clientY - box.top) / box.height)];
+}
+eraseGuide.onpointerdown = event => {
+  if (!eraseMode || activeErase || event.button !== 0 || eraseToggle.disabled) return;
+  activeErase = {size: Number(eraseSize.value) / 1000, points: [erasePoint(event)]};
+  eraseStrokes.push(activeErase);
+  eraseGuide.setPointerCapture(event.pointerId);
+  eraseApply.disabled = false;
+  showEraseMarks();
+};
+eraseGuide.onpointermove = event => {
+  if (!activeErase || !eraseGuide.hasPointerCapture(event.pointerId) || eraseToggle.disabled) return;
+  activeErase.points.push(erasePoint(event));
+  showEraseMarks();
+};
+eraseGuide.onlostpointercapture = () => { activeErase = undefined; };
+window.addEventListener('resize', showEraseMarks);
+eraseToggle.onclick = () => {
+  eraseStatus.textContent = '';
+  setEraseMode(!eraseMode);
+};
+function showCutout(png) {
+  cutoutBlob = png;
+  if (outputUrl) URL.revokeObjectURL(outputUrl);
+  outputUrl = URL.createObjectURL(png);
+  after.src = outputUrl;
+  after.closest('figure').hidden = false;
+  composition.hidden = false;
+  maskTools.hidden = false;
+  download.href = outputUrl;
+  download.hidden = false;
+}
+eraseApply.onclick = async () => {
+  if (eraseApply.disabled || !cutoutBlob) return;
+  const prior = cutoutBlob;
+  const marks = eraseStrokes;
+  setEraseMode(false);
+  busy(true);
+  let bitmap;
+  try {
+    bitmap = await createImageBitmap(prior);
+    const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(bitmap, 0, 0);
+    bitmap.close();
+    bitmap = undefined;
+    ctx.globalCompositeOperation = 'destination-out';
+    paintErase(ctx, canvas.width, canvas.height, marks);
+    const png = await canvas.convertToBlob({type: 'image/png'});
+    previousCutout = prior;
+    clearComposite();
+    showCutout(png);
+    eraseStatus.textContent = 'Recorte corregido.';
+  } catch {
+    eraseStatus.textContent = 'No se pudo aplicar el borrado.';
+  } finally {
+    bitmap?.close();
+    busy(false);
+  }
+};
+eraseUndo.onclick = () => {
+  if (!previousCutout || eraseUndo.disabled) return;
+  setEraseMode(false);
+  clearComposite();
+  showCutout(previousCutout);
+  previousCutout = undefined;
+  eraseStatus.textContent = 'Se deshizo el último borrado.';
+  busy(false);
+};
 const fine = document.querySelector('#fine');
 const composition = document.querySelector('#composition');
 const background = document.querySelector('#background');
@@ -933,18 +1071,25 @@ function composeBackground(selectedStrokes, generate = false) {
 }
 
 function clearOutput() {
+  previousCutout = undefined;
+  maskTools.hidden = true;
+  eraseStatus.textContent = '';
+  setEraseMode(false);
   cutoutBlob = undefined;
   composition.hidden = true;
   clearComposite();
   if (outputUrl) URL.revokeObjectURL(outputUrl);
   outputUrl = undefined;
   after.removeAttribute('src');
-  after.parentElement.hidden = true;
+  after.closest('figure').hidden = true;
   download.hidden = true;
   download.removeAttribute('href');
 }
 function busy(value) {
   button.disabled = value;
+  eraseToggle.disabled = value;
+  eraseApply.disabled = value || !eraseStrokes.length;
+  eraseUndo.disabled = value || !previousCutout;
   fine.disabled = value;
   background.disabled = value;
   composeButton.disabled = value || !cutoutBlob || !background.files[0] || background.files[0].size > 20000000;
@@ -1032,15 +1177,7 @@ function runModel(backend, note = '', photo) {
       }
     }
     feedback.textContent = note + message;
-    if (png) {
-      cutoutBlob = png;
-      composition.hidden = false;
-      outputUrl = URL.createObjectURL(png);
-      after.src = outputUrl;
-      after.parentElement.hidden = false;
-      download.href = outputUrl;
-      download.hidden = false;
-    }
+    if (png) showCutout(png);
     busy(false);
   };
   try {
