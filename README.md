@@ -1,2 +1,0 @@
-# Registro Pagos-
-Topológicamente topologico
