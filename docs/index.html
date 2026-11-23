@@ -13,21 +13,62 @@ dd{margin:0 0 .8rem}dt{font-weight:700}p{line-height:1.5}
 <main>
 <h1>Diagnóstico de GPU</h1>
 <p>Ejecuta una convolución sintética en cuatro tamaños hasta 2048 × 2048. El resultado muestra la mayor carga completada en esta prueba. La VRAM libre y el rendimiento de un modelo ONNX requieren mediciones distintas.</p>
-<button id="run">Probar este dispositivo</button>
+<button id="run">Probar este dispositivo y el modelo</button>
 <p id="status" role="status"></p>
 <dl id="result"></dl>
 <section>
 <h2>Presupuesto del modelo</h2>
 <p id="budget" aria-live="polite">Ejecutá el diagnóstico para calcular el presupuesto.</p>
-<form id="estimate">
-<p>Ingresá valores estimados para una variante y un tamaño de entrada. Usá pesos residentes, pico de activaciones y memoria adicional del motor, en MiB.</p>
-<p><label>Pesos residentes <input name="weights" type="number" min="0.01" step="any" required></label></p>
-<p><label>Pico de activaciones <input name="activations" type="number" min="0.01" step="any" required></label></p>
-<p><label>Búferes adicionales del motor, entrada y salida <input name="workspace" type="number" min="0.01" step="any" required></label></p>
-<p><label><input name="fp16" type="checkbox"> La variante requiere FP16 nativo</label></p>
-<button id="calculate" disabled>Evaluar modelo</button>
-</form>
+<dl>
+<dt>Modelo</dt><dd>U²-Net pequeño · FP32</dd>
+<dt>Entrada sintética</dt><dd>320 × 320 · tensor RGB de 1,17 MiB</dd>
+<dt>Pico de memoria</dt><dd>Pendiente de medir para esta variante. La prueba utiliza CPU/WASM hasta validar un presupuesto WebGPU para el modelo.</dd>
+</dl>
 <p id="decision" role="status"></p>
+<script id="model-worker" type="text/plain">
+self.onmessage = async () => {
+const runtimeBase = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
+const modelURL = 'https://huggingface.co/nfa04/u2netp-onnx/resolve/main/u2netp.onnx';
+let session, input, outputs;
+try {
+  const ort = await import(runtimeBase + 'ort.wasm.min.mjs');
+  ort.env.wasm.wasmPaths = runtimeBase;
+  ort.env.wasm.numThreads = 1;
+  const response = await fetch(modelURL);
+  if (!response.ok) throw new Error('Descarga del modelo: HTTP ' + response.status);
+  const bytes = await response.arrayBuffer();
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+  const checksum = Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join('');
+  if (checksum !== '309c8469258dda742793dce0ebea8e6dd393174f89934733ecc8b14c76f4ddd8') {
+    throw new Error('El archivo recibido no coincide con la versión del modelo.');
+  }
+  const downloadMiB = bytes.byteLength / 1048576;
+  session = await ort.InferenceSession.create(bytes, {executionProviders: ['wasm']});
+  const side = 320;
+  const pixels = new Float32Array(3 * side * side);
+  for (let y = 80; y < 240; y++) {
+    for (let channel = 0; channel < 3; channel++) {
+      pixels.fill(1, (channel * side + y) * side + 80, (channel * side + y) * side + 240);
+    }
+  }
+  input = new ort.Tensor('float32', pixels, [1, 3, side, side]);
+  const start = performance.now();
+  outputs = await session.run({[session.inputNames[0]]: input}, [session.outputNames[0]]);
+  const elapsed = performance.now() - start;
+  const mask = outputs[session.outputNames[0]].data;
+  if (mask.length !== side * side || !mask.every(Number.isFinite)) {
+    throw new Error('La máscara ONNX no pasó la validación.');
+  }
+  self.postMessage({message: 'Inferencia completada en CPU/WASM en ' + Math.round(elapsed) + ' ms. Archivo ONNX verificado: ' + downloadMiB.toFixed(2) + ' MiB.'});
+} catch (error) {
+  self.postMessage({message: 'No se completó la prueba del modelo. ' + error.message});
+} finally {
+  input?.dispose();
+  for (const tensor of Object.values(outputs || {})) tensor.dispose();
+  await session?.release();
+}
+};
+</script>
 </section>
 </main>
 <script id="worker" type="text/plain">
@@ -113,37 +154,37 @@ const button = document.querySelector('#run');
 const status = document.querySelector('#status');
 const result = document.querySelector('#result');
 const storageKey = 'agarsito-gpu-convolution-v2';
-function estimateMemory(probeMiB, weights, activations, workspace) {
-  const budget = probeMiB * 0.7;
-  const peak = weights + activations + workspace;
-  return {budget, peak, fits: peak <= budget};
-}
-const estimate = document.querySelector('#estimate');
-const calculate = document.querySelector('#calculate');
 const decision = document.querySelector('#decision');
 const budget = document.querySelector('#budget');
 let profile;
 function updateProfile(next) {
   profile = next;
-  decision.textContent = '';
-  calculate.disabled = !profile;
   budget.textContent = profile
-    ? 'Búferes probados: ' + profile.probeMiB + ' MiB. Presupuesto inicial (70 %): ' + (profile.probeMiB * 0.7).toFixed(1) + ' MiB. FP16 nativo: ' + (profile.fp16 ? 'sí' : 'no') + '.'
-    : 'Sin un escalón completado, evitá iniciar el modelo en WebGPU.';
+    ? 'Búferes probados: ' + profile.probeMiB + ' MiB. Presupuesto inicial de GPU: ' + (profile.probeMiB * 0.7).toFixed(1) + ' MiB.'
+    : 'Sin un presupuesto inicial de GPU para este diagnóstico.';
 }
-estimate.oninput = () => { decision.textContent = ''; };
-estimate.onsubmit = event => {
-  event.preventDefault();
-  if (!profile) return;
-  const fields = estimate.elements;
-  const values = ['weights', 'activations', 'workspace'].map(name => fields.namedItem(name).valueAsNumber);
-  if (!values.every(value => Number.isFinite(value) && value > 0)) return;
-  const result = estimateMemory(profile.probeMiB, ...values);
-  let recommendation = 'Candidato para una prueba corta en WebGPU.';
-  if (!result.fits) recommendation = 'Supera el presupuesto. Probá una variante más liviana o un tamaño de entrada compatible más pequeño.';
-  if (fields.namedItem('fp16').checked && !profile.fp16) recommendation = 'El dispositivo no admite el FP16 nativo que requiere esta variante.';
-  decision.textContent = 'Pico estimado: ' + result.peak.toFixed(1) + ' MiB. ' + recommendation;
-};
+function testModel() {
+  decision.textContent = 'Cargando U²-Net pequeño y probando la inferencia en CPU/WASM…';
+  const code = document.querySelector('#model-worker').textContent;
+  const url = URL.createObjectURL(new Blob([code], {type: 'text/javascript'}));
+  let worker, timeout;
+  const finish = message => {
+    clearTimeout(timeout);
+    worker?.terminate();
+    URL.revokeObjectURL(url);
+    decision.textContent = message;
+    button.disabled = false;
+  };
+  try {
+    worker = new Worker(url, {type: 'module'});
+    worker.onmessage = ({data}) => finish(data.message);
+    worker.onerror = () => finish('El navegador no pudo ejecutar la prueba del modelo.');
+    timeout = setTimeout(() => finish('La prueba del modelo superó 90 segundos.'), 90000);
+    worker.postMessage(null);
+  } catch (error) {
+    finish('El navegador no pudo iniciar la prueba del modelo. ' + error.message);
+  }
+}
 try {
   const saved = JSON.parse(localStorage.getItem(storageKey));
   if (saved) {
@@ -155,6 +196,7 @@ button.onclick = () => {
   const url = URL.createObjectURL(new Blob([document.querySelector('#worker').textContent], {type: 'text/javascript'}));
   let worker, timeout, latestReport = {};
   button.disabled = true;
+  decision.textContent = '';
   updateProfile(null);
   try { localStorage.removeItem(storageKey); } catch {}
   result.replaceChildren();
@@ -171,7 +213,7 @@ button.onclick = () => {
       detail.textContent = value;
       result.append(term, detail);
     }
-    button.disabled = false;
+    testModel();
   }
   try {
     worker = new Worker(url);
