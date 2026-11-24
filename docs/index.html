@@ -20,6 +20,8 @@ input{display:block;margin:1rem 0;max-width:100%}
 #cutout-stage img{display:block;width:100%;height:auto;max-height:none}
 #erase-guide{position:absolute;inset:0;width:100%;height:100%;touch-action:none;cursor:crosshair}
 #mask-tools button{margin:.2rem 0}
+#framing canvas{display:block;max-width:100%;max-height:25rem;width:auto;height:auto;background:repeating-conic-gradient(#ddd 0 25%,#fff 0 50%) 0 0/20px 20px}
+#framing{margin-block:1.5rem}
 </style>
 <main>
 <h1>Quitar fondo</h1>
@@ -47,6 +49,7 @@ input{display:block;margin:1rem 0;max-width:100%}
 <p id="erase-status" role="status"></p>
 </section>
 <a id="download" download="foto-sin-fondo.png" hidden>Descargar PNG transparente</a>
+<button id="frame-cutout" hidden>Encuadrar PNG transparente</button>
 <section id="composition" hidden>
 <h2>Colocar un fondo</h2>
 <label for="background">Elegí una imagen de fondo</label>
@@ -63,6 +66,26 @@ input{display:block;margin:1rem 0;max-width:100%}
 <p>MI-GAN se descarga al usar esta opción (28,1 MB). La foto se procesa en el dispositivo.</p>
 </div>
 <a id="save-composite" download="foto-con-fondo.png" hidden>Descargar foto con fondo</a>
+</section>
+<button id="frame-composite" hidden>Encuadrar foto con fondo</button>
+<section id="framing" hidden>
+<h2>Encuadre de exportación</h2>
+<p id="frame-source"></p>
+<label for="print-format">Proporción de la medida</label>
+<select id="print-format">
+<option value="20,27">20 × 27 cm</option>
+<option value="16,22">16 × 22 cm</option>
+<option value="50,110">50 × 110 cm</option>
+</select>
+<label for="print-orientation">Orientación</label>
+<select id="print-orientation"><option value="portrait">Vertical</option><option value="landscape">Horizontal</option></select>
+<label for="frame-x">Posición horizontal</label>
+<input type="range" id="frame-x" min="0" max="100" value="50">
+<label for="frame-y">Posición vertical</label>
+<input type="range" id="frame-y" min="0" max="100" value="50">
+<canvas id="frame-preview" aria-label="Vista previa del encuadre"></canvas>
+<p id="frame-status" role="status"></p>
+<button id="save-frame">Descargar PNG encuadrado</button>
 </section>
 <h2>Diagnóstico de GPU</h2>
 <p>Ejecuta una convolución sintética en cuatro tamaños hasta 2048 × 2048. El resultado muestra la mayor carga completada en esta prueba. La VRAM libre y el rendimiento de un modelo ONNX requieren mediciones distintas.</p>
@@ -793,6 +816,93 @@ const before = document.querySelector('#before');
 const after = document.querySelector('#after');
 const download = document.querySelector('#download');
 let originalUrl, outputUrl, cutoutBlob, compositeUrl;
+
+const frameCutout = document.querySelector('#frame-cutout');
+const frameComposite = document.querySelector('#frame-composite');
+const framing = document.querySelector('#framing');
+const format = document.querySelector('#print-format');
+const orientation = document.querySelector('#print-orientation');
+const frameX = document.querySelector('#frame-x');
+const frameY = document.querySelector('#frame-y');
+const framePreview = document.querySelector('#frame-preview');
+const frameStatus = document.querySelector('#frame-status');
+const saveFrame = document.querySelector('#save-frame');
+let frameImage;
+
+function cropBox(width, height, ratioWidth, ratioHeight, x, y) {
+  const ratio = ratioWidth / ratioHeight;
+  const cropWidth = Math.min(width, Math.max(1, Math.round(height * ratio)));
+  const cropHeight = Math.min(height, Math.max(1, Math.round(width / ratio)));
+  return {
+    x: Math.round((width - cropWidth) * x / 100),
+    y: Math.round((height - cropHeight) * y / 100),
+    width: cropWidth,
+    height: cropHeight
+  };
+}
+function currentFrame() {
+  let [w, h] = format.value.split(',').map(Number);
+  if (orientation.value === 'landscape') [w, h] = [h, w];
+  return cropBox(frameImage.naturalWidth, frameImage.naturalHeight, w, h, Number(frameX.value), Number(frameY.value));
+}
+function showFramePreview() {
+  if (!frameImage) return;
+  const box = currentFrame();
+  const scale = Math.min(1, 512 / Math.max(box.width, box.height));
+  framePreview.width = Math.max(1, Math.round(box.width * scale));
+  framePreview.height = Math.max(1, Math.round(box.height * scale));
+  framePreview.getContext('2d').drawImage(frameImage, box.x, box.y, box.width, box.height, 0, 0, framePreview.width, framePreview.height);
+  frameX.disabled = box.width === frameImage.naturalWidth;
+  frameY.disabled = box.height === frameImage.naturalHeight;
+  frameStatus.textContent = box.width + ' × ' + box.height + ' px · resolución original del recorte';
+}
+async function openFraming(source, label) {
+  frameImage = undefined;
+  framing.hidden = true;
+  const url = source.src;
+  try {
+    await source.decode();
+    if (url !== source.src || source.closest('figure').hidden) return;
+    frameImage = source;
+    orientation.value = source.naturalWidth > source.naturalHeight ? 'landscape' : 'portrait';
+    frameX.value = frameY.value = '50';
+    document.querySelector('#frame-source').textContent = label;
+    framing.hidden = false;
+    showFramePreview();
+    framing.scrollIntoView({block: 'start'});
+  } catch {
+    return;
+  }
+}
+function closeFraming() {
+  frameImage = undefined;
+  framing.hidden = true;
+  framePreview.width = framePreview.height = 1;
+}
+for (const control of [format, orientation, frameX, frameY]) control.oninput = showFramePreview;
+frameCutout.onclick = () => openFraming(after, 'PNG transparente');
+frameComposite.onclick = () => openFraming(composite, 'Foto con fondo');
+saveFrame.onclick = async () => {
+  if (!frameImage || saveFrame.disabled) return;
+  const box = currentFrame();
+  const name = 'foto-' + format.value.replace(',', 'x') + '.png';
+  saveFrame.disabled = true;
+  try {
+    const canvas = new OffscreenCanvas(box.width, box.height);
+    canvas.getContext('2d').drawImage(frameImage, box.x, box.y, box.width, box.height, 0, 0, box.width, box.height);
+    const png = await canvas.convertToBlob({type: 'image/png'});
+    const link = document.createElement('a');
+    const url = URL.createObjectURL(png);
+    link.href = url;
+    link.download = name;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+  } catch {
+    frameStatus.textContent = 'No se pudo exportar el encuadre.';
+  } finally {
+    saveFrame.disabled = false;
+  }
+};
 const maskTools = document.querySelector('#mask-tools');
 const eraseToggle = document.querySelector('#erase-toggle');
 const eraseOptions = document.querySelector('#erase-options');
@@ -868,6 +978,8 @@ eraseToggle.onclick = () => {
   setEraseMode(!eraseMode);
 };
 function showCutout(png) {
+  closeFraming();
+  frameCutout.hidden = false;
   cutoutBlob = png;
   if (outputUrl) URL.revokeObjectURL(outputUrl);
   outputUrl = URL.createObjectURL(png);
@@ -998,6 +1110,8 @@ const composite = document.querySelector('#composite');
 const saveComposite = document.querySelector('#save-composite');
 
 function clearComposite() {
+  if (frameImage === composite) closeFraming();
+  frameComposite.hidden = true;
   hairTools.hidden = true;
   marking = false;
   strokes = [];
@@ -1050,7 +1164,9 @@ function composeBackground(selectedStrokes, generate = false) {
     if (compositeUrl) URL.revokeObjectURL(compositeUrl);
     compositeUrl = URL.createObjectURL(image);
     hairTools.hidden = false;
+    if (frameImage === composite) closeFraming();
     composite.src = compositeUrl;
+    frameComposite.hidden = false;
     composite.closest('figure').hidden = false;
     saveComposite.href = compositeUrl;
     saveComposite.hidden = false;
@@ -1071,6 +1187,8 @@ function composeBackground(selectedStrokes, generate = false) {
 }
 
 function clearOutput() {
+  closeFraming();
+  frameCutout.hidden = true;
   previousCutout = undefined;
   maskTools.hidden = true;
   eraseStatus.textContent = '';
