@@ -31,6 +31,8 @@ input{display:block;margin:1rem 0;max-width:100%}
 <p><label for="fine"><input id="fine" type="checkbox" checked> Bordes finos y limpieza de halo por color local</label></p>
 <button id="cut" disabled>Quitar fondo</button>
 <button id="cut-cpu" disabled>Probar en CPU</button>
+<button id="cut-portrait" disabled>Recorte de retrato (MODNet)</button>
+<p>MODNet analiza retratos en el dispositivo. Al elegirlo se descarga el modelo de 25 MiB.</p>
 <p id="photo-status" role="status"></p>
 <div class="previews">
 <figure hidden><figcaption>Original</figcaption><img id="before" alt="Foto original"></figure>
@@ -408,7 +410,7 @@ self.onmessage = async ({data: {cutout, background, strokes, original, generate}
 };
 </script>
 <script id="model-worker" type="text/plain">
-self.onmessage = async ({data: {backend, photo, fineEdges}}) => {
+self.onmessage = async ({data: {backend, photo, fineEdges, portrait}}) => {
 const runtimeBase = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
 const modelURL = 'https://huggingface.co/nfa04/u2netp-onnx/resolve/main/u2netp.onnx';
 // Equivalencia para MaxPool 2×2, stride 2 y sin padding explícito.
@@ -621,23 +623,25 @@ try {
   const ort = await import(runtimeBase + (backend === 'webgpu' ? 'ort.webgpu.min.mjs' : 'ort.wasm.min.mjs'));
   ort.env.wasm.wasmPaths = runtimeBase;
   ort.env.wasm.numThreads = 1;
-  const response = await fetch(modelURL);
+  const portraitURL = 'https://huggingface.co/Xenova/modnet/resolve/fa2fa546052fba4c08921230a26cc69a333fca12/onnx/model.onnx';
+  const response = await fetch(portrait ? portraitURL : modelURL);
   if (!response.ok) throw new Error('Descarga del modelo: HTTP ' + response.status);
   const bytes = await response.arrayBuffer();
   const checksum = await sha256(bytes);
-  if (checksum !== '309c8469258dda742793dce0ebea8e6dd393174f89934733ecc8b14c76f4ddd8') {
+  const expectedHash = portrait ? '07c308cf0fc7e6e8b2065a12ed7fc07e1de8febb7dc7839d7b7f15dd66584df9' : '309c8469258dda742793dce0ebea8e6dd393174f89934733ecc8b14c76f4ddd8';
+  if (checksum !== expectedHash) {
     throw new Error('El archivo recibido no coincide con la versión del modelo.');
   }
   const downloadMiB = bytes.byteLength / 1048576;
-  const model = backend === 'webgpu' ? adaptWebGpuModel(bytes) : bytes;
-  if (backend === 'webgpu' && await sha256(model) !== 'a606d95ea45914f7856169e7941492acedc0a709e0d15355c78f30ed82b4fc44') {
+  const model = !portrait && backend === 'webgpu' ? adaptWebGpuModel(bytes) : bytes;
+  if (!portrait && backend === 'webgpu' && await sha256(model) !== 'a606d95ea45914f7856169e7941492acedc0a709e0d15355c78f30ed82b4fc44') {
     throw new Error('El modelo adaptado no pasó la verificación.');
   }
   session = await ort.InferenceSession.create(model, {
     executionProviders: [backend],
     ...(backend === 'webgpu' ? {extra: {session: {disable_cpu_ep_fallback: '1'}}} : {})
   });
-  const side = 320;
+  const side = portrait ? 512 : 320;
   const pixels = new Float32Array(3 * side * side);
   if (bitmap) {
     const sample = new OffscreenCanvas(side, side).getContext('2d', {willReadFrequently: true});
@@ -653,7 +657,7 @@ try {
     }
     for (let channel = 0; channel < 3; channel++) {
       for (let i = 0; i < side * side; i++) {
-        pixels[channel * side * side + i] = (rgba[4 * i + channel] / maximum - means[channel]) / deviations[channel];
+        pixels[channel * side * side + i] = portrait ? rgba[4 * i + channel] / 127.5 - 1 : (rgba[4 * i + channel] / maximum - means[channel]) / deviations[channel];
       }
     }
   } else for (let y = 80; y < 240; y++) {
@@ -681,7 +685,7 @@ try {
     if (hasBanding(mask, side, high - low)) {
       throw new Error('La máscara presenta franjas repetidas. Se descartó el recorte.');
     }
-    const prior = Float32Array.from(mask, value => (value - low) / (high - low));
+    const prior = Float32Array.from(mask, value => portrait ? Math.max(0, Math.min(1, value)) : (value - low) / (high - low));
     const alphaCanvas = new OffscreenCanvas(side, side);
     const alphaContext = alphaCanvas.getContext('2d');
     const alpha = alphaContext.createImageData(side, side);
@@ -709,7 +713,7 @@ try {
     }
     png = await canvas.convertToBlob({type: 'image/png'});
   }
-  self.postMessage({ok: true, png, message: 'Inferencia completada en ' + (backend === 'webgpu' ? 'WebGPU' : 'CPU/WASM') + ' en ' + Math.round(elapsed) + ' ms. Archivo ONNX verificado: ' + downloadMiB.toFixed(2) + ' MiB.'});
+  self.postMessage({ok: true, png, message: (portrait ? 'MODNet: inferencia completada en ' : 'Inferencia completada en ') + (backend === 'webgpu' ? 'WebGPU' : 'CPU/WASM') + ' en ' + Math.round(elapsed) + ' ms. Archivo ONNX verificado: ' + downloadMiB.toFixed(2) + ' MiB.'});
 } catch (error) {
   self.postMessage({message: 'No se completó la prueba del modelo. ' + error.message});
 } finally {
@@ -811,6 +815,7 @@ let profile;
 const picker = document.querySelector('#photo');
 const cut = document.querySelector('#cut');
 const cutCpu = document.querySelector('#cut-cpu');
+const cutPortrait = document.querySelector('#cut-portrait');
 const photoStatus = document.querySelector('#photo-status');
 const before = document.querySelector('#before');
 const after = document.querySelector('#after');
@@ -1214,6 +1219,7 @@ function busy(value) {
   picker.disabled = value;
   cut.disabled = value || !picker.files[0] || picker.files[0].size > 20000000;
   cutCpu.disabled = cut.disabled;
+  cutPortrait.disabled = cut.disabled;
 }
 picker.onchange = () => {
   clearOutput();
@@ -1249,6 +1255,11 @@ cutCpu.onclick = () => {
   busy(true);
   runModel('wasm', '', picker.files[0]);
 };
+cutPortrait.onclick = () => {
+  if (cutPortrait.disabled) return;
+  busy(true);
+  runModel('wasm', '', picker.files[0], true);
+};
 function updateProfile(next) {
   profile = next;
   budget.textContent = profile
@@ -1272,11 +1283,11 @@ function testModel(photo) {
   }
 }
 
-function runModel(backend, note = '', photo) {
+function runModel(backend, note = '', photo, portrait = false) {
   const feedback = photo ? photoStatus : decision;
   const gpu = backend === 'webgpu';
   const name = gpu ? 'WebGPU' : 'CPU/WASM';
-  feedback.textContent = note + 'Cargando U²-Net pequeño en ' + name + '…';
+  feedback.textContent = note + 'Cargando ' + (portrait ? 'MODNet' : 'U²-Net pequeño') + ' en ' + name + '…';
   if (gpu) {
     try { localStorage.setItem(pendingGpuKey, '1'); } catch {}
   }
@@ -1295,7 +1306,10 @@ function runModel(backend, note = '', photo) {
       }
     }
     feedback.textContent = note + message;
-    if (png) showCutout(png);
+    if (png) {
+      if (portrait) clearOutput();
+      showCutout(png);
+    }
     busy(false);
   };
   try {
@@ -1303,7 +1317,7 @@ function runModel(backend, note = '', photo) {
     worker.onmessage = ({data}) => finish(data);
     worker.onerror = () => finish({message: 'El navegador interrumpió el worker.'});
     timeout = setTimeout(() => finish({message: 'La prueba superó el tiempo límite.'}), gpu ? 45000 : 90000);
-    worker.postMessage({backend, photo, fineEdges: fine.checked});
+    worker.postMessage({backend, photo, fineEdges: fine.checked, portrait});
   } catch (error) {
     finish({message: error.message});
   }
