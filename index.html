@@ -391,8 +391,62 @@ async function regenerateEdge(ctx, edge, subject, width, height) {
   }
 }
 
-self.onmessage = async ({data: {cutout, background, strokes, original, generate}}) => {
-  let subject, backdrop, originalPhoto;
+function blendMarkedEdge(ctx, subject, current, strokes) {
+  const {width, height} = subject;
+  const scale = Math.min(1, 480 / Math.max(width, height));
+  const w = Math.max(1, Math.round(width * scale));
+  const h = Math.max(1, Math.round(height * scale));
+  const brush = new OffscreenCanvas(w, h).getContext('2d');
+  const radius = Math.max(3, Math.min(w, h) * 0.035);
+  brush.lineWidth = radius * 2;
+  brush.lineCap = brush.lineJoin = 'round';
+  for (const [[x, y], ...points] of strokes) {
+    brush.beginPath();
+    brush.arc(x * w, y * h, radius, 0, Math.PI * 2);
+    brush.fill();
+    brush.beginPath();
+    brush.moveTo(x * w, y * h);
+    for (const [px, py] of points) brush.lineTo(px * w, py * h);
+    brush.stroke();
+  }
+  const marked = brush.getImageData(0, 0, w, h).data;
+  const tile = new OffscreenCanvas(width, Math.min(height, 64)).getContext('2d', {willReadFrequently: true});
+  let changed = false;
+  for (let top = 0; top < height; top += 64) {
+    const rows = Math.min(64, height - top);
+    const background = ctx.getImageData(0, top, width, rows).data;
+    tile.clearRect(0, 0, width, rows);
+    tile.drawImage(subject, 0, top, width, rows, 0, 0, width, rows);
+    const matte = tile.getImageData(0, 0, width, rows).data;
+    tile.clearRect(0, 0, width, rows);
+    tile.drawImage(current, 0, top, width, rows, 0, 0, width, rows);
+    const strip = tile.getImageData(0, 0, width, rows);
+    for (let y = 0; y < rows; y++) {
+      const row = Math.floor((y + top) * h / height) * w;
+      for (let x = 0; x < width; x++) {
+        const p = (y * width + x) * 4;
+        const amount = edgeBlendAmount(matte[p + 3], marked[(row + Math.floor(x * w / width)) * 4 + 3]);
+        if (!amount) continue;
+        for (let c = 0; c < 3; c++) {
+          const before = strip.data[p + c];
+          const after = Math.round(before + (background[p + c] - before) * amount);
+          if (before !== after) changed = true;
+          strip.data[p + c] = after;
+        }
+      }
+    }
+    ctx.putImageData(strip, 0, top);
+  }
+  return changed;
+}
+function edgeBlendAmount(opacity, mark) {
+  if (opacity < 4 || opacity >= 235 || !mark) return 0;
+  const a = opacity / 255;
+  return 0.52 * Math.min(1, opacity / 22) * (1 - a) * (mark / 255);
+}
+
+self.onmessage = async ({data: {cutout, background, strokes, original, generate, currentComposition}}) => {
+  let subject, backdrop, originalPhoto, current;
   try {
     subject = await createImageBitmap(cutout);
     backdrop = await createImageBitmap(background);
@@ -411,6 +465,13 @@ self.onmessage = async ({data: {cutout, background, strokes, original, generate}
     ctx.drawImage(backdrop, (width - bgWidth) / 2, (height - bgHeight) / 2, bgWidth, bgHeight);
     backdrop.close();
     backdrop = undefined;
+    if (currentComposition) {
+      current = await createImageBitmap(currentComposition);
+      if (current.width !== width || current.height !== height) throw new Error('La composición y el recorte tienen dimensiones distintas.');
+      const integrated = blendMarkedEdge(ctx, subject, current, strokes);
+      self.postMessage({image: await canvas.convertToBlob({type: 'image/png'}), integrated});
+      return;
+    }
     if (strokes.length) {
       originalPhoto = await createImageBitmap(original);
       if (originalPhoto.width !== width || originalPhoto.height !== height) throw new Error('La foto original y el recorte tienen dimensiones distintas.');
@@ -429,6 +490,7 @@ self.onmessage = async ({data: {cutout, background, strokes, original, generate}
     subject?.close();
     backdrop?.close();
     originalPhoto?.close();
+    current?.close();
   }
 };
 </script>
@@ -856,7 +918,7 @@ const photoStatus = document.querySelector('#photo-status');
 const before = document.querySelector('#before');
 const after = document.querySelector('#after');
 const download = document.querySelector('#download');
-let originalUrl, outputUrl, cutoutBlob, compositeUrl;
+let originalUrl, outputUrl, cutoutBlob, compositeUrl, compositeBlob;
 
 const frameCutout = document.querySelector('#frame-cutout');
 const frameComposite = document.querySelector('#frame-composite');
@@ -1160,6 +1222,7 @@ function clearComposite() {
   refreshHairControls();
   if (compositeUrl) URL.revokeObjectURL(compositeUrl);
   compositeUrl = undefined;
+  compositeBlob = undefined;
   composite.removeAttribute('src');
   composite.closest('figure').hidden = true;
   saveComposite.hidden = true;
@@ -1177,17 +1240,17 @@ composeButton.onclick = () => {
   composeBackground([]);
 };
 applyHair.onclick = () => {
-  if (!applyHair.disabled) composeBackground(strokes);
+  if (!applyHair.disabled && compositeBlob) composeBackground(strokes, false, compositeBlob);
 };
 generateHair.onclick = () => {
   if (!generateHair.disabled) composeBackground(strokes, true);
 };
-function composeBackground(selectedStrokes, generate = false) {
+function composeBackground(selectedStrokes, generate = false, currentComposition) {
   composing = true;
   marking = false;
   refreshHairControls();
   busy(true);
-  composeStatus.textContent = selectedStrokes.length ? 'Separando cabello y restos del fondo original…' : 'Preparando la composición…';
+  composeStatus.textContent = currentComposition ? 'Suavizando el borde sobre la composición actual…' : selectedStrokes.length ? 'Separando cabello y restos del fondo original…' : 'Preparando la composición…';
   const code = document.querySelector('#compose-worker').textContent;
   const url = URL.createObjectURL(new Blob([code], {type: 'text/javascript'}));
   let worker, timeout;
@@ -1203,6 +1266,7 @@ function composeBackground(selectedStrokes, generate = false) {
       return;
     }
     if (compositeUrl) URL.revokeObjectURL(compositeUrl);
+    compositeBlob = image;
     compositeUrl = URL.createObjectURL(image);
     hairTools.hidden = false;
     if (frameImage === composite) closeFraming();
@@ -1211,7 +1275,7 @@ function composeBackground(selectedStrokes, generate = false) {
     composite.closest('figure').hidden = false;
     saveComposite.href = compositeUrl;
     saveComposite.hidden = false;
-    composeStatus.textContent = generated ? 'Borde reconstruido con MI-GAN.' : generate ? 'La IA no produjo un cambio visible en el borde marcado. Para restos opacos, usá Quitar restos del fondo.' : integrated ? 'Composición con cabello integrado y halo corregido.' : selectedStrokes.length ? 'Marcá una zona donde el cabello toque el fondo.' : 'Fondo aplicado. Ya podés marcar el cabello.';
+    composeStatus.textContent = generated ? 'Borde reconstruido con MI-GAN.' : generate ? 'La IA no produjo un cambio visible en el borde marcado. Para restos opacos, usá Quitar restos del fondo.' : integrated ? 'Unión del cabello suavizada sobre la composición actual.' : selectedStrokes.length ? 'Marcá una zona donde el cabello toque el fondo.' : 'Fondo aplicado. Ya podés marcar el cabello.';
   };
   try {
     worker = new Worker(url);
@@ -1221,7 +1285,7 @@ function composeBackground(selectedStrokes, generate = false) {
     };
     worker.onerror = () => finish({error: 'El navegador interrumpió la composición.'});
     timeout = setTimeout(() => finish({error: 'La composición superó el tiempo límite.'}), generate ? 150000 : 45000);
-    worker.postMessage({cutout: cutoutBlob, background: background.files[0], strokes: selectedStrokes, original: picker.files[0], generate});
+    worker.postMessage({cutout: cutoutBlob, background: background.files[0], strokes: selectedStrokes, original: currentComposition ? undefined : picker.files[0], generate, currentComposition});
   } catch (error) {
     finish({error: error.message});
   }
