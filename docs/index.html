@@ -92,6 +92,7 @@ input{display:block;margin:1rem 0;max-width:100%}
 <h2>Diagnóstico de GPU</h2>
 <p>Ejecuta una convolución sintética en cuatro tamaños hasta 2048 × 2048. El resultado muestra la mayor carga completada en esta prueba. La VRAM libre y el rendimiento de un modelo ONNX requieren mediciones distintas.</p>
 <button id="run">Probar este dispositivo y el modelo</button>
+<button id="benchmark-cpu">Medir U²-Net en CPU</button>
 <p id="status" role="status"></p>
 <dl id="result"></dl>
 <section>
@@ -122,6 +123,12 @@ function fitHairColor(pixels, pixel, guide, hair, original, background) {
   const separation = Math.max(0, Math.min(1, (energy - 1600) / 7500));
   const confidence = separation * Math.max(0, 1 - residual / 4800);
   return {coverage, confidence};
+}
+
+function markedEdgeWeight(mark, opacity) {
+  if (mark < 100 || opacity < 12 || opacity >= 235) return 0;
+  const ramp = Math.min(1, (opacity - 11) / 22, (235 - opacity) / 33);
+  return Math.round(220 * ramp * mark / 255);
 }
 
 function integrateHair(ctx, subject, originalPhoto, width, height, strokes, generate) {
@@ -156,26 +163,36 @@ function integrateHair(ctx, subject, originalPhoto, width, height, strokes, gene
   const backgroundSeeds = new Int32Array(w * h).fill(-1);
   const weights = generate ? new Uint8Array(w * h) : null;
   let anchors = 0;
+  let holes = 0;
   const alphaAt = (x, y) => guide[(Math.min(h - 1, Math.max(0, y)) * w + Math.min(w - 1, Math.max(0, x))) * 4 + 3];
   const clamp = value => Math.max(0, Math.min(1, value));
   for (let y = 1; y < h - 1; y++) {
     for (let x = 1; x < w - 1; x++) {
       const i = y * w + x;
       const a = guide[i * 4 + 3];
-      if (marked[i * 4 + 3] < 100 || a < 6 || a > 245) continue;
-      const dx = alphaAt(x + 1, y) - alphaAt(x - 1, y);
-      const dy = alphaAt(x, y + 1) - alphaAt(x, y - 1);
+      const mark = marked[i * 4 + 3];
+      if (weights) {
+        weights[i] = markedEdgeWeight(mark, a);
+        if (weights[i]) holes++;
+      }
+      if (mark < 100 || a < 6 || a > 245) continue;
+      let dx = alphaAt(x + 1, y) - alphaAt(x - 1, y);
+      let dy = alphaAt(x, y + 1) - alphaAt(x, y - 1);
+      if (Math.hypot(dx, dy) < 9) {
+        dx = alphaAt(x + 4, y) - alphaAt(x - 4, y);
+        dy = alphaAt(x, y + 4) - alphaAt(x, y - 4);
+      }
       const gradient = Math.hypot(dx, dy);
       if (gradient < 9) continue;
       const nx = dx / gradient, ny = dy / gradient;
-      for (let step = 2; step <= 13; step++) {
+      for (let step = 2; step <= 19; step++) {
         const px = Math.round(x + nx * step), py = Math.round(y + ny * step);
         if (px < 0 || py < 0 || px >= w || py >= h) break;
         const anchor = py * w + px;
         if (guide[anchor * 4 + 3] >= 250) {
           seeds[i] = anchor;
           anchors++;
-          strength[i] = clamp(1 - (step - 2) / 17);
+          strength[i] = clamp(1 - (step - 2) / 24);
           break;
         }
       }
@@ -191,9 +208,6 @@ function integrateHair(ctx, subject, originalPhoto, width, height, strokes, gene
       }
       if (backgroundSeeds[i] >= 0) {
         const fit = fitHairColor(originalGuide, i * 4, guide, seeds[i] * 4, originalGuide, backgroundSeeds[i] * 4);
-        if (weights && a >= 22 && a < 225 && fit.confidence > 0.38 && fit.coverage < 0.56) {
-          weights[i] = Math.round(225 * Math.min(1, (0.62 - fit.coverage) * 2.4) * fit.confidence);
-        }
         if (fit.confidence > 0.45 && fit.coverage < 0.18) continue;
       }
       if (a < 74 || a > 182 || (x * 37 + y * 59) % 19 !== 0) continue;
@@ -217,7 +231,11 @@ function integrateHair(ctx, subject, originalPhoto, width, height, strokes, gene
       ctx.stroke();
     }
   }
-  if (!anchors) return false;
+  if (!anchors) {
+    if (!holes) return false;
+    ctx.drawImage(subject, 0, 0);
+    return {weights, w, h};
+  }
   const tile = new OffscreenCanvas(width, Math.min(height, 64));
   const tileContext = tile.getContext('2d', {willReadFrequently: true});
   const originalTile = new OffscreenCanvas(width, Math.min(height, 64)).getContext('2d', {willReadFrequently: true});
@@ -245,7 +263,7 @@ function integrateHair(ctx, subject, originalPhoto, width, height, strokes, gene
           continue;
         }
         const modelWeight = (fit?.confidence || 0) * strength[i];
-        const mix = Math.max(strength[i] * (0.34 + (1 - a) * 0.63), modelWeight);
+        const mix = Math.max(strength[i] * (0.55 + (1 - a) * 0.45), modelWeight);
         let opacity = a * (1 - 0.72 * strength[i] * (1 - a) ** 2);
         if (fit && fit.coverage < a) {
           opacity += modelWeight * 0.85 * (fit.coverage - opacity);
@@ -337,14 +355,18 @@ async function regenerateEdge(ctx, edge, subject, width, height) {
       throw new Error('MI-GAN devolvió un formato inesperado.');
     }
     const patch = sample.createImageData(cw, ch);
+    let changes = 0;
     for (let i = 0; i < plane; i++) {
       for (let c = 0; c < 3; c++) patch.data[4 * i + c] = result.data[c * plane + i];
       patch.data[4 * i + 3] = alpha[i];
+      if (alpha[i] && [0, 1, 2].some(c => Math.abs(input.data[4 * i + c] - result.data[c * plane + i]) * alpha[i] / 255 >= 4)) changes++;
     }
+    if (!changes) return false;
     sample.putImageData(patch, 0, 0);
     // Nearest-neighbor keeps the edit inside the selected low-resolution cells.
     const band = new OffscreenCanvas(cropWidth, Math.min(64, cropHeight)).getContext('2d', {willReadFrequently: true});
     band.imageSmoothingEnabled = false;
+    let applied = false;
     for (let row = 0; row < cropHeight; row += 64) {
       const rows = Math.min(64, cropHeight - row);
       band.clearRect(0, 0, cropWidth, rows);
@@ -354,12 +376,13 @@ async function regenerateEdge(ctx, edge, subject, width, height) {
       band.drawImage(tile, 0, -row, cropWidth, cropHeight);
       const patchBand = band.getImageData(0, 0, cropWidth, rows);
       for (let p = 3; p < patchBand.data.length; p += 4) {
-        if (protectedPixels[p] >= 245) patchBand.data[p] = 0;
+        if (protectedPixels[p] >= 235) patchBand.data[p] = 0;
+        else if (patchBand.data[p]) applied = true;
       }
       band.putImageData(patchBand, 0, 0);
       ctx.drawImage(band.canvas, 0, 0, cropWidth, rows, x0, y0 + row, cropWidth, rows);
     }
-    return true;
+    return applied;
   } finally {
     imageTensor.dispose();
     maskTensor.dispose();
@@ -620,6 +643,7 @@ try {
       throw new Error('La foto supera 16 megapíxeles o 8192 píxeles por lado.');
     }
   }
+  const preparation = performance.now();
   const ort = await import(runtimeBase + (backend === 'webgpu' ? 'ort.webgpu.min.mjs' : 'ort.wasm.min.mjs'));
   ort.env.wasm.wasmPaths = runtimeBase;
   ort.env.wasm.numThreads = 1;
@@ -666,9 +690,20 @@ try {
     }
   }
   input = new ort.Tensor('float32', pixels, [1, 3, side, side]);
+  const feeds = {[session.inputNames[0]]: input};
+  const names = [session.outputNames[0]];
+  const preparationMs = performance.now() - preparation;
   const start = performance.now();
-  outputs = await session.run({[session.inputNames[0]]: input}, [session.outputNames[0]]);
+  outputs = await session.run(feeds, names);
   const elapsed = performance.now() - start;
+  let warmTime = '';
+  if (!bitmap) {
+    for (const tensor of Object.values(outputs)) tensor.dispose();
+    outputs = undefined;
+    const warmStart = performance.now();
+    outputs = await session.run(feeds, names);
+    warmTime = ' Segunda inferencia (misma sesión): ' + Math.round(performance.now() - warmStart) + ' ms.';
+  }
   const mask = outputs[session.outputNames[0]].data;
   if (mask.length !== side * side || !mask.every(Number.isFinite)) {
     throw new Error('La máscara ONNX no pasó la validación.');
@@ -713,7 +748,7 @@ try {
     }
     png = await canvas.convertToBlob({type: 'image/png'});
   }
-  self.postMessage({ok: true, png, message: (portrait ? 'MODNet: inferencia completada en ' : 'Inferencia completada en ') + (backend === 'webgpu' ? 'WebGPU' : 'CPU/WASM') + ' en ' + Math.round(elapsed) + ' ms. Archivo ONNX verificado: ' + downloadMiB.toFixed(2) + ' MiB.'});
+  self.postMessage({ok: true, png, message: (portrait ? 'MODNet: inferencia completada en ' : 'Inferencia completada en ') + (backend === 'webgpu' ? 'WebGPU' : 'CPU/WASM') + ' en ' + Math.round(elapsed) + ' ms (primera ejecución). Preparación: ' + Math.round(preparationMs) + ' ms.' + warmTime + ' Archivo ONNX verificado: ' + downloadMiB.toFixed(2) + ' MiB.'});
 } catch (error) {
   self.postMessage({message: 'No se completó la prueba del modelo. ' + error.message});
 } finally {
@@ -806,6 +841,7 @@ self.onmessage = async () => {
 </script>
 <script>
 const button = document.querySelector('#run');
+const benchmarkCpu = document.querySelector('#benchmark-cpu');
 const status = document.querySelector('#status');
 const result = document.querySelector('#result');
 const storageKey = 'agarsito-gpu-convolution-v2';
@@ -1175,7 +1211,7 @@ function composeBackground(selectedStrokes, generate = false) {
     composite.closest('figure').hidden = false;
     saveComposite.href = compositeUrl;
     saveComposite.hidden = false;
-    composeStatus.textContent = generated ? 'Borde reconstruido con MI-GAN.' : generate ? 'No se detectaron restos de fondo con suficiente confianza para reconstruir.' : integrated ? 'Composición con cabello integrado y halo corregido.' : selectedStrokes.length ? 'Marcá una zona donde el cabello toque el fondo.' : 'Fondo aplicado. Ya podés marcar el cabello.';
+    composeStatus.textContent = generated ? 'Borde reconstruido con MI-GAN.' : generate ? 'La IA no produjo un cambio visible en el borde marcado. Para restos opacos, usá Quitar restos del fondo.' : integrated ? 'Composición con cabello integrado y halo corregido.' : selectedStrokes.length ? 'Marcá una zona donde el cabello toque el fondo.' : 'Fondo aplicado. Ya podés marcar el cabello.';
   };
   try {
     worker = new Worker(url);
@@ -1210,6 +1246,7 @@ function clearOutput() {
 }
 function busy(value) {
   button.disabled = value;
+  benchmarkCpu.disabled = value;
   eraseToggle.disabled = value;
   eraseApply.disabled = value || !eraseStrokes.length;
   eraseUndo.disabled = value || !previousCutout;
@@ -1330,6 +1367,10 @@ try {
   }
 } catch {}
 button.onclick = () => startDiagnostic();
+benchmarkCpu.onclick = () => {
+  busy(true);
+  runModel('wasm');
+};
 function startDiagnostic(photo) {
   const url = URL.createObjectURL(new Blob([document.querySelector('#worker').textContent], {type: 'text/javascript'}));
   let worker, timeout, latestReport = {};
