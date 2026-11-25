@@ -75,6 +75,7 @@ input{display:block;margin:1rem 0;max-width:100%}
 <input id="restore-strength" type="range" min="0" max="100" value="50">
 <canvas id="restore-preview" style="width:100%;height:auto" aria-label="Vista previa de la mejora"></canvas>
 <button id="save-restore">Descargar resultado</button>
+<button id="use-restored">Usar restauración para seguir editando</button>
 </div>
 </section>
 <script id="restore-worker" type="text/plain">
@@ -666,6 +667,7 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic}}) 
 <button id="generate-hair" disabled>Reconstruir borde con IA</button>
 <p>MI-GAN se descarga al usar esta opción (28,1 MB). La foto se procesa en el dispositivo.</p>
 </div>
+<button id="use-composite" hidden>Usar foto con fondo para seguir editando</button>
 <a id="save-composite" download="foto-con-fondo.png" hidden>Descargar foto con fondo</a>
 </section>
 <button id="frame-composite" hidden>Encuadrar foto con fondo</button>
@@ -692,6 +694,19 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic}}) 
 <canvas id="frame-preview" aria-label="Vista previa del encuadre"></canvas>
 <p id="frame-status" role="status"></p>
 <button id="save-frame">Descargar PNG encuadrado</button>
+</section>
+<section id="color-tools" hidden>
+<h2>Ajustar color</h2>
+<label for="edit-light">Iluminación <output id="value-light">0</output></label>
+<input id="edit-light" type="range" min="-100" max="100" value="0">
+<label for="edit-temp">Temperatura <output id="value-temp">0</output></label>
+<input id="edit-temp" type="range" min="-100" max="100" value="0">
+<label for="edit-sat">Saturación <output id="value-sat">0</output></label>
+<input id="edit-sat" type="range" min="-100" max="100" value="0">
+<canvas id="color-preview" style="width:100%;height:auto" aria-label="Vista previa de color"></canvas>
+<p id="color-status" role="status"></p>
+<button id="use-color">Usar ajuste para seguir editando</button>
+<button id="save-color">Descargar ajuste</button>
 </section>
 <h2>Diagnóstico de GPU</h2>
 <p>Ejecuta una convolución sintética en cuatro tamaños hasta 2048 × 2048. El resultado muestra la mayor carga completada en esta prueba. La VRAM libre y el rendimiento de un modelo ONNX requieren mediciones distintas.</p>
@@ -1537,7 +1552,9 @@ const photoStatus = document.querySelector('#photo-status');
 const before = document.querySelector('#before');
 const after = document.querySelector('#after');
 const download = document.querySelector('#download');
-let originalUrl, outputUrl, cutoutBlob, compositeUrl, compositeBlob;
+let originalUrl, outputUrl, cutoutBlob, compositeUrl, compositeBlob, workingPhoto, composedResult;
+const useComposite = document.querySelector('#use-composite');
+const useRestored = document.querySelector('#use-restored');
 
 const frameCutout = document.querySelector('#frame-cutout');
 const frameComposite = document.querySelector('#frame-composite');
@@ -1860,7 +1877,8 @@ function clearComposite() {
   refreshHairControls();
   if (compositeUrl) URL.revokeObjectURL(compositeUrl);
   compositeUrl = undefined;
-  compositeBlob = undefined;
+  compositeBlob = composedResult = undefined;
+  useComposite.hidden = true;
   composite.removeAttribute('src');
   composite.closest('figure').hidden = true;
   saveComposite.hidden = true;
@@ -1910,6 +1928,8 @@ async function composeBackground(selectedStrokes, generate = false, currentCompo
     }
     if (compositeUrl) URL.revokeObjectURL(compositeUrl);
     compositeBlob = cleanImage;
+    composedResult = image;
+    useComposite.hidden = false;
     compositeUrl = URL.createObjectURL(image);
     hairTools.hidden = false;
     if (frameImage === composite) closeFraming();
@@ -1932,7 +1952,7 @@ async function composeBackground(selectedStrokes, generate = false, currentCompo
     };
     worker.onerror = () => finish({error: 'El navegador interrumpió la composición.'});
     timeout = setTimeout(() => finish({error: 'La composición superó el tiempo límite.'}), generate ? 150000 : 45000);
-    worker.postMessage({cutout: cutoutBlob, background: backdrop, mesh: overlay, catalogBackground: !!number, strokes: selectedStrokes, original: currentComposition ? undefined : picker.files[0], generate, currentComposition});
+    worker.postMessage({cutout: cutoutBlob, background: backdrop, mesh: overlay, catalogBackground: !!number, strokes: selectedStrokes, original: currentComposition ? undefined : workingPhoto, generate, currentComposition});
   } catch (error) {
     finish({error: error.message});
   }
@@ -1965,27 +1985,44 @@ const restoreStrength = document.querySelector('#restore-strength');
 const restoreValue = document.querySelector('#restore-value');
 const restorePreview = document.querySelector('#restore-preview');
 const restoreSave = document.querySelector('#save-restore');
-let restoredBitmap, restoreOriginal, restoreReference, restoreFile;
+let restoredBitmap, restoreOriginal, restoreReference, restoreFile, correction;
 
 function clearRestoration() {
   restoredBitmap?.close();
   restoreOriginal?.close();
   restoreReference?.close();
-  restoredBitmap = restoreOriginal = restoreReference = restoreFile = undefined;
+  restoredBitmap = restoreOriginal = restoreReference = restoreFile = correction = undefined;
   restoreResult.hidden = true;
   restorePreview.width = restorePreview.height = 1;
   restoreStatus.textContent = '';
 }
-function addRestorationDelta(original, reference, restored, strength) {
+function addRestorationDelta(original, field, strength) {
   for (let i = 0; i < original.length; i += 4) {
-    if (original[i + 3] === 0 || reference[i + 3] < 250 || restored[i + 3] < 250) continue;
+    if (original[i + 3] === 0 || field[i + 3] < 250) continue;
     for (let c = 0; c < 3; c++) {
-      const delta = restored[i + c] - reference[i + c];
+      const delta = field[i + c] - 128;
       original[i + c] += strength * Math.max(-45, Math.min(45, delta));
     }
   }
 }
 
+function makeCorrectionField(reference, restored, width, height) {
+  const canvas = new OffscreenCanvas(width, height);
+  const ctx = canvas.getContext('2d', {willReadFrequently:true});
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(reference, 0, 0, width, height);
+  const base = ctx.getImageData(0, 0, width, height);
+  ctx.clearRect(0, 0, width, height);
+  ctx.drawImage(restored, 0, 0, width, height);
+  const result = ctx.getImageData(0, 0, width, height);
+  const field = ctx.createImageData(width, height);
+  for (let p = 0; p < field.data.length; p += 4) {
+    for (let c = 0; c < 3; c++) field.data[p+c] = 128 + Math.max(-45,Math.min(45,result.data[p+c]-base.data[p+c]));
+    field.data[p+3] = Math.min(base.data[p+3],result.data[p+3]);
+  }
+  ctx.putImageData(field, 0, 0);
+  return canvas;
+}
 function paintRestoration(canvas, strength) {
   const ctx = canvas.getContext('2d');
   const {width, height} = canvas;
@@ -2004,9 +2041,8 @@ function paintRestoration(canvas, strength) {
   for (let top = 0; top < height; top += 128) {
     const rows = Math.min(128, height - top);
     const original = sample(restoreOriginal, top, rows);
-    const reference = sample(restoreReference, top, rows);
-    const restored = sample(restoredBitmap, top, rows);
-    addRestorationDelta(original.data, reference.data, restored.data, strength);
+    const field = sample(correction, top, rows);
+    addRestorationDelta(original.data, field.data, strength);
     ctx.putImageData(original, 0, top);
   }
 }
@@ -2021,7 +2057,7 @@ function startRestoration(useCpu) {
   clearRestoration();
   busy(true);
   restoreMode.disabled = true;
-  const photo = picker.files[0];
+  const photo = workingPhoto;
   const code = document.querySelector('#restore-worker').textContent;
   const url = URL.createObjectURL(new Blob([code], {type: 'text/javascript'}));
   let worker, timer, finished = false;
@@ -2037,6 +2073,7 @@ function startRestoration(useCpu) {
       restoreOriginal = await createImageBitmap(photo);
       restoredBitmap = await createImageBitmap(data.png);
       restoreReference = await createImageBitmap(data.reference);
+      correction = makeCorrectionField(restoreReference, restoredBitmap, data.width, data.height);
       restoreFile = photo;
       const scale = Math.min(1, 640 / Math.max(restoreOriginal.width, restoreOriginal.height));
       restorePreview.width = Math.max(1, Math.round(restoreOriginal.width * scale));
@@ -2065,29 +2102,24 @@ function startRestoration(useCpu) {
     worker.postMessage({photo, variant: restoreMode.value, useCpu, probeMiB: profile?.probeMiB});
   } catch (error) { finish({error: error.message}); }
 };
-restoreSave.onclick = async () => {
-  if (!restoreFile || restoreSave.disabled) return;
+async function finishRestoration(continueEditing) {
+  if(!restoreFile || restoreSave.disabled) return;
   busy(true);
-  const strength = Number(restoreStrength.value) / 100;
-  try {
-    let file = restoreFile;
-    let name = file.name;
-    if (strength) {
-      const canvas = new OffscreenCanvas(restoreOriginal.width, restoreOriginal.height);
-      paintRestoration(canvas, strength);
-      file = await canvas.convertToBlob({type: 'image/png'});
-      name = 'foto-mejorada.png';
+  try{
+    const strength=Number(restoreStrength.value)/100;
+    let blob=restoreFile;
+    if(strength){
+      const canvas=new OffscreenCanvas(restoreOriginal.width,restoreOriginal.height);
+      paintRestoration(canvas,strength);
+      blob=await canvas.convertToBlob({type:'image/png'});
     }
-    const url = URL.createObjectURL(file);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = name;
-    link.click();
-    setTimeout(() => URL.revokeObjectURL(url), 30000);
-  } catch (error) {
-    restoreStatus.textContent = 'No se pudo descargar el resultado. ' + error.message;
-  } finally { busy(false); }
-};
+    if(continueEditing) setWorkingPhoto(blob,'Foto restaurada',true);
+    else downloadEdit(blob,blob.name || 'foto-mejorada.png');
+  }catch(error){restoreStatus.textContent='No se pudo guardar el resultado. '+error.message;}
+  finally{busy(false);}
+}
+restoreSave.onclick=()=>finishRestoration(false);
+useRestored.onclick=()=>finishRestoration(true);
 
 const diagnoseButton = document.querySelector('#restore-diagnostic');
 const report = document.querySelector('#restore-report');
@@ -2133,11 +2165,104 @@ diagnoseButton.onclick = () => {
   } catch (error) { finish(error.message); }
 };
 
+const colorTools=document.querySelector('#color-tools'), colorPreview=document.querySelector('#color-preview'), colorStatus=document.querySelector('#color-status');
+const useColor=document.querySelector('#use-color'), saveColor=document.querySelector('#save-color');
+const colorKeys=['light','temp','sat'], colorSliders=colorKeys.map(key=>document.querySelector('#edit-'+key));
+let colorBitmap, colorVersion=0, editorBusy=false;
+function colorPixels(data, light, temperature, saturation) {
+  const exposure=2**(light/100), warmth=temperature*0.0025, chroma=1+saturation/100;
+  for(let i=0;i<data.length;i+=4){
+    if (!data[i+3]) continue;
+    const r=data[i]*exposure*(1+warmth), g=data[i+1]*exposure, b=data[i+2]*exposure*(1-warmth);
+    const gray=r*.2126+g*.7152+b*.0722;
+    data[i]=gray+(r-gray)*chroma;
+    data[i+1]=gray+(g-gray)*chroma;
+    data[i+2]=gray+(b-gray)*chroma;
+  }
+}
+function paintColors(canvas) {
+  const ctx=canvas.getContext('2d',{willReadFrequently:true});
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  ctx.drawImage(colorBitmap,0,0,canvas.width,canvas.height);
+  const values=colorSliders.map(slider=>Number(slider.value));
+  if (!values.some(Boolean)) return;
+  for(let y=0;y<canvas.height;y+=128){
+    const pixels=ctx.getImageData(0,y,canvas.width,Math.min(128,canvas.height-y));
+    colorPixels(pixels.data,...values);
+    ctx.putImageData(pixels,0,y);
+  }
+}
+function redrawColors(){
+  colorSliders.forEach((slider,i)=>{document.querySelector('#value-'+colorKeys[i]).textContent=slider.value;});
+  if(colorBitmap) paintColors(colorPreview);
+}
+for(const slider of colorSliders) slider.oninput=redrawColors;
+async function refreshColorSource(){
+  const version=++colorVersion;
+  colorBitmap?.close();
+  colorBitmap=undefined;
+  colorTools.hidden=!workingPhoto;
+  useColor.disabled=saveColor.disabled=true;
+  colorSliders.forEach(slider=>{slider.value='0';});
+  colorStatus.textContent='';
+  colorPreview.width=colorPreview.height=1;
+  redrawColors();
+  if(!workingPhoto) return;
+  try{
+    const bitmap=await createImageBitmap(workingPhoto);
+    if(version!==colorVersion){bitmap.close();return;}
+    if(bitmap.width*bitmap.height>16000000 || Math.max(bitmap.width,bitmap.height)>8192){
+      bitmap.close();
+      throw Error('La foto supera los límites de tamaño del editor.');
+    }
+    colorBitmap=bitmap;
+    const scale=Math.min(1,640/Math.max(bitmap.width,bitmap.height));
+    colorPreview.width=Math.max(1,Math.round(bitmap.width*scale));
+    colorPreview.height=Math.max(1,Math.round(bitmap.height*scale));
+    redrawColors();
+    useColor.disabled=saveColor.disabled=editorBusy;
+  }catch(error){if(version===colorVersion) colorStatus.textContent=error.message;}
+}
+function downloadEdit(blob,name){
+  const url=URL.createObjectURL(blob);
+  const link=document.createElement('a');
+  link.href=url;
+  link.download=name;
+  link.click();
+  setTimeout(()=>URL.revokeObjectURL(url),30000);
+}
+async function finishColor(continueEditing){
+  if(!colorBitmap || editorBusy) return;
+  busy(true);
+  try{
+    let blob=workingPhoto;
+    if(colorSliders.some(slider=>Number(slider.value))){
+      const canvas=new OffscreenCanvas(colorBitmap.width,colorBitmap.height);
+      paintColors(canvas);
+      blob=await canvas.convertToBlob({type:'image/png'});
+    }
+    if(continueEditing) setWorkingPhoto(blob,'Foto con color ajustado',true);
+    else downloadEdit(blob,blob.name || 'foto-color.png');
+  }catch(error){colorStatus.textContent=error.message;}
+  finally{busy(false);}
+}
+useColor.onclick=()=>finishColor(true);
+saveColor.onclick=()=>finishColor(false);
+useComposite.onclick=()=>{
+  if(composedResult && !editorBusy) setWorkingPhoto(composedResult,'Foto con fondo',true);
+};
+
 function busy(value) {
+  editorBusy = value;
+  restoreStrength.disabled = value;
+  colorSliders.forEach(slider=>{slider.disabled=value;});
   diagnoseButton.disabled = value;
-  restoreButton.disabled = value || !picker.files[0] || picker.files[0].size > 20000000;
+  restoreButton.disabled = value || !workingPhoto;
   restoreCpu.disabled = restoreButton.disabled;
   restoreSave.disabled = value;
+  useRestored.disabled = value;
+  useComposite.disabled = value;
+  useColor.disabled = saveColor.disabled = value || !colorBitmap;
   button.disabled = value;
   benchmarkCpu.disabled = value;
   eraseToggle.disabled = value;
@@ -2147,30 +2272,34 @@ function busy(value) {
   background.disabled = catalogBackground.disabled = catalogMesh.disabled = value;
   composeButton.disabled = value || !cutoutBlob || (!catalogBackground.value.trim() && (!background.files[0] || background.files[0].size > 20000000));
   picker.disabled = value;
-  cut.disabled = value || !picker.files[0] || picker.files[0].size > 20000000;
+  cut.disabled = value || !workingPhoto;
   cutCpu.disabled = cut.disabled;
   cutPortrait.disabled = cut.disabled;
 }
-picker.onchange = () => {
+picker.onchange = () => setWorkingPhoto(picker.files[0], 'Original');
+
+function setWorkingPhoto(file, label, fromEdit = false) {
+  workingPhoto = !fromEdit && file?.size > 20000000 ? undefined : file;
   clearRestoration();
   clearOutput();
   if (originalUrl) URL.revokeObjectURL(originalUrl);
   before.removeAttribute('src');
   before.parentElement.hidden = true;
-  const file = picker.files[0];
   photoStatus.textContent = '';
-  if (file && file.size <= 20000000) {
-    originalUrl = URL.createObjectURL(file);
+  if (workingPhoto) {
+    before.closest('figure').querySelector('figcaption').textContent = label;
+    originalUrl = URL.createObjectURL(workingPhoto);
     before.src = originalUrl;
     before.parentElement.hidden = false;
   } else if (file) {
     photoStatus.textContent = 'La foto supera el límite de 20 MB.';
   }
   busy(false);
-};
+  refreshColorSource();
+}
 cut.onclick = () => {
-  const file = picker.files[0];
-  if (!file || file.size > 20000000 || cut.disabled) return;
+  const file = workingPhoto;
+  if (!file || cut.disabled) return;
   clearOutput();
   if (profile) {
     busy(true);
@@ -2184,12 +2313,12 @@ cutCpu.onclick = () => {
   if (cutCpu.disabled) return;
   clearOutput();
   busy(true);
-  runModel('wasm', '', picker.files[0]);
+  runModel('wasm', '', workingPhoto);
 };
 cutPortrait.onclick = () => {
   if (cutPortrait.disabled) return;
   busy(true);
-  runModel('wasm', '', picker.files[0], true);
+  runModel('wasm', '', workingPhoto, true);
 };
 function updateProfile(next) {
   profile = next;
