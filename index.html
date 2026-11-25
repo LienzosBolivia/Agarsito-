@@ -566,6 +566,10 @@ async function diagnoseRestoration(ort, model, adapter, note) {
   }
 }
 
+function isRestorationMemoryError(error) {
+  return /out.of.memory|allocation|buffer.*size|memoria insuficiente/i.test(error.message);
+}
+
 let paused = false;
 let resumeProcessing;
 async function waitForRestorationResume() {
@@ -609,6 +613,9 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic, co
       const maxBuffer = super2 ? Math.max(area*4,coreArea*16) : width*height*16;
       return 4866418 + area*960 + buffers <= plan.budget && maxBuffer <= bindingLimit;
     });
+    if (super2 && !tiles.length && Math.min(width,32+2*plan.halo)*Math.min(height,32+2*plan.halo)*256 <= bindingLimit) {
+      tiles.push(32);
+    }
     if (!diagnostic && !quick && !tiles.length) throw Error('El presupuesto estimado no alcanza para el bloque mínimo de Real-ESRGAN en GPU.');
     const source = new OffscreenCanvas(width,height).getContext('2d',{willReadFrequently:true});
     source.imageSmoothingQuality = 'high';
@@ -691,106 +698,178 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic, co
       }
       throw Error('No se validó la salida de la GPU. ' + failures.join(' | ') + ' Podés probar este modelo en CPU.');
     }
-    async function infer(core, halo) {
-      self.postMessage({progress:0,backend,core,budget:plan.budget/1048576});
-      const ort = await import(runtime + (backend === 'webgpu' ? 'ort.webgpu.min.mjs' : 'ort.wasm.min.mjs'));
-      ort.env.wasm.wasmPaths = runtime;
-      ort.env.wasm.numThreads = 1;
-      if (adapter) ort.env.webgpu.adapter = adapter;
+    const halo = plan.halo;
+    function blockAt(core, x, y) {
+      const left = Math.max(0,x-halo), top = Math.max(0,y-halo);
+      const cw = Math.min(core,width-x), ch = Math.min(core,height-y);
+      const w = Math.min(width,x+cw+halo)-left;
+      const h = Math.min(height,y+ch+halo)-top;
+      return {cw,ch,args:[left,top,w,h,x,y,cw,ch]};
+    }
+
+    async function prepareGpuPixels(ort, core) {
+      const area = Math.min(width,core+2*halo)*Math.min(height,core+2*halo);
+      const limit = Math.min(bindingLimit,ort.env.webgpu.device.limits.maxStorageBufferBindingSize,ort.env.webgpu.device.limits.maxBufferSize);
+      const keepOnGpu = width*height*16 <= limit && 4866418 + area*960 + width*height*36 <= plan.budget;
+      const outputByTile = super2 && !keepOnGpu;
+      const coreArea = Math.min(width,core)*Math.min(height,core);
+      const uploadByTile = outputByTile && (width*height*4 > limit ||
+        4866418 + area*960 + width*height*4 + coreArea*32 > plan.budget);
+      const pixels = await createRestorationGpu(ort,source,width,height,outputByTile ? core : 0,area,uploadByTile);
+      return {pixels,uploadByTile};
+    }
+
+    async function withGpuMemoryScope(device, work) {
+      if (!device) return work();
+      device.pushErrorScope('out-of-memory');
+      try {
+        return await work();
+      } finally {
+        const error = await device.popErrorScope();
+        if (error) throw Error('Memoria insuficiente en WebGPU: ' + error.message);
+      }
+    }
+
+    async function selectSuperresolutionTiles(ort, result) {
+      const session = await createRestorationSession(ort);
+      const device = ort.env.webgpu.device;
+      const limit = Math.min(bindingLimit,device.limits.maxStorageBufferBindingSize,device.limits.maxBufferSize);
+      const candidates = [...new Set([tiles[0],64,96,128].map(core => Math.min(core,Math.max(width,height))))]
+        .filter(core => Math.min(width,core+2*halo)*Math.min(height,core+2*halo)*256 <= limit)
+        .sort((a,b) => a-b);
+      const measured = [];
+      try {
+        for (const core of candidates) {
+          await waitForRestorationResume();
+          self.postMessage({phase:'Midiendo Real-ESRGAN en WebGPU con bloques de ' + core + ' px…'});
+          const x = Math.max(0,Math.floor((width-core)/2));
+          const y = Math.max(0,Math.floor((height-core)/2));
+          const {cw,ch,args} = blockAt(core,x,y);
+          let pixels;
+          try {
+            const rate = await withGpuMemoryScope(device,async () => {
+              ({pixels} = await prepareGpuPixels(ort,core));
+              await pixels.tile(session,...args,result);
+              await waitForRestorationResume();
+              const start = performance.now();
+              await pixels.tile(session,...args,result);
+              return cw*ch/Math.max(1,performance.now()-start);
+            });
+            measured.push({core,rate});
+          } catch (error) {
+            self.postMessage({phase:'Bloque de ' + core + ' px descartado. ' + error.message});
+            if (isRestorationMemoryError(error)) break;
+          } finally {
+            pixels?.release();
+          }
+        }
+      } finally {
+        await session.release();
+      }
+      const ranked = measured.sort((a,b) => b.rate-a.rate).map(({core}) => core);
+      if (!ranked.length) return tiles;
+      const [fastest] = ranked;
+      const smaller = [...new Set([...ranked,...tiles])].filter(core => core < fastest).sort((a,b) => b-a);
+      return [fastest,...smaller];
+    }
+
+    const ort = await import(runtime + (backend === 'webgpu' ? 'ort.webgpu.min.mjs' : 'ort.wasm.min.mjs'));
+    ort.env.wasm.wasmPaths = runtime;
+    ort.env.wasm.numThreads = 1;
+    if (adapter) ort.env.webgpu.adapter = adapter;
+    const result = new OffscreenCanvas(width*2,height*2).getContext('2d');
+    result.imageSmoothingQuality = 'high';
+
+    async function infer(core) {
+      self.postMessage({progress:0,backend,route,core,budget:plan.budget/1048576});
       const session = await createRestorationSession(ort);
       let firstTileMs, gpuPixels, uploadByTile;
       const timing = {blocks:0, uploadMs:0, runMs:0, finishMs:0, pngMs:0, restMs:0};
       let nextRest = performance.now() + 500;
+      const device = super2 ? ort.env.webgpu.device : null;
       try {
-        if (!useCpu) {
-          const area = Math.min(width,core+2*halo)*Math.min(height,core+2*halo);
-          const keepOnGpu = width*height*16 <= bindingLimit && 4866418 + area*960 + width*height*36 <= plan.budget;
-          const outputByTile = super2 && !keepOnGpu;
-          const coreArea = Math.min(width,core)*Math.min(height,core);
-          uploadByTile = outputByTile && (width*height*4 > bindingLimit ||
-            4866418 + area*960 + width*height*4 + coreArea*32 > plan.budget);
-          gpuPixels = await createRestorationGpu(ort, source, width, height, outputByTile ? core : 0, area, uploadByTile);
-        }
-        const result = new OffscreenCanvas(width * 2,height * 2).getContext('2d');
-        result.imageSmoothingQuality = 'high';
-        for (let y=0;y<height;y+=core) {
-          for (let x=0;x<width;x+=core) {
-            if (super2) await waitForRestorationResume();
-            const left=Math.max(0,x-halo), top=Math.max(0,y-halo);
-            const coreWidth=Math.min(core,width-x), coreHeight=Math.min(core,height-y);
-            const w=Math.min(width,x+coreWidth+halo)-left, h=Math.min(height,y+coreHeight+halo)-top;
-            const tileStart = performance.now();
-            if (gpuPixels) {
-              const tileTiming = await gpuPixels.tile(session,left,top,w,h,x,y,coreWidth,coreHeight,result);
-              timing.blocks++;
-              for (const key of ['uploadMs','runMs','finishMs']) timing[key] += tileTiming[key];
-              if (firstTileMs === undefined) firstTileMs = Math.round(performance.now() - tileStart);
-              self.postMessage({progress:Math.round(100*(y*width+coreHeight*(x+coreWidth))/(width*height)),backend,route,core,budget:plan.budget/1048576});
-              if (super2 && performance.now() >= nextRest && (x + core < width || y + core < height)) {
-                const restStart = performance.now();
-                await new Promise(resolve => setTimeout(resolve, 20));
-                timing.restMs += performance.now() - restStart;
-                nextRest = performance.now() + 500;
-              }
-              continue;
-            }
-            const rgba=source.getImageData(left,top,w,h).data;
-            const plane=w*h, data=new Float32Array(3*plane);
-            for(let c=0;c<3;c++) for(let i=0;i<plane;i++) data[c*plane+i]=rgba[4*i+c]/255;
-            const input=new ort.Tensor('float32',data,[1,3,h,w]);
-            let outputs;
-            try {
-              const start = performance.now();
-              outputs=await session.run({[session.inputNames[0]]:input});
-              const output=outputs[session.outputNames[0]];
-              const ow=w*4, oh=h*4, n=ow*oh;
-              const values = output.location === 'cpu' ? output.data : await output.getData();
-              if(output.dims.join(',')!==[1,3,oh,ow].join(',') || !values.every(Number.isFinite)) throw Error('Salida inesperada del modelo.');
-              if (firstTileMs === undefined) {
-                firstTileMs = Math.round(performance.now() - start);
-                self.postMessage({phase: route + ' completó el bloque de prueba en ' + firstTileMs + ' ms. Continuando…'});
-              }
-              const pixels=result.createImageData(coreWidth*2,coreHeight*2);
-              for(let row=0;row<pixels.height;row++){
-                const sy=(y-top)*4+row*2;
-                for(let col=0;col<pixels.width;col++){
-                  const sx=(x-left)*4+col*2;
-                  const dst=(row*pixels.width+col)*4;
-                  const src=sy*ow+sx;
-                  for(let c=0;c<3;c++){
-                    const p=c*n+src;
-                    pixels.data[dst+c]=(values[p]+values[p+1]+values[p+ow]+values[p+ow+1])*63.75;
-                  }
-                  pixels.data[dst+3]=rgba[(Math.floor(sy/4)*w+Math.floor(sx/4))*4+3];
+        return await withGpuMemoryScope(device,async () => {
+          if (!useCpu) ({pixels:gpuPixels,uploadByTile} = await prepareGpuPixels(ort,core));
+          for (let y=0;y<height;y+=core) {
+            for (let x=0;x<width;x+=core) {
+              if (super2) await waitForRestorationResume();
+              const {cw:coreWidth,ch:coreHeight,args} = blockAt(core,x,y);
+              const [left,top,w,h] = args;
+              const tileStart = performance.now();
+              if (gpuPixels) {
+                const tileTiming = await gpuPixels.tile(session,...args,result);
+                timing.blocks++;
+                for (const key of ['uploadMs','runMs','finishMs']) timing[key] += tileTiming[key];
+                if (firstTileMs === undefined) firstTileMs = Math.round(performance.now() - tileStart);
+                self.postMessage({progress:Math.round(100*(y*width+coreHeight*(x+coreWidth))/(width*height)),backend,route,core,budget:plan.budget/1048576});
+                if (super2 && performance.now() >= nextRest && (x + core < width || y + core < height)) {
+                  const restStart = performance.now();
+                  await new Promise(resolve => setTimeout(resolve, 20));
+                  timing.restMs += performance.now() - restStart;
+                  nextRest = performance.now() + 500;
                 }
+                continue;
               }
-              if (hasOutputStripes(pixels) && !hasOutputStripes({width:w,height:h,data:rgba})) throw Error('Se detectaron franjas en la salida. El resultado fue descartado. Probá el mismo modelo con la opción CPU.');
-              result.putImageData(pixels,x*2,y*2);
-              self.postMessage({progress:Math.round(100*(y*width+coreHeight*(x+coreWidth))/(width*height)),backend,route,core,budget:plan.budget/1048576});
-            } finally {
-              input.dispose();
-              for(const tensor of Object.values(outputs || {})) tensor.dispose();
+              const rgba=source.getImageData(left,top,w,h).data;
+              const plane=w*h, data=new Float32Array(3*plane);
+              for(let c=0;c<3;c++) for(let i=0;i<plane;i++) data[c*plane+i]=rgba[4*i+c]/255;
+              const input=new ort.Tensor('float32',data,[1,3,h,w]);
+              let outputs;
+              try {
+                const start = performance.now();
+                outputs=await session.run({[session.inputNames[0]]:input});
+                const output=outputs[session.outputNames[0]];
+                const ow=w*4, oh=h*4, n=ow*oh;
+                const values = output.location === 'cpu' ? output.data : await output.getData();
+                if(output.dims.join(',')!==[1,3,oh,ow].join(',') || !values.every(Number.isFinite)) throw Error('Salida inesperada del modelo.');
+                if (firstTileMs === undefined) {
+                  firstTileMs = Math.round(performance.now() - start);
+                  self.postMessage({phase: route + ' completó el bloque de prueba en ' + firstTileMs + ' ms. Continuando…'});
+                }
+                const pixels=result.createImageData(coreWidth*2,coreHeight*2);
+                for(let row=0;row<pixels.height;row++){
+                  const sy=(y-top)*4+row*2;
+                  for(let col=0;col<pixels.width;col++){
+                    const sx=(x-left)*4+col*2;
+                    const dst=(row*pixels.width+col)*4;
+                    const src=sy*ow+sx;
+                    for(let c=0;c<3;c++){
+                      const p=c*n+src;
+                      pixels.data[dst+c]=(values[p]+values[p+1]+values[p+ow]+values[p+ow+1])*63.75;
+                    }
+                    pixels.data[dst+3]=rgba[(Math.floor(sy/4)*w+Math.floor(sx/4))*4+3];
+                  }
+                }
+                if (hasOutputStripes(pixels) && !hasOutputStripes({width:w,height:h,data:rgba})) throw Error('Se detectaron franjas en la salida. El resultado fue descartado. Probá el mismo modelo con la opción CPU.');
+                result.putImageData(pixels,x*2,y*2);
+                self.postMessage({progress:Math.round(100*(y*width+coreHeight*(x+coreWidth))/(width*height)),backend,route,core,budget:plan.budget/1048576});
+              } finally {
+                input.dispose();
+                for(const tensor of Object.values(outputs || {})) tensor.dispose();
+              }
             }
           }
-        }
-        const pngStart = performance.now();
-        const png = await (gpuPixels ? gpuPixels.png(result) : result.canvas.convertToBlob({type:'image/png'}));
-        timing.pngMs = performance.now() - pngStart;
-        return {png, firstTileMs, timing, uploadByTile};
+          const pngStart = performance.now();
+          const png = await (gpuPixels ? gpuPixels.png(result) : result.canvas.convertToBlob({type:'image/png'}));
+          timing.pngMs = performance.now() - pngStart;
+          return {png, firstTileMs, timing, uploadByTile};
+        });
       } finally {
         gpuPixels?.release();
         await session.release();
       }
     }
-    for (const [index, core] of tiles.entries()) {
+    const selectedTiles = super2 ? await selectSuperresolutionTiles(ort,result) : tiles;
+    for (const [index, core] of selectedTiles.entries()) {
       try {
-        const {png, firstTileMs, timing, uploadByTile} = await infer(core, plan.halo);
+        const {png, firstTileMs, timing, uploadByTile} = await infer(core);
         self.postMessage({png,reference:await reference?.canvas.convertToBlob({type:'image/png'}),super2,route,width,height,core,firstTileMs,timing,uploadByTile,cpuThreads:navigator.hardwareConcurrency,processingMs:Math.round(performance.now()-processingStarted)});
         return;
       } catch (error) {
-        if (index === tiles.length - 1 || !/out.of.memory|allocation|buffer.*size/i.test(error.message)) {
+        if (index === selectedTiles.length - 1 || !isRestorationMemoryError(error)) {
           throw Error((useCpu ? 'CPU/WASM: ' : 'WebGPU: ') + error.message);
         }
+        self.postMessage({phase:'Memoria insuficiente para ' + core + ' px. Reintentando con ' + selectedTiles[index+1] + ' px…'});
       }
     }
   } catch(error) { self.postMessage({error:error.message}); }
@@ -2386,7 +2465,7 @@ function startRestoration(useCpu) {
       }
       if (data.phase) restoreStatus.textContent = data.phase;
       else if (data.progress === undefined) finish(data);
-      else restoreStatus.textContent = 'Procesando en ' + (data.route || (data.backend === 'webgpu' ? 'WebGPU' : 'CPU/WASM')) + (data.backend === 'webgpu' ? ' · presupuesto estimado: ' + data.budget.toFixed(1) + ' MiB' : '') + ' · bloque: ' + data.core + ' px · ' + data.progress + ' %';
+      else restoreStatus.textContent = 'Procesando en ' + (data.route || (data.backend === 'webgpu' ? 'WebGPU' : 'CPU/WASM')) + (data.backend === 'webgpu' ? ' · presupuesto estimado: ' + data.budget.toFixed(1) + ' MiB de referencia' : '') + ' · bloque: ' + data.core + ' px · ' + data.progress + ' %';
     };
     worker.onerror = () => finish({error: 'El navegador interrumpió la mejora.'});
     restartTimer();
