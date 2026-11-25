@@ -28,6 +28,32 @@ input{display:block;margin:1rem 0;max-width:100%}
 <p>Probá U²-Net con una foto de hasta 20 MB y 16 megapíxeles. El procesamiento se realiza en este navegador.</p>
 <label for="photo">Elegí una foto</label>
 <input id="photo" type="file" accept="image/*">
+<button id="frame-original" hidden>Encuadrar foto</button>
+<section id="framing" hidden>
+<h2>Encuadre</h2>
+<p id="frame-source"></p>
+<label for="print-format">Proporción de la medida</label>
+<select id="print-format">
+<option value="20,27">20 × 27 cm</option>
+<option value="16,22">16 × 22 cm</option>
+<option value="30,42">30 × 42 cm</option>
+<option value="40,50">50 × 40 cm</option>
+<option value="50,60">50 × 60 cm</option>
+<option value="50,110">50 × 110 cm</option>
+</select>
+<label for="print-orientation">Orientación</label>
+<select id="print-orientation"><option value="portrait">Vertical</option><option value="landscape">Horizontal</option></select>
+<label for="frame-x">Posición horizontal</label>
+<input type="range" id="frame-x" min="0" max="100" value="50">
+<label for="frame-y">Posición vertical</label>
+<input type="range" id="frame-y" min="0" max="100" value="50">
+<label for="frame-zoom">Zoom del encuadre</label>
+<input type="range" id="frame-zoom" min="100" max="250" value="100">
+<canvas id="frame-preview" aria-label="Vista previa del encuadre"></canvas>
+<p id="frame-status" role="status"></p>
+<button id="apply-frame" hidden>Aplicar encuadre</button>
+<button id="save-frame">Descargar PNG encuadrado</button>
+</section>
 <p><label for="fine"><input id="fine" type="checkbox" checked> Bordes finos y limpieza de halo por color local</label></p>
 <button id="cut" disabled>Quitar fondo</button>
 <button id="cut-cpu" disabled>Probar en CPU</button>
@@ -648,31 +674,7 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic}}) 
 };
 </script>
 <button id="frame-cutout" hidden>Encuadrar antes de colocar fondo</button>
-<section id="framing" hidden>
-<h2>Encuadre</h2>
-<p id="frame-source"></p>
-<label for="print-format">Proporción de la medida</label>
-<select id="print-format">
-<option value="20,27">20 × 27 cm</option>
-<option value="16,22">16 × 22 cm</option>
-<option value="30,42">30 × 42 cm</option>
-<option value="40,50">50 × 40 cm</option>
-<option value="50,60">50 × 60 cm</option>
-<option value="50,110">50 × 110 cm</option>
-</select>
-<label for="print-orientation">Orientación</label>
-<select id="print-orientation"><option value="portrait">Vertical</option><option value="landscape">Horizontal</option></select>
-<label for="frame-x">Posición horizontal</label>
-<input type="range" id="frame-x" min="0" max="100" value="50">
-<label for="frame-y">Posición vertical</label>
-<input type="range" id="frame-y" min="0" max="100" value="50">
-<label for="frame-zoom">Zoom del encuadre</label>
-<input type="range" id="frame-zoom" min="100" max="250" value="100">
-<canvas id="frame-preview" aria-label="Vista previa del encuadre"></canvas>
-<p id="frame-status" role="status"></p>
-<button id="apply-frame" hidden>Aplicar encuadre y elegir fondo</button>
-<button id="save-frame">Descargar PNG encuadrado</button>
-</section>
+
 <section id="composition" hidden>
 <h2>Colocar un fondo</h2>
 <label for="background">Elegí una imagen de fondo</label>
@@ -1560,6 +1562,7 @@ let originalUrl, outputUrl, cutoutBlob, compositeUrl, compositeBlob, workingPhot
 const useComposite = document.querySelector('#use-composite');
 const useRestored = document.querySelector('#use-restored');
 
+const frameOriginal = document.querySelector('#frame-original');
 const frameCutout = document.querySelector('#frame-cutout');
 const frameComposite = document.querySelector('#frame-composite');
 const framing = document.querySelector('#framing');
@@ -1572,7 +1575,7 @@ const framePreview = document.querySelector('#frame-preview');
 const frameStatus = document.querySelector('#frame-status');
 const saveFrame = document.querySelector('#save-frame');
 const applyFrame = document.querySelector('#apply-frame');
-let frameImage;
+let frameImage, frameRequest = 0;
 
 function cropBox(width, height, ratioWidth, ratioHeight, x, y, zoom = 1) {
   const ratio = ratioWidth / ratioHeight;
@@ -1602,14 +1605,15 @@ function showFramePreview() {
   frameStatus.textContent = box.width + ' × ' + box.height + ' px · resolución original del recorte';
 }
 async function openFraming(source, label) {
+  const request = ++frameRequest;
   frameImage = undefined;
   framing.hidden = true;
   const url = source.src;
   try {
     await source.decode();
-    if (url !== source.src || source.closest('figure').hidden) return;
+    if (request !== frameRequest || url !== source.src || source.closest('figure').hidden) return;
     frameImage = source;
-    applyFrame.hidden = source !== after;
+    applyFrame.hidden = source !== before && source !== after;
     orientation.value = source.naturalWidth > source.naturalHeight ? 'landscape' : 'portrait';
     frameX.value = frameY.value = '50';
     frameZoom.value = '100';
@@ -1622,11 +1626,13 @@ async function openFraming(source, label) {
   }
 }
 function closeFraming() {
+  ++frameRequest;
   frameImage = undefined;
   framing.hidden = true;
   framePreview.width = framePreview.height = 1;
 }
 for (const control of [format, orientation, frameX, frameY, frameZoom]) control.oninput = showFramePreview;
+frameOriginal.onclick = () => openFraming(before, 'Encuadrá la foto antes de continuar. No es necesario quitar el fondo.');
 frameCutout.onclick = () => openFraming(after, 'Encuadrá la silueta antes de elegir el fondo.');
 frameComposite.onclick = () => openFraming(composite, 'Foto con fondo');
 async function framedPng(source, box) {
@@ -1635,10 +1641,17 @@ async function framedPng(source, box) {
   return await canvas.convertToBlob({type:'image/png'});
 }
 applyFrame.onclick = async () => {
-  if (editorBusy || frameImage !== after || !cutoutBlob || !workingPhoto) return;
+  if (editorBusy || !workingPhoto || (frameImage !== before && (frameImage !== after || !cutoutBlob))) return;
+  const source = frameImage;
   const box = currentFrame();
   busy(true);
   try {
+    if (source === before) {
+      const original = await framedPng(source, box);
+      setWorkingPhoto(original, 'Foto encuadrada', true);
+      photoStatus.textContent = 'Encuadre aplicado: ' + box.width + ' × ' + box.height + ' px. Podés seguir editando, quitar el fondo o conservarlo.';
+      return;
+    }
     await before.decode();
     if (before.naturalWidth !== after.naturalWidth || before.naturalHeight !== after.naturalHeight) {
       throw Error('Las dimensiones del original y del recorte no coinciden.');
@@ -2300,7 +2313,11 @@ useComposite.onclick=()=>{
 
 function busy(value) {
   editorBusy = value;
-  applyFrame.disabled = frameCutout.disabled = frameComposite.disabled = value;
+  applyFrame.disabled = frameOriginal.disabled = frameCutout.disabled = frameComposite.disabled = value;
+  saveFrame.disabled = value;
+  format.disabled = orientation.disabled = frameZoom.disabled = value;
+  if (value) frameX.disabled = frameY.disabled = true;
+  else if (frameImage) showFramePreview();
   restoreStrength.disabled = value;
   colorSliders.forEach(slider=>{slider.disabled=value;});
   diagnoseButton.disabled = value;
@@ -2323,7 +2340,10 @@ function busy(value) {
   cutCpu.disabled = cut.disabled;
   cutPortrait.disabled = cut.disabled;
 }
-picker.onchange = () => setWorkingPhoto(picker.files[0], 'Original');
+picker.onchange = () => {
+  setWorkingPhoto(picker.files[0], 'Original');
+  if (workingPhoto) openFraming(before, 'Primer paso: encuadrá la foto o continuá sin cambiar el encuadre.');
+};
 
 function setWorkingPhoto(file, label, fromEdit = false) {
   workingPhoto = !fromEdit && file?.size > 20000000 ? undefined : file;
@@ -2341,6 +2361,7 @@ function setWorkingPhoto(file, label, fromEdit = false) {
   } else if (file) {
     photoStatus.textContent = 'La foto supera el límite de 20 MB.';
   }
+  frameOriginal.hidden = !workingPhoto;
   busy(false);
   refreshColorSource();
 }
