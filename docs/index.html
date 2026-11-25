@@ -51,6 +51,104 @@ input{display:block;margin:1rem 0;max-width:100%}
 <p id="erase-status" role="status"></p>
 </section>
 <a id="download" download="foto-sin-fondo.png" hidden>Descargar PNG transparente</a>
+<section id="restore">
+<h2>Mejorar calidad</h2>
+<p>La intensidad afecta toda la foto. Compará las facciones con el original antes de exportar.</p>
+<label for="restore-mode">Modelo</label>
+<select id="restore-mode">
+<option value="light">Mejora suave de píxeles</option>
+<option value="strong">Restauración intensa de ruido y compresión</option>
+</select>
+<button id="run-restore" disabled>Procesar foto original</button>
+<p id="restore-status" role="status"></p>
+<div id="restore-result" hidden>
+<label for="restore-strength">Intensidad <output id="restore-value">50 %</output></label>
+<input id="restore-strength" type="range" min="0" max="100" value="50">
+<canvas id="restore-preview" style="width:100%;height:auto" aria-label="Vista previa de la mejora"></canvas>
+<button id="save-restore">Descargar resultado</button>
+</div>
+</section>
+<script id="restore-worker" type="text/plain">
+self.onmessage = async ({data: {photo, variant, gpu}}) => {
+  let image;
+  try {
+    image = await createImageBitmap(photo);
+    if (image.width * image.height > 16000000 || Math.max(image.width,image.height) > 8192) throw Error('La foto supera el tamaño admitido.');
+    const scale = Math.min(1, 768 / Math.max(image.width, image.height));
+    const width = Math.max(1, Math.round(image.width * scale));
+    const height = Math.max(1, Math.round(image.height * scale));
+    const source = new OffscreenCanvas(width,height).getContext('2d',{willReadFrequently:true});
+    source.imageSmoothingQuality = 'high';
+    source.drawImage(image,0,0,width,height);
+    image.close();
+    image = undefined;
+    const file = variant === 'strong' ? 'realesr-general-x4v3' : 'realesr-general-wdn-x4v3';
+    const response = await fetch('https://huggingface.co/thisismert/real-esrgan-onnx/resolve/main/onnx/' + file + '.onnx');
+    if (!response.ok) throw Error('No se pudo descargar el modelo (HTTP ' + response.status + ').');
+    const model = new Uint8Array(await response.arrayBuffer());
+    const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', model));
+    const checksum = Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join('');
+    const expected = variant === 'strong' ? '5518a106453e751655edc12f208973207ab8355d0cafc1816b8a9041b01810dd' : '1a94b28646b806071cf2d8d2d28d71e7f4b0cfc375536aa00c6c70856f115ece';
+    if (checksum !== expected) throw Error('El archivo del modelo no coincide con la versión verificada.');
+    const runtime = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
+    async function infer(backend) {
+      const ort = await import(runtime + (backend === 'webgpu' ? 'ort.webgpu.min.mjs' : 'ort.wasm.min.mjs'));
+      ort.env.wasm.wasmPaths = runtime;
+      ort.env.wasm.numThreads = 1;
+      const options = {executionProviders: [backend]};
+      if (backend === 'webgpu') options.extra = {session: {disable_cpu_ep_fallback: '1'}};
+      const session = await ort.InferenceSession.create(model, options);
+      try {
+        const result = new OffscreenCanvas(width * 2,height * 2).getContext('2d');
+        result.imageSmoothingQuality = 'high';
+        for (let y=0;y<height;y+=96) {
+          for (let x=0;x<width;x+=96) {
+            const left=Math.max(0,x-40), top=Math.max(0,y-40);
+            const coreWidth=Math.min(96,width-x), coreHeight=Math.min(96,height-y);
+            const w=Math.min(width,x+coreWidth+40)-left, h=Math.min(height,y+coreHeight+40)-top;
+            const rgba=source.getImageData(left,top,w,h).data;
+            const plane=w*h, data=new Float32Array(3*plane);
+            for(let c=0;c<3;c++) for(let i=0;i<plane;i++) data[c*plane+i]=rgba[4*i+c]/255;
+            const input=new ort.Tensor('float32',data,[1,3,h,w]);
+            let outputs;
+            try {
+              outputs=await session.run({[session.inputNames[0]]:input});
+              const output=outputs[session.outputNames[0]];
+              const ow=w*4, oh=h*4, n=ow*oh;
+              const values = output.data;
+              if(output.dims.join(',')!==[1,3,oh,ow].join(',') || !values.every(Number.isFinite)) throw Error('Salida inesperada del modelo.');
+              const patch=new OffscreenCanvas(ow,oh).getContext('2d');
+              const pixels=patch.createImageData(ow,oh);
+              for(let i=0;i<n;i++){
+                for(let c=0;c<3;c++) pixels.data[4*i+c]=values[c*n+i]*255;
+                const sx=Math.floor(i%ow/4), sy=Math.floor(i/ow/4);
+                pixels.data[4*i+3]=rgba[(sy*w+sx)*4+3];
+              }
+              patch.putImageData(pixels,0,0);
+              result.drawImage(patch.canvas,(x-left)*4,(y-top)*4,coreWidth*4,coreHeight*4,x*2,y*2,coreWidth*2,coreHeight*2);
+            } finally {
+              input.dispose();
+              for(const tensor of Object.values(outputs || {})) tensor.dispose();
+            }
+          }
+          self.postMessage({progress:Math.round(Math.min(height,y+96)*100/height),backend});
+        }
+        return result.canvas.convertToBlob({type:'image/png'});
+      } finally { await session.release(); }
+    }
+    let backend = gpu ? 'webgpu' : 'wasm';
+    let png;
+    try { png=await infer(backend); } catch(error) {
+      if(!gpu) throw error;
+      backend='wasm';
+      self.postMessage({progress:0,backend});
+      png=await infer(backend);
+    }
+    self.postMessage({png,backend,width,height});
+  } catch(error) { self.postMessage({error:error.message}); }
+  finally { image?.close(); }
+};
+</script>
 <button id="frame-cutout" hidden>Encuadrar PNG transparente</button>
 <section id="composition" hidden>
 <h2>Colocar un fondo</h2>
@@ -81,6 +179,9 @@ input{display:block;margin:1rem 0;max-width:100%}
 <select id="print-format">
 <option value="20,27">20 × 27 cm</option>
 <option value="16,22">16 × 22 cm</option>
+<option value="30,42">30 × 42 cm</option>
+<option value="40,50">50 × 40 cm</option>
+<option value="50,60">50 × 60 cm</option>
 <option value="50,110">50 × 110 cm</option>
 </select>
 <label for="print-orientation">Orientación</label>
@@ -1357,7 +1458,115 @@ function clearOutput() {
   download.hidden = true;
   download.removeAttribute('href');
 }
+
+const restoreButton = document.querySelector('#run-restore');
+const restoreMode = document.querySelector('#restore-mode');
+const restoreStatus = document.querySelector('#restore-status');
+const restoreResult = document.querySelector('#restore-result');
+const restoreStrength = document.querySelector('#restore-strength');
+const restoreValue = document.querySelector('#restore-value');
+const restorePreview = document.querySelector('#restore-preview');
+const restoreSave = document.querySelector('#save-restore');
+let restoredBitmap, restoreOriginal, restoreFile;
+
+function clearRestoration() {
+  restoredBitmap?.close();
+  restoreOriginal?.close();
+  restoredBitmap = restoreOriginal = restoreFile = undefined;
+  restoreResult.hidden = true;
+  restorePreview.width = restorePreview.height = 1;
+  restoreStatus.textContent = '';
+}
+function paintRestoration(canvas, strength) {
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.save();
+  ctx.imageSmoothingQuality = 'high';
+  ctx.globalAlpha = 1 - strength;
+  ctx.drawImage(restoreOriginal, 0, 0, canvas.width, canvas.height);
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.globalAlpha = strength;
+  ctx.drawImage(restoredBitmap, 0, 0, canvas.width, canvas.height);
+  ctx.restore();
+}
+restoreStrength.oninput = () => {
+  restoreValue.textContent = restoreStrength.value + ' %';
+  if (restoredBitmap) paintRestoration(restorePreview, Number(restoreStrength.value) / 100);
+};
+restoreButton.onclick = () => {
+  if (restoreButton.disabled) return;
+  clearRestoration();
+  busy(true);
+  restoreMode.disabled = true;
+  const photo = picker.files[0];
+  const code = document.querySelector('#restore-worker').textContent;
+  const url = URL.createObjectURL(new Blob([code], {type: 'text/javascript'}));
+  let worker, timer, finished = false;
+  restoreStatus.textContent = 'Cargando Real-ESRGAN…';
+  const finish = async data => {
+    if (finished) return;
+    finished = true;
+    clearTimeout(timer);
+    worker?.terminate();
+    URL.revokeObjectURL(url);
+    try {
+      if (!data.png) throw Error(data.error);
+      restoreOriginal = await createImageBitmap(photo);
+      restoredBitmap = await createImageBitmap(data.png);
+      restoreFile = photo;
+      const scale = Math.min(1, 640 / Math.max(restoreOriginal.width, restoreOriginal.height));
+      restorePreview.width = Math.max(1, Math.round(restoreOriginal.width * scale));
+      restorePreview.height = Math.max(1, Math.round(restoreOriginal.height * scale));
+      restoreStrength.value = '50';
+      restoreStrength.oninput();
+      restoreResult.hidden = false;
+      restoreStatus.textContent = 'Modelo ejecutado en ' + (data.backend === 'webgpu' ? 'WebGPU' : 'CPU/WASM') + ' · entrada de IA: ' + data.width + ' × ' + data.height + ' px.';
+    } catch (error) {
+      clearRestoration();
+      restoreStatus.textContent = error.message;
+    } finally {
+      restoreMode.disabled = false;
+      busy(false);
+    }
+  };
+  try {
+    worker = new Worker(url, {type: 'module'});
+    worker.onmessage = ({data}) => {
+      if (data.progress === undefined) finish(data);
+      else restoreStatus.textContent = 'Procesando en ' + (data.backend === 'webgpu' ? 'WebGPU' : 'CPU/WASM') + ' · ' + data.progress + ' %';
+    };
+    worker.onerror = () => finish({error: 'El navegador interrumpió la mejora.'});
+    timer = setTimeout(() => finish({error: 'La mejora superó el tiempo límite.'}), 240000);
+    worker.postMessage({photo, variant: restoreMode.value, gpu: profile?.probeMiB >= 32});
+  } catch (error) { finish({error: error.message}); }
+};
+restoreSave.onclick = async () => {
+  if (!restoreFile || restoreSave.disabled) return;
+  busy(true);
+  const strength = Number(restoreStrength.value) / 100;
+  try {
+    let file = restoreFile;
+    let name = file.name;
+    if (strength) {
+      const canvas = new OffscreenCanvas(restoreOriginal.width, restoreOriginal.height);
+      paintRestoration(canvas, strength);
+      file = await canvas.convertToBlob({type: 'image/png'});
+      name = 'foto-mejorada.png';
+    }
+    const url = URL.createObjectURL(file);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = name;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+  } catch (error) {
+    restoreStatus.textContent = 'No se pudo descargar el resultado. ' + error.message;
+  } finally { busy(false); }
+};
+
 function busy(value) {
+  restoreButton.disabled = value || !picker.files[0] || picker.files[0].size > 20000000;
+  restoreSave.disabled = value;
   button.disabled = value;
   benchmarkCpu.disabled = value;
   eraseToggle.disabled = value;
@@ -1372,6 +1581,7 @@ function busy(value) {
   cutPortrait.disabled = cut.disabled;
 }
 picker.onchange = () => {
+  clearRestoration();
   clearOutput();
   if (originalUrl) URL.revokeObjectURL(originalUrl);
   before.removeAttribute('src');
