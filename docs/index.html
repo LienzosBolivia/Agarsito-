@@ -166,7 +166,7 @@ function adaptRestorationModel(bytes) {
   output.set(bytes.subarray(read),write);
   return output;
 }
-async function createRestorationGpu(ort, source, width, height, tileSize = 0) {
+async function createRestorationGpu(ort, source, width, height, tileSize = 0, maxTileArea = 0) {
   const device = ort.env.webgpu.device;
   if (!device) throw Error('ONNX Runtime no expuso el dispositivo WebGPU.');
   const buffers = [];
@@ -222,6 +222,8 @@ fn assemble(@builtin(global_invocation_id) p:vec3u) {
     const output = allocate(fullSize,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC);
     const staging = allocate(fullSize,GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ);
     const info = allocate(48,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST);
+    const inputUsage = GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC|GPUBufferUsage.COPY_DST;
+    const sharedInput = maxTileArea ? allocate(maxTileArea*12,inputUsage) : null;
     const originalPixels = source.getImageData(0,0,width,height);
     device.queue.writeBuffer(original,0,originalPixels.data);
     function dispatch(pipeline, bindings, w, h) {
@@ -236,8 +238,8 @@ fn assemble(@builtin(global_invocation_id) p:vec3u) {
     }
     return {
       async tile(session, left, top, w, h, x, y, cw, ch, canvas) {
-        const input = device.createBuffer({size:w*h*12,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC|GPUBufferUsage.COPY_DST});
-        let tensor, outputs;
+        const input = sharedInput || device.createBuffer({size:w*h*12,usage:inputUsage});
+        let tensor, outputs, readCompleted = false;
         try {
           device.queue.writeBuffer(info,0,new Uint32Array([left,top,w,h,x,y,cw,ch,width,height,tileSize ? 1 : 0,0]));
           dispatch(pack,[[0,original],[1,input],[3,info]],w,h);
@@ -255,14 +257,15 @@ fn assemble(@builtin(global_invocation_id) p:vec3u) {
             const pixels = canvas.createImageData(cw*2,ch*2);
             try { pixels.data.set(new Uint8Array(staging.getMappedRange(0,size))); }
             finally { staging.unmap(); }
+            readCompleted = true;
             canvas.putImageData(pixels,x*2,y*2);
           }
         } finally {
-          try { await device.queue.onSubmittedWorkDone(); }
+          try { if (!readCompleted) await device.queue.onSubmittedWorkDone(); }
           finally {
             for(const item of Object.values(outputs||{})) item.dispose();
             tensor?.dispose();
-            input.destroy();
+            if (!sharedInput) input.destroy();
           }
         }
       },
@@ -636,6 +639,7 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic}}) 
     }
     let route = useCpu ? 'CPU/WASM' : 'WebGPU estricta';
     let verifiedLayout;
+    const processingStarted = performance.now();
     async function createRestorationSession(ort) {
       if (useCpu) return ort.InferenceSession.create(graph, {executionProviders: ['wasm']});
       const modes = verifiedLayout ? [verifiedLayout] : ['NCHW','NHWC'];
@@ -672,7 +676,11 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic}}) 
       const session = await createRestorationSession(ort);
       let firstTileMs, gpuPixels;
       try {
-        if (!useCpu) gpuPixels = await createRestorationGpu(ort, source, width, height, super2 ? core : 0);
+        if (!useCpu) {
+          const area = Math.min(width,core+2*halo)*Math.min(height,core+2*halo);
+          const keepOnGpu = width*height*16 <= bindingLimit && 4866418 + area*960 + width*height*36 <= plan.budget;
+          gpuPixels = await createRestorationGpu(ort, source, width, height, super2 && !keepOnGpu ? core : 0, area);
+        }
         const result = new OffscreenCanvas(width * 2,height * 2).getContext('2d');
         result.imageSmoothingQuality = 'high';
         for (let y=0;y<height;y+=core) {
@@ -735,7 +743,7 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic}}) 
     for (const [index, core] of tiles.entries()) {
       try {
         const {png, firstTileMs} = await infer(core, plan.halo);
-        self.postMessage({png,reference:await reference?.canvas.convertToBlob({type:'image/png'}),super2,route,width,height,core,firstTileMs});
+        self.postMessage({png,reference:await reference?.canvas.convertToBlob({type:'image/png'}),super2,route,width,height,core,firstTileMs,processingMs:Math.round(performance.now()-processingStarted)});
         return;
       } catch (error) {
         if (index === tiles.length - 1 || !/out.of.memory|allocation|buffer.*size/i.test(error.message)) {
@@ -2274,6 +2282,10 @@ function startRestoration(useCpu) {
   const code = document.querySelector('#restore-worker').textContent;
   const url = URL.createObjectURL(new Blob([code], {type: 'text/javascript'}));
   let worker, timer, finished = false;
+  function restartTimer() {
+    clearTimeout(timer);
+    timer = setTimeout(() => finish({error: variant === 'super2' ? 'La superresolución dejó de avanzar. Probá con la pestaña en primer plano.' : 'La mejora superó el tiempo límite.'}), variant === 'super2' ? 120000 : 240000);
+  }
   restoreStatus.textContent = !useCpu && ['fast','focus'].includes(restoreMode.value) ? 'Preparando WebGPU…' : 'Cargando Real-ESRGAN para ejecución GPU estricta…';
   const finish = async data => {
     if (finished) return;
@@ -2299,7 +2311,7 @@ function startRestoration(useCpu) {
       restoreStrength.value = enlargedRestoration ? '100' : '50';
       restoreStrength.oninput();
       restoreResult.hidden = false;
-      restoreStatus.textContent = enlargedRestoration ? 'Superresolución IA ×2 · salida: ' + restoredBitmap.width + ' × ' + restoredBitmap.height + ' px · ' + data.route + '.' : data.duration !== undefined ? 'Nitidez en ' + data.route + ' · ' + data.duration + ' ms · entrada: ' + data.width + ' × ' + data.height + ' px.' : 'Modelo ejecutado en ' + data.route + ' · primer bloque: ' + data.firstTileMs + ' ms · bloque: ' + data.core + ' px · entrada de IA: ' + data.width + ' × ' + data.height + ' px.';
+      restoreStatus.textContent = enlargedRestoration ? 'Superresolución IA ×2 · salida: ' + restoredBitmap.width + ' × ' + restoredBitmap.height + ' px · ' + data.route + ' · ' + (data.processingMs / 1000).toFixed(1) + ' s de procesamiento.' : data.duration !== undefined ? 'Nitidez en ' + data.route + ' · ' + data.duration + ' ms · entrada: ' + data.width + ' × ' + data.height + ' px.' : 'Modelo ejecutado en ' + data.route + ' · primer bloque: ' + data.firstTileMs + ' ms · bloque: ' + data.core + ' px · entrada de IA: ' + data.width + ' × ' + data.height + ' px.';
     } catch (error) {
       clearRestoration();
       restoreStatus.textContent = error.message;
@@ -2311,12 +2323,13 @@ function startRestoration(useCpu) {
   try {
     worker = new Worker(url, {type: 'module'});
     worker.onmessage = ({data}) => {
+      if (variant === 'super2' && (data.phase || data.progress !== undefined)) restartTimer();
       if (data.phase) restoreStatus.textContent = data.phase;
       else if (data.progress === undefined) finish(data);
       else restoreStatus.textContent = 'Procesando en ' + (data.route || (data.backend === 'webgpu' ? 'WebGPU' : 'CPU/WASM')) + (data.backend === 'webgpu' ? ' · presupuesto estimado: ' + data.budget.toFixed(1) + ' MiB' : '') + ' · bloque: ' + data.core + ' px · ' + data.progress + ' %';
     };
     worker.onerror = () => finish({error: 'El navegador interrumpió la mejora.'});
-    timer = setTimeout(() => finish({error: 'La mejora superó el tiempo límite.'}), variant === 'super2' ? 720000 : 240000);
+    restartTimer();
     worker.postMessage({photo, variant: restoreMode.value, useCpu, probeMiB: profile?.probeMiB});
   } catch (error) { finish({error: error.message}); }
 };
