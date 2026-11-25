@@ -59,7 +59,8 @@ input{display:block;margin:1rem 0;max-width:100%}
 <option value="light">Mejora suave de píxeles</option>
 <option value="strong">Restauración intensa de ruido y compresión</option>
 </select>
-<button id="run-restore" disabled>Procesar foto original</button>
+<button id="run-restore" disabled>Mejorar con GPU</button>
+<button id="run-restore-cpu" disabled>Prueba rápida en CPU</button>
 <p id="restore-status" role="status"></p>
 <div id="restore-result" hidden>
 <label for="restore-strength">Intensidad <output id="restore-value">50 %</output></label>
@@ -69,12 +70,30 @@ input{display:block;margin:1rem 0;max-width:100%}
 </div>
 </section>
 <script id="restore-worker" type="text/plain">
-self.onmessage = async ({data: {photo, variant, gpu}}) => {
+function restorationPlan(probeMiB, weightsBytes, bindingLimit) {
+  const budget = Math.floor((probeMiB || 24) * 1048576 * 0.7);
+  const halo = 32;
+  const candidates = [192, 160, 128, 96, 64, 48, 32].filter(core => {
+    const pixels = (core + 2 * halo) ** 2;
+    return weightsBytes + pixels * 960 <= budget && pixels * 256 <= bindingLimit;
+  });
+  const maxSide = budget >= 44 * 1048576 ? 768 : budget >= 30 * 1048576 ? 576 : 448;
+  return {budget, halo, candidates, maxSide};
+}
+
+self.onmessage = async ({data: {photo, variant, useCpu, probeMiB}}) => {
   let image;
   try {
+    const backend = useCpu ? 'wasm' : 'webgpu';
+    const adapter = useCpu ? null : await navigator.gpu?.requestAdapter();
+    if (!useCpu && !adapter) throw Error('WebGPU no está disponible en este navegador. Podés usar la prueba rápida en CPU.');
+    const bindingLimit = adapter ? Math.min(adapter.limits.maxStorageBufferBindingSize, adapter.limits.maxBufferSize) : Infinity;
+    const plan = restorationPlan(probeMiB, 4866418, bindingLimit);
+    const tiles = useCpu ? [96] : plan.candidates;
+    if (!tiles.length) throw Error('El presupuesto estimado no alcanza para el bloque mínimo de Real-ESRGAN en GPU.');
     image = await createImageBitmap(photo);
     if (image.width * image.height > 16000000 || Math.max(image.width,image.height) > 8192) throw Error('La foto supera el tamaño admitido.');
-    const scale = Math.min(1, 768 / Math.max(image.width, image.height));
+    const scale = Math.min(1, (useCpu ? 224 : plan.maxSide) / Math.max(image.width, image.height));
     const width = Math.max(1, Math.round(image.width * scale));
     const height = Math.max(1, Math.round(image.height * scale));
     const source = new OffscreenCanvas(width,height).getContext('2d',{willReadFrequently:true});
@@ -91,21 +110,23 @@ self.onmessage = async ({data: {photo, variant, gpu}}) => {
     const expected = variant === 'strong' ? '5518a106453e751655edc12f208973207ab8355d0cafc1816b8a9041b01810dd' : '1a94b28646b806071cf2d8d2d28d71e7f4b0cfc375536aa00c6c70856f115ece';
     if (checksum !== expected) throw Error('El archivo del modelo no coincide con la versión verificada.');
     const runtime = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
-    async function infer(backend) {
+    async function infer(core, halo) {
+      self.postMessage({progress:0,backend,core,budget:plan.budget/1048576});
       const ort = await import(runtime + (backend === 'webgpu' ? 'ort.webgpu.min.mjs' : 'ort.wasm.min.mjs'));
       ort.env.wasm.wasmPaths = runtime;
       ort.env.wasm.numThreads = 1;
+      if (adapter) ort.env.webgpu.adapter = adapter;
       const options = {executionProviders: [backend]};
       if (backend === 'webgpu') options.extra = {session: {disable_cpu_ep_fallback: '1'}};
       const session = await ort.InferenceSession.create(model, options);
       try {
         const result = new OffscreenCanvas(width * 2,height * 2).getContext('2d');
         result.imageSmoothingQuality = 'high';
-        for (let y=0;y<height;y+=96) {
-          for (let x=0;x<width;x+=96) {
-            const left=Math.max(0,x-40), top=Math.max(0,y-40);
-            const coreWidth=Math.min(96,width-x), coreHeight=Math.min(96,height-y);
-            const w=Math.min(width,x+coreWidth+40)-left, h=Math.min(height,y+coreHeight+40)-top;
+        for (let y=0;y<height;y+=core) {
+          for (let x=0;x<width;x+=core) {
+            const left=Math.max(0,x-halo), top=Math.max(0,y-halo);
+            const coreWidth=Math.min(core,width-x), coreHeight=Math.min(core,height-y);
+            const w=Math.min(width,x+coreWidth+halo)-left, h=Math.min(height,y+coreHeight+halo)-top;
             const rgba=source.getImageData(left,top,w,h).data;
             const plane=w*h, data=new Float32Array(3*plane);
             for(let c=0;c<3;c++) for(let i=0;i<plane;i++) data[c*plane+i]=rgba[4*i+c]/255;
@@ -117,34 +138,42 @@ self.onmessage = async ({data: {photo, variant, gpu}}) => {
               const ow=w*4, oh=h*4, n=ow*oh;
               const values = output.data;
               if(output.dims.join(',')!==[1,3,oh,ow].join(',') || !values.every(Number.isFinite)) throw Error('Salida inesperada del modelo.');
-              const patch=new OffscreenCanvas(ow,oh).getContext('2d');
-              const pixels=patch.createImageData(ow,oh);
-              for(let i=0;i<n;i++){
-                for(let c=0;c<3;c++) pixels.data[4*i+c]=values[c*n+i]*255;
-                const sx=Math.floor(i%ow/4), sy=Math.floor(i/ow/4);
-                pixels.data[4*i+3]=rgba[(sy*w+sx)*4+3];
+              const pixels=result.createImageData(coreWidth*2,coreHeight*2);
+              for(let row=0;row<pixels.height;row++){
+                const sy=(y-top)*4+row*2;
+                for(let col=0;col<pixels.width;col++){
+                  const sx=(x-left)*4+col*2;
+                  const dst=(row*pixels.width+col)*4;
+                  const src=sy*ow+sx;
+                  for(let c=0;c<3;c++){
+                    const p=c*n+src;
+                    pixels.data[dst+c]=(values[p]+values[p+1]+values[p+ow]+values[p+ow+1])*63.75;
+                  }
+                  pixels.data[dst+3]=rgba[(Math.floor(sy/4)*w+Math.floor(sx/4))*4+3];
+                }
               }
-              patch.putImageData(pixels,0,0);
-              result.drawImage(patch.canvas,(x-left)*4,(y-top)*4,coreWidth*4,coreHeight*4,x*2,y*2,coreWidth*2,coreHeight*2);
+              result.putImageData(pixels,x*2,y*2);
+              self.postMessage({progress:Math.round(100*(y*width+coreHeight*(x+coreWidth))/(width*height)),backend,core,budget:plan.budget/1048576});
             } finally {
               input.dispose();
               for(const tensor of Object.values(outputs || {})) tensor.dispose();
             }
           }
-          self.postMessage({progress:Math.round(Math.min(height,y+96)*100/height),backend});
         }
         return result.canvas.convertToBlob({type:'image/png'});
       } finally { await session.release(); }
     }
-    let backend = gpu ? 'webgpu' : 'wasm';
-    let png;
-    try { png=await infer(backend); } catch(error) {
-      if(!gpu) throw error;
-      backend='wasm';
-      self.postMessage({progress:0,backend});
-      png=await infer(backend);
+    for (const [index, core] of tiles.entries()) {
+      try {
+        const png = await infer(core, plan.halo);
+        self.postMessage({png,backend,width,height,core});
+        return;
+      } catch (error) {
+        if (index === tiles.length - 1 || !/out.of.memory|allocation|buffer.*size/i.test(error.message)) {
+          throw Error((useCpu ? 'CPU/WASM: ' : 'WebGPU: ') + error.message);
+        }
+      }
     }
-    self.postMessage({png,backend,width,height});
   } catch(error) { self.postMessage({error:error.message}); }
   finally { image?.close(); }
 };
@@ -1460,6 +1489,7 @@ function clearOutput() {
 }
 
 const restoreButton = document.querySelector('#run-restore');
+const restoreCpu = document.querySelector('#run-restore-cpu');
 const restoreMode = document.querySelector('#restore-mode');
 const restoreStatus = document.querySelector('#restore-status');
 const restoreResult = document.querySelector('#restore-result');
@@ -1493,7 +1523,9 @@ restoreStrength.oninput = () => {
   restoreValue.textContent = restoreStrength.value + ' %';
   if (restoredBitmap) paintRestoration(restorePreview, Number(restoreStrength.value) / 100);
 };
-restoreButton.onclick = () => {
+restoreButton.onclick = () => startRestoration(false);
+restoreCpu.onclick = () => startRestoration(true);
+function startRestoration(useCpu) {
   if (restoreButton.disabled) return;
   clearRestoration();
   busy(true);
@@ -1520,7 +1552,7 @@ restoreButton.onclick = () => {
       restoreStrength.value = '50';
       restoreStrength.oninput();
       restoreResult.hidden = false;
-      restoreStatus.textContent = 'Modelo ejecutado en ' + (data.backend === 'webgpu' ? 'WebGPU' : 'CPU/WASM') + ' · entrada de IA: ' + data.width + ' × ' + data.height + ' px.';
+      restoreStatus.textContent = 'Modelo ejecutado en ' + (data.backend === 'webgpu' ? 'WebGPU' : 'CPU/WASM') + ' · bloque: ' + data.core + ' px · entrada de IA: ' + data.width + ' × ' + data.height + ' px.';
     } catch (error) {
       clearRestoration();
       restoreStatus.textContent = error.message;
@@ -1533,11 +1565,11 @@ restoreButton.onclick = () => {
     worker = new Worker(url, {type: 'module'});
     worker.onmessage = ({data}) => {
       if (data.progress === undefined) finish(data);
-      else restoreStatus.textContent = 'Procesando en ' + (data.backend === 'webgpu' ? 'WebGPU' : 'CPU/WASM') + ' · ' + data.progress + ' %';
+      else restoreStatus.textContent = 'Procesando en ' + (data.backend === 'webgpu' ? 'WebGPU · presupuesto estimado: ' + data.budget.toFixed(1) + ' MiB' : 'CPU/WASM') + ' · bloque: ' + data.core + ' px · ' + data.progress + ' %';
     };
     worker.onerror = () => finish({error: 'El navegador interrumpió la mejora.'});
     timer = setTimeout(() => finish({error: 'La mejora superó el tiempo límite.'}), 240000);
-    worker.postMessage({photo, variant: restoreMode.value, gpu: profile?.probeMiB >= 32});
+    worker.postMessage({photo, variant: restoreMode.value, useCpu, probeMiB: profile?.probeMiB});
   } catch (error) { finish({error: error.message}); }
 };
 restoreSave.onclick = async () => {
@@ -1566,6 +1598,7 @@ restoreSave.onclick = async () => {
 
 function busy(value) {
   restoreButton.disabled = value || !picker.files[0] || picker.files[0].size > 20000000;
+  restoreCpu.disabled = restoreButton.disabled;
   restoreSave.disabled = value;
   button.disabled = value;
   benchmarkCpu.disabled = value;
