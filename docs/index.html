@@ -1630,7 +1630,7 @@ self.onmessage = async () => {
     const layout = 'auto';
     const module = device.createShaderModule({code: shader});
     const pipeline = await device.createComputePipelineAsync({layout, compute: {module, entryPoint: 'main'}});
-    for (const side of [256, 512, 1024, 2048, 2560, 3072]) {
+    for (const side of [256, 512, 1024, 2048, 2304, 2560, 2816, 3072]) {
       const bytes = side * side * 4;
       if (bytes > Math.min(device.limits.maxBufferSize, device.limits.maxStorageBufferBindingSize)) break;
       const buffers = [];
@@ -2315,7 +2315,31 @@ restoreStrength.oninput = () => {
 };
 restoreButton.onclick = () => startRestoration(false);
 restoreCpu.onclick = () => startRestoration(true);
-function startRestoration(useCpu) {
+async function probeRestorationBudget() {
+  const code = document.querySelector('#worker').textContent;
+  const url = URL.createObjectURL(new Blob([code], {type: 'text/javascript'}));
+  let worker, timeout;
+  try {
+    worker = new Worker(url);
+    return await new Promise(resolve => {
+      let completedMiB;
+      worker.onmessage = ({data}) => {
+        completedMiB = data.lastPassed ? data.lastPassed ** 2 * 8 / 1048576 : undefined;
+        if (!data.progress) resolve(completedMiB);
+      };
+      worker.onerror = () => resolve(undefined);
+      timeout = setTimeout(() => resolve(completedMiB), 12000);
+      worker.postMessage(null);
+    });
+  } catch {
+    return undefined;
+  } finally {
+    clearTimeout(timeout);
+    worker?.terminate();
+    URL.revokeObjectURL(url);
+  }
+}
+async function startRestoration(useCpu) {
   if (restoreButton.disabled) return;
   clearRestoration();
   busy(true);
@@ -2378,6 +2402,11 @@ function startRestoration(useCpu) {
     }
   };
   try {
+    let probeMiB = profile?.probeMiB;
+    if (variant === 'super2' && !useCpu) {
+      restoreStatus.textContent = 'Comprobando qué tamaño de bloque admite la GPU…';
+      probeMiB = await probeRestorationBudget() ?? Math.min(probeMiB || 24, 32);
+    }
     worker = new Worker(url, {type: 'module'});
     worker.onmessage = ({data}) => {
       if (data.phase || data.progress !== undefined) {
@@ -2400,7 +2429,7 @@ function startRestoration(useCpu) {
       document.addEventListener('visibilitychange', syncPause);
       syncPause();
     }
-    worker.postMessage({photo, variant, useCpu, probeMiB: profile?.probeMiB});
+    worker.postMessage({photo, variant, useCpu, probeMiB});
   } catch (error) { finish({error: error.message}); }
 };
 async function finishRestoration(continueEditing) {
