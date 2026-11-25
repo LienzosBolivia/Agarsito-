@@ -63,6 +63,13 @@ input{display:block;margin:1rem 0;max-width:100%}
 <button id="run-restore" disabled>Mejorar con GPU</button>
 <button id="run-restore-cpu" disabled>Prueba rápida en CPU</button>
 <p id="restore-status" role="status"></p>
+<button id="restore-diagnostic">Diagnosticar compatibilidad GPU</button>
+<div id="restore-report" hidden>
+<label for="restore-log">Informe para compartir</label>
+<textarea id="restore-log" readonly rows="12" style="display:block;width:100%;box-sizing:border-box"></textarea>
+<button id="copy-restore-log">Copiar informe</button>
+<p id="restore-diagnostic-status" role="status"></p>
+</div>
 <div id="restore-result" hidden>
 <label for="restore-strength">Intensidad <output id="restore-value">50 %</output></label>
 <input id="restore-strength" type="range" min="0" max="100" value="50">
@@ -301,7 +308,74 @@ function hasOutputStripes(pixels) {
   return repeats>=Math.max(7,width/12);
 }
 
-self.onmessage = async ({data: {photo, variant, useCpu, probeMiB}}) => {
+async function diagnoseRestoration(ort, model, adapter, note) {
+  const methods = ['log','info','debug','warn','error'];
+  const original = Object.fromEntries(methods.map(key => [key,console[key]]));
+  const kernels = new Map();
+  const seen = new Set();
+  for (const key of methods) {
+    console[key] = (...args) => {
+      const line = args.map(value => String(value)).join(' ').slice(0,2400);
+      if (/node placement|assigned|executionprovider|execution provider|graph partition|[a-z]epfallback/i.test(line) && seen.size < 90 && !seen.has(line)) {
+        seen.add(line);
+        note(line);
+      }
+      original[key].apply(console,args);
+    };
+  }
+  ort.env.logLevel = 'verbose';
+  ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
+  ort.env.wasm.numThreads = 1;
+  ort.env.webgpu.adapter = adapter;
+  try {
+    for (const strict of [true,false]) {
+      const label = strict ? 'WebGPU estricta' : 'WebGPU + CPU/WASM';
+      note('--- ' + label + ' ---');
+      let session, input, outputs;
+      try {
+        const start = performance.now();
+        session = await ort.InferenceSession.create(model,{
+          executionProviders: strict ? ['webgpu'] : ['webgpu','wasm'],
+          logSeverityLevel: 0,
+          logVerbosityLevel: 1,
+          ...(strict ? {preferredOutputLocation:'gpu-buffer',extra:{session:{disable_cpu_ep_fallback:'1'}}} : {})
+        });
+        note('Sesión creada en ' + Math.round(performance.now()-start) + ' ms.');
+        if (ort.env.webgpu.device?.features.has('timestamp-query')) {
+          ort.env.webgpu.profiling = {mode:'default',ondata(info) {
+            const key = info.kernelName || info.kernelType || info.programName;
+            if (key) kernels.set(key,(kernels.get(key)||0)+1);
+          }};
+        }
+        const side = 48;
+        const data = Float32Array.from({length:3*side*side},(_,i)=>(i%251)/250);
+        input = new ort.Tensor('float32',data,[1,3,side,side]);
+        const before = performance.now();
+        outputs = await session.run({[session.inputNames[0]]:input});
+        const tensor = outputs[session.outputNames[0]];
+        const values = tensor.location === 'cpu' ? tensor.data : await tensor.getData();
+        if (tensor.dims.join(',') !== [1,48,side,side].join(',') || !values.every(Number.isFinite)) throw Error('Salida no válida.');
+        note('Bloque sintético 48 × 48 completo: ' + Math.round(performance.now()-before) + ' ms.');
+        if (kernels.size) note('Kernels WebGPU observados: ' + Array.from(kernels,([name,count])=>name+' ×'+count).join(', '));
+        else note('El motor no entregó nombres de kernels GPU en esta prueba.');
+        if (strict) break;
+      } catch (error) {
+        note('Error: ' + (error.message || String(error)));
+      } finally {
+        input?.dispose();
+        for (const output of Object.values(outputs || {})) output.dispose();
+        await session?.release();
+      }
+    }
+    if (!Array.from(seen).some(line => /assigned|node placement/i.test(line))) {
+      note('La compilación web del motor no expuso la asignación individual de nodos CPU en los registros capturados.');
+    }
+  } finally {
+    for (const key of methods) console[key] = original[key];
+  }
+}
+
+self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic}}) => {
   let image;
   try {
     const backend = useCpu ? 'wasm' : 'webgpu';
@@ -310,20 +384,20 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB}}) => {
     const bindingLimit = adapter ? Math.min(adapter.limits.maxStorageBufferBindingSize, adapter.limits.maxBufferSize) : Infinity;
     const quick = variant === 'fast' && !useCpu;
     const plan = restorationPlan(probeMiB, 4866418, bindingLimit);
-    image = await createImageBitmap(photo);
-    if (image.width * image.height > 16000000 || Math.max(image.width,image.height) > 8192) throw Error('La foto supera el tamaño admitido.');
-    const scale = Math.min(1, (useCpu ? 224 : quick ? Math.min(1600, Math.floor(Math.sqrt(Math.min(bindingLimit / 4, (probeMiB || 24) * 1048576 * 0.7 / 12)))) : plan.maxSide) / Math.max(image.width, image.height));
-    const width = Math.max(1, Math.round(image.width * scale));
-    const height = Math.max(1, Math.round(image.height * scale));
+    if (!diagnostic) image = await createImageBitmap(photo);
+    if (image && (image.width * image.height > 16000000 || Math.max(image.width,image.height) > 8192)) throw Error('La foto supera el tamaño admitido.');
+    const scale = Math.min(1, (useCpu ? 224 : quick ? Math.min(1600, Math.floor(Math.sqrt(Math.min(bindingLimit / 4, (probeMiB || 24) * 1048576 * 0.7 / 12)))) : plan.maxSide) / (image ? Math.max(image.width, image.height) : 48));
+    const width = Math.max(1, Math.round((image?.width || 48) * scale));
+    const height = Math.max(1, Math.round((image?.height || 48) * scale));
     const tiles = useCpu ? [96] : plan.candidates.filter(core => {
       const area = Math.min(width,core+2*plan.halo)*Math.min(height,core+2*plan.halo);
       return 4866418 + area*960 + width*height*36 <= plan.budget && width*height*16 <= bindingLimit;
     });
-    if (!quick && !tiles.length) throw Error('El presupuesto estimado no alcanza para el bloque mínimo de Real-ESRGAN en GPU.');
+    if (!diagnostic && !quick && !tiles.length) throw Error('El presupuesto estimado no alcanza para el bloque mínimo de Real-ESRGAN en GPU.');
     const source = new OffscreenCanvas(width,height).getContext('2d',{willReadFrequently:true});
     source.imageSmoothingQuality = 'high';
-    source.drawImage(image,0,0,width,height);
-    image.close();
+    if (image) source.drawImage(image,0,0,width,height);
+    image?.close();
     image = undefined;
     if (quick) {
       self.postMessage({phase:'Aplicando nitidez directamente en WebGPU…'});
@@ -348,6 +422,17 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB}}) => {
       if (hash !== adapted) throw Error('La versión optimizada no pasó la verificación.');
     }
     const runtime = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
+    if (diagnostic) {
+      const note = line => self.postMessage({diagnosticLine:line});
+      note('Real-ESRGAN: ' + file + ' · ONNX Runtime Web 1.22.0 · grafo adaptado');
+      const info = adapter.info;
+      note('Adaptador: ' + [info?.vendor,info?.architecture].filter(Boolean).join(' / ') + ' · FP16: ' + (adapter.features.has('shader-f16') ? 'sí' : 'no'));
+      note('Límite de enlace/búfer: ' + Math.round(bindingLimit/1048576) + ' MiB · prueba previa: ' + (probeMiB || 'sin datos') + ' MiB');
+      const ort = await import(runtime + 'ort.webgpu.min.mjs');
+      await diagnoseRestoration(ort,graph,adapter,note);
+      self.postMessage({diagnosticDone:true});
+      return;
+    }
     const route = useCpu ? 'CPU/WASM' : 'WebGPU estricta';
     async function createRestorationSession(ort) {
       if (useCpu) return ort.InferenceSession.create(graph, {executionProviders: ['wasm']});
@@ -1869,7 +1954,52 @@ restoreSave.onclick = async () => {
   } finally { busy(false); }
 };
 
+const diagnoseButton = document.querySelector('#restore-diagnostic');
+const report = document.querySelector('#restore-report');
+const diagnosticLog = document.querySelector('#restore-log');
+const diagnosticStatus = document.querySelector('#restore-diagnostic-status');
+document.querySelector('#copy-restore-log').onclick = async () => {
+  try {
+    await navigator.clipboard.writeText(diagnosticLog.value);
+    diagnosticStatus.textContent = 'Informe copiado.';
+  } catch {
+    diagnosticLog.focus();
+    diagnosticLog.select();
+    diagnosticStatus.textContent = 'Seleccioné el informe para que lo copies.';
+  }
+};
+diagnoseButton.onclick = () => {
+  if (diagnoseButton.disabled) return;
+  busy(true);
+  report.hidden = false;
+  diagnosticLog.value = '';
+  diagnosticStatus.textContent = 'Probando un bloque sintético…';
+  const code = document.querySelector('#restore-worker').textContent;
+  const url = URL.createObjectURL(new Blob([code],{type:'text/javascript'}));
+  let worker, timeout;
+  const append = line => { diagnosticLog.value += line + '\n'; };
+  const finish = error => {
+    clearTimeout(timeout);
+    worker?.terminate();
+    URL.revokeObjectURL(url);
+    if (error) append(error);
+    diagnosticStatus.textContent = error ? 'Diagnóstico interrumpido. Podés copiar el informe parcial.' : 'Diagnóstico listo para copiar.';
+    busy(false);
+  };
+  try {
+    worker = new Worker(url,{type:'module'});
+    worker.onmessage = ({data}) => {
+      if (data.diagnosticLine) append(data.diagnosticLine);
+      else if (data.diagnosticDone || data.error) finish(data.error);
+    };
+    worker.onerror = () => finish('El navegador interrumpió el diagnóstico.');
+    timeout = setTimeout(() => finish('Tiempo límite del diagnóstico.'),90000);
+    worker.postMessage({variant:restoreMode.value === 'strong' ? 'strong' : 'light',diagnostic:true,probeMiB:profile?.probeMiB});
+  } catch (error) { finish(error.message); }
+};
+
 function busy(value) {
+  diagnoseButton.disabled = value;
   restoreButton.disabled = value || !picker.files[0] || picker.files[0].size > 20000000;
   restoreCpu.disabled = restoreButton.disabled;
   restoreSave.disabled = value;
