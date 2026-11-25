@@ -305,7 +305,7 @@ fn assemble(@builtin(global_invocation_id) p:vec3u) {
 function restorationPlan(probeMiB, weightsBytes, bindingLimit) {
   const budget = Math.floor((probeMiB || 24) * 1048576 * 0.7);
   const halo = 34;
-  const candidates = [192, 160, 128, 96, 64, 48, 32].filter(core => {
+  const candidates = [192, 176, 160, 144, 128, 112, 96, 88, 80, 72, 64, 56, 48, 40, 32].filter(core => {
     const pixels = (core + 2 * halo) ** 2;
     return weightsBytes + pixels * 960 <= budget && pixels * 256 <= bindingLimit;
   });
@@ -850,7 +850,7 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic, co
 <button id="save-color">Descargar ajuste</button>
 </section>
 <h2>Diagnóstico de GPU</h2>
-<p>Ejecuta una convolución sintética en cuatro tamaños hasta 2048 × 2048. El resultado muestra la mayor carga completada en esta prueba. La VRAM libre y el rendimiento de un modelo ONNX requieren mediciones distintas.</p>
+<p>Ejecuta una convolución sintética en tamaños crecientes hasta 3072 × 3072 (72 MiB en búferes). El resultado muestra la mayor carga completada en esta prueba. La VRAM libre y el rendimiento de un modelo ONNX requieren mediciones distintas.</p>
 <button id="run">Probar este dispositivo y el modelo</button>
 <button id="benchmark-cpu">Medir U²-Net en CPU</button>
 <p id="status" role="status"></p>
@@ -1630,7 +1630,7 @@ self.onmessage = async () => {
     const layout = 'auto';
     const module = device.createShaderModule({code: shader});
     const pipeline = await device.createComputePipelineAsync({layout, compute: {module, entryPoint: 'main'}});
-    for (const side of [256, 512, 1024, 2048]) {
+    for (const side of [256, 512, 1024, 2048, 2560, 3072]) {
       const bytes = side * side * 4;
       if (bytes > Math.min(device.limits.maxBufferSize, device.limits.maxStorageBufferBindingSize)) break;
       const buffers = [];
