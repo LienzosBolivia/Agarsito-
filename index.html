@@ -681,8 +681,6 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic}}) 
 <input id="background" type="file" accept="image/*">
 <label for="catalog-background">Fondo del catálogo N.º</label>
 <input id="catalog-background" inputmode="numeric" placeholder="1–26">
-<label for="catalog-mesh">Malla del catálogo N.º (opcional)</label>
-<input id="catalog-mesh" inputmode="numeric" placeholder="1–3">
 <button id="compose" disabled>Aplicar fondo</button>
 <p id="compose-status" role="status"></p>
 <figure id="composition-view" hidden><figcaption>Foto con el fondo elegido</figcaption><div id="composition-stage"><img id="composite" alt="Retrato con el fondo elegido"><canvas id="hair-guide" aria-label="Área para marcar el borde del cabello" hidden></canvas></div></figure>
@@ -698,6 +696,18 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic}}) 
 <a id="save-composite" download="foto-con-fondo.png" hidden>Descargar foto con fondo</a>
 </section>
 <button id="frame-composite" hidden>Encuadrar foto con fondo</button>
+<section id="mesh-tools" hidden>
+<h2>Colocar una malla</h2>
+<p id="mesh-source"></p>
+<label for="catalog-mesh">Malla del catálogo N.º</label>
+<input id="catalog-mesh" inputmode="numeric" placeholder="1–3">
+<button id="apply-mesh" disabled>Aplicar malla</button>
+<p id="mesh-status" role="status"></p>
+<figure id="mesh-view" hidden><figcaption>Foto con malla superpuesta</figcaption><img id="mesh-preview" alt="Foto con malla"></figure>
+<button id="use-mesh" hidden>Usar foto con malla para seguir editando</button>
+<a id="save-mesh" download="foto-con-malla.png" hidden>Descargar foto con malla</a>
+<p>La malla se superpone a la foto sin quitar el fondo. Si vas a cambiar el fondo después, aplicá la malla al final.</p>
+</section>
 
 <section id="color-tools" hidden>
 <h2>Ajustar color</h2>
@@ -1760,6 +1770,7 @@ eraseToggle.onclick = () => {
   setEraseMode(!eraseMode);
 };
 function showCutout(png) {
+  clearMesh();
   closeFraming();
   frameCutout.hidden = false;
   cutoutBlob = png;
@@ -1771,6 +1782,7 @@ function showCutout(png) {
   maskTools.hidden = false;
   download.href = outputUrl;
   download.hidden = false;
+  refreshMeshControls();
 }
 eraseApply.onclick = async () => {
   if (eraseApply.disabled || !cutoutBlob) return;
@@ -1814,6 +1826,15 @@ const composition = document.querySelector('#composition');
 const background = document.querySelector('#background');
 const catalogBackground = document.querySelector('#catalog-background');
 const catalogMesh = document.querySelector('#catalog-mesh');
+const meshTools = document.querySelector('#mesh-tools');
+const meshSourceLabel = document.querySelector('#mesh-source');
+const meshButton = document.querySelector('#apply-mesh');
+const meshStatus = document.querySelector('#mesh-status');
+const meshView = document.querySelector('#mesh-view');
+const meshPreview = document.querySelector('#mesh-preview');
+const useMesh = document.querySelector('#use-mesh');
+const saveMesh = document.querySelector('#save-mesh');
+let meshResult, meshUrl;
 let catalog;
 
 async function catalogAsset(group, number) {
@@ -1829,6 +1850,69 @@ async function catalogAsset(group, number) {
   if (!response.ok) throw new Error('No se pudo cargar ' + path + '.');
   return response.blob();
 }
+function meshSource() {
+  if (compositeBlob) return {blob: compositeBlob, label: 'Foto con fondo nuevo'};
+  if (cutoutBlob) return {blob: cutoutBlob, label: 'Foto con fondo transparente'};
+  return {blob: workingPhoto, label: 'Foto activa con su fondo original'};
+}
+function refreshMeshControls() {
+  const source = meshSource();
+  meshTools.hidden = !source.blob;
+  meshSourceLabel.textContent = source.blob ? 'Se aplicará encima de: ' + source.label : '';
+  catalogMesh.disabled = editorBusy;
+  meshButton.disabled = editorBusy || !source.blob || !catalogMesh.value.trim();
+  useMesh.disabled = editorBusy || !meshResult;
+  saveMesh.hidden = !meshResult || editorBusy;
+}
+function clearMesh() {
+  if (meshUrl) URL.revokeObjectURL(meshUrl);
+  meshUrl = meshResult = undefined;
+  meshPreview.removeAttribute('src');
+  meshView.hidden = useMesh.hidden = saveMesh.hidden = true;
+  saveMesh.removeAttribute('href');
+  meshStatus.textContent = '';
+}
+catalogMesh.oninput = () => {
+  clearMesh();
+  refreshMeshControls();
+};
+meshButton.onclick = async () => {
+  if (meshButton.disabled || editorBusy) return;
+  const source = meshSource();
+  const number = catalogMesh.value.trim();
+  clearMesh();
+  busy(true);
+  meshStatus.textContent = 'Aplicando malla a resolución completa…';
+  let photo, overlay;
+  try {
+    photo = await createImageBitmap(source.blob);
+    if (photo.width * photo.height > 16000000 || Math.max(photo.width, photo.height) > 8192) {
+      throw Error('La foto supera los límites de tamaño del editor.');
+    }
+    overlay = await createImageBitmap(await catalogAsset('mallas', number));
+    const canvas = new OffscreenCanvas(photo.width, photo.height);
+    const ctx = canvas.getContext('2d', {alpha: true});
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(photo, 0, 0);
+    ctx.drawImage(overlay, 0, 0, photo.width, photo.height);
+    meshResult = await canvas.convertToBlob({type: 'image/png'});
+    meshUrl = URL.createObjectURL(meshResult);
+    meshPreview.src = meshUrl;
+    meshView.hidden = useMesh.hidden = false;
+    saveMesh.href = meshUrl;
+    meshStatus.textContent = 'Malla aplicada: ' + photo.width + ' × ' + photo.height + ' px.';
+  } catch (error) {
+    clearMesh();
+    meshStatus.textContent = error.message || 'No se pudo aplicar la malla.';
+  } finally {
+    photo?.close();
+    overlay?.close();
+    busy(false);
+  }
+};
+useMesh.onclick = () => {
+  if (meshResult && !editorBusy) setWorkingPhoto(meshResult, 'Foto con malla', true);
+};
 const hairTools = document.querySelector('#hair-tools');
 const markHair = document.querySelector('#mark-hair');
 const clearHair = document.querySelector('#clear-hair');
@@ -1909,6 +1993,7 @@ const composite = document.querySelector('#composite');
 const saveComposite = document.querySelector('#save-composite');
 
 function clearComposite() {
+  clearMesh();
   if (frameImage === composite) closeFraming();
   frameComposite.hidden = true;
   hairTools.hidden = true;
@@ -1932,7 +2017,7 @@ background.onchange = () => {
   busy(false);
   if (background.files[0]?.size > 20000000) composeStatus.textContent = 'El fondo supera los 20 MB.';
 };
-catalogBackground.oninput = catalogMesh.oninput = () => {
+catalogBackground.oninput = () => {
   clearComposite();
   busy(false);
 };
@@ -1968,8 +2053,10 @@ async function composeBackground(selectedStrokes, generate = false, currentCompo
       return;
     }
     if (compositeUrl) URL.revokeObjectURL(compositeUrl);
+    clearMesh();
     compositeBlob = cleanImage;
     composedResult = image;
+    refreshMeshControls();
     useComposite.hidden = false;
     compositeUrl = URL.createObjectURL(image);
     hairTools.hidden = false;
@@ -1983,9 +2070,7 @@ async function composeBackground(selectedStrokes, generate = false, currentCompo
   };
   try {
     const number = catalogBackground.value.trim();
-    const meshNumber = catalogMesh.value.trim();
     const backdrop = number ? await catalogAsset('fondos', number) : background.files[0];
-    const overlay = meshNumber ? await catalogAsset('mallas', meshNumber) : undefined;
     worker = new Worker(url);
     worker.onmessage = ({data}) => {
       if (data.progress) composeStatus.textContent = data.progress;
@@ -1993,7 +2078,7 @@ async function composeBackground(selectedStrokes, generate = false, currentCompo
     };
     worker.onerror = () => finish({error: 'El navegador interrumpió la composición.'});
     timeout = setTimeout(() => finish({error: 'La composición superó el tiempo límite.'}), generate ? 150000 : 45000);
-    worker.postMessage({cutout: cutoutBlob, background: backdrop, mesh: overlay, catalogBackground: !!number, strokes: selectedStrokes, original: currentComposition ? undefined : workingPhoto, generate, currentComposition});
+    worker.postMessage({cutout: cutoutBlob, background: backdrop, catalogBackground: !!number, strokes: selectedStrokes, original: currentComposition ? undefined : workingPhoto, generate, currentComposition});
   } catch (error) {
     finish({error: error.message});
   }
@@ -2333,7 +2418,8 @@ function busy(value) {
   eraseApply.disabled = value || !eraseStrokes.length;
   eraseUndo.disabled = value || !previousCutout;
   fine.disabled = value;
-  background.disabled = catalogBackground.disabled = catalogMesh.disabled = value;
+  background.disabled = catalogBackground.disabled = value;
+  refreshMeshControls();
   composeButton.disabled = value || !cutoutBlob || (!catalogBackground.value.trim() && (!background.files[0] || background.files[0].size > 20000000));
   picker.disabled = value;
   cut.disabled = value || !workingPhoto;
