@@ -56,6 +56,7 @@ input{display:block;margin:1rem 0;max-width:100%}
 <p>La intensidad afecta toda la foto. Compará las facciones con el original antes de exportar.</p>
 <label for="restore-mode">Modelo</label>
 <select id="restore-mode">
+<option value="fast">Nitidez rápida en GPU</option>
 <option value="light">Mejora suave de píxeles</option>
 <option value="strong">Restauración intensa de ruido y compresión</option>
 </select>
@@ -81,6 +82,97 @@ function restorationPlan(probeMiB, weightsBytes, bindingLimit) {
   return {budget, halo, candidates, maxSide};
 }
 
+async function gpuDetail(adapter, source, width, height) {
+  const device = await adapter.requestDevice();
+  const size = width * height * 4;
+  const buffers = [];
+  function buffer(length, usage) {
+    const item = device.createBuffer({size: length, usage});
+    buffers.push(item);
+    return item;
+  }
+  try {
+    const module = device.createShaderModule({code: `
+@group(0) @binding(0) var<storage, read> original: array<u32>;
+@group(0) @binding(1) var<storage, read_write> result: array<u32>;
+@group(0) @binding(2) var<uniform> dims: vec4u;
+fn sampleAt(x: i32, y: i32) -> vec4f {
+  let px = u32(clamp(x, 0, i32(dims.x)-1));
+  let py = u32(clamp(y, 0, i32(dims.y)-1));
+  return unpack4x8unorm(original[py*dims.x+px]);
+}
+@compute @workgroup_size(8,8)
+fn main(@builtin(global_invocation_id) pos: vec3u) {
+  if (pos.x >= dims.x || pos.y >= dims.y) { return; }
+  let center = sampleAt(i32(pos.x), i32(pos.y));
+  var sum = center.rgb * 2.0;
+  var weight = 2.0;
+  for (var dy = -1; dy <= 1; dy++) {
+    for (var dx = -1; dx <= 1; dx++) {
+      if (dx != 0 || dy != 0) {
+        let neighbor = sampleAt(i32(pos.x)+dx, i32(pos.y)+dy);
+        let diff = center.rgb - neighbor.rgb;
+        let influence = neighbor.a / (1.0 + 20.0*dot(diff,diff));
+        sum += neighbor.rgb * influence;
+        weight += influence;
+      }
+    }
+  }
+  let detail = center.rgb - sum / weight;
+  let luma = dot(detail, vec3f(0.2126, 0.7152, 0.0722));
+  let gain = smoothstep(0.006,0.045,abs(luma)) * 0.65;
+  let rgb = clamp(center.rgb + vec3f(luma * gain),vec3f(0.0),vec3f(1.0));
+  result[pos.y*dims.x+pos.x] = pack4x8unorm(vec4f(rgb, center.a));
+}`});
+    const pipeline = await device.createComputePipelineAsync({layout:'auto',compute:{module,entryPoint:'main'}});
+    const input = buffer(size, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+    const output = buffer(size, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+    const staging = buffer(size, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ);
+    const dimensions = buffer(16,GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+    device.queue.writeBuffer(input,0,source.getImageData(0,0,width,height).data);
+    device.queue.writeBuffer(dimensions,0,new Uint32Array([width,height,0,0]));
+    const bindGroup=device.createBindGroup({layout:pipeline.getBindGroupLayout(0),entries:[input,output,dimensions].map((item,binding)=>({binding,resource:{buffer:item}}))});
+    const encoder=device.createCommandEncoder();
+    const pass=encoder.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0,bindGroup);
+    pass.dispatchWorkgroups(Math.ceil(width/8),Math.ceil(height/8));
+    pass.end();
+    encoder.copyBufferToBuffer(output,0,staging,0,size);
+    device.queue.submit([encoder.finish()]);
+    await staging.mapAsync(GPUMapMode.READ);
+    const pixels=source.createImageData(width,height);
+    pixels.data.set(new Uint8Array(staging.getMappedRange()));
+    staging.unmap();
+    source.putImageData(pixels,0,0);
+    return await source.canvas.convertToBlob({type:'image/png'});
+  } finally {
+    for(const item of buffers) item.destroy();
+    device.destroy();
+  }
+}
+function hasOutputStripes(pixels) {
+  const {width,height,data}=pixels;
+  let previous=0, repeats=0;
+  for(let x=1;x<width;x++){
+    let rising=0, falling=0, visible=0;
+    for(let y=0;y<height;y++){
+      const p=(y*width+x)*4;
+      if(data[p+3]<225 || data[p-1]<225) continue;
+      visible++;
+      const delta=data[p]+data[p+1]+data[p+2]-data[p-4]-data[p-3]-data[p-2];
+      if(delta>45) rising++;
+      if(delta<-45) falling++;
+    }
+    if(visible<height/2) continue;
+    const sign=rising>visible*.65?1:falling>visible*.65?-1:0;
+    if(!sign) continue;
+    if(previous && previous!==sign) repeats++;
+    previous=sign;
+  }
+  return repeats>=Math.max(7,width/12);
+}
+
 self.onmessage = async ({data: {photo, variant, useCpu, probeMiB}}) => {
   let image;
   try {
@@ -88,12 +180,13 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB}}) => {
     const adapter = useCpu ? null : await navigator.gpu?.requestAdapter();
     if (!useCpu && !adapter) throw Error('WebGPU no está disponible en este navegador. Podés usar la prueba rápida en CPU.');
     const bindingLimit = adapter ? Math.min(adapter.limits.maxStorageBufferBindingSize, adapter.limits.maxBufferSize) : Infinity;
+    const quick = variant === 'fast' && !useCpu;
     const plan = restorationPlan(probeMiB, 4866418, bindingLimit);
     const tiles = useCpu ? [96] : plan.candidates;
-    if (!tiles.length) throw Error('El presupuesto estimado no alcanza para el bloque mínimo de Real-ESRGAN en GPU.');
+    if (!quick && !tiles.length) throw Error('El presupuesto estimado no alcanza para el bloque mínimo de Real-ESRGAN en GPU.');
     image = await createImageBitmap(photo);
     if (image.width * image.height > 16000000 || Math.max(image.width,image.height) > 8192) throw Error('La foto supera el tamaño admitido.');
-    const scale = Math.min(1, (useCpu ? 224 : plan.maxSide) / Math.max(image.width, image.height));
+    const scale = Math.min(1, (useCpu ? 224 : quick ? Math.min(1600, Math.floor(Math.sqrt(Math.min(bindingLimit / 4, (probeMiB || 24) * 1048576 * 0.7 / 12)))) : plan.maxSide) / Math.max(image.width, image.height));
     const width = Math.max(1, Math.round(image.width * scale));
     const height = Math.max(1, Math.round(image.height * scale));
     const source = new OffscreenCanvas(width,height).getContext('2d',{willReadFrequently:true});
@@ -101,6 +194,13 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB}}) => {
     source.drawImage(image,0,0,width,height);
     image.close();
     image = undefined;
+    if (quick) {
+      self.postMessage({phase:'Aplicando nitidez directamente en WebGPU…'});
+      const start = performance.now();
+      const png = await gpuDetail(adapter,source,width,height);
+      self.postMessage({png,route:'WebGPU directa',width,height,duration:Math.round(performance.now()-start)});
+      return;
+    }
     const file = variant === 'strong' ? 'realesr-general-x4v3' : 'realesr-general-wdn-x4v3';
     const response = await fetch('https://huggingface.co/thisismert/real-esrgan-onnx/resolve/main/onnx/' + file + '.onnx');
     if (!response.ok) throw Error('No se pudo descargar el modelo (HTTP ' + response.status + ').');
@@ -175,6 +275,7 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB}}) => {
                   pixels.data[dst+3]=rgba[(Math.floor(sy/4)*w+Math.floor(sx/4))*4+3];
                 }
               }
+              if (hasOutputStripes(pixels) && (backend === 'webgpu' || !hasOutputStripes({width:w,height:h,data:rgba}))) throw Error('Se detectaron franjas en la salida. El resultado fue descartado. Probá Nitidez rápida en GPU.');
               result.putImageData(pixels,x*2,y*2);
               self.postMessage({progress:Math.round(100*(y*width+coreHeight*(x+coreWidth))/(width*height)),backend,route,core,budget:plan.budget/1048576});
             } finally {
@@ -1557,7 +1658,7 @@ function startRestoration(useCpu) {
   const code = document.querySelector('#restore-worker').textContent;
   const url = URL.createObjectURL(new Blob([code], {type: 'text/javascript'}));
   let worker, timer, finished = false;
-  restoreStatus.textContent = 'Cargando Real-ESRGAN…';
+  restoreStatus.textContent = !useCpu && restoreMode.value === 'fast' ? 'Preparando WebGPU…' : 'Cargando Real-ESRGAN…';
   const finish = async data => {
     if (finished) return;
     finished = true;
@@ -1575,7 +1676,7 @@ function startRestoration(useCpu) {
       restoreStrength.value = '50';
       restoreStrength.oninput();
       restoreResult.hidden = false;
-      restoreStatus.textContent = 'Modelo ejecutado en ' + data.route + ' · primer bloque: ' + data.firstTileMs + ' ms · bloque: ' + data.core + ' px · entrada de IA: ' + data.width + ' × ' + data.height + ' px.';
+      restoreStatus.textContent = data.duration !== undefined ? 'Nitidez en ' + data.route + ' · ' + data.duration + ' ms · entrada: ' + data.width + ' × ' + data.height + ' px.' : 'Modelo ejecutado en ' + data.route + ' · primer bloque: ' + data.firstTileMs + ' ms · bloque: ' + data.core + ' px · entrada de IA: ' + data.width + ' × ' + data.height + ' px.';
     } catch (error) {
       clearRestoration();
       restoreStatus.textContent = error.message;
