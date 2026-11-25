@@ -90,13 +90,113 @@ function adaptRestorationModel(bytes) {
   output.set(bytes.subarray(read),write);
   return output;
 }
-function restorationSample(values, input, c, sx, sy, w, h) {
-  const plane = w*h;
-  const base = Math.floor(sy/4)*w+Math.floor(sx/4);
-  const index = (c*16+(sy%4)*4+sx%4)*plane+base;
-  const original = input[c*plane+base];
-  return (Math.fround(values[index]+original)+Math.fround(values[index+plane]+original)
-    +Math.fround(values[index+4*plane]+original)+Math.fround(values[index+5*plane]+original))*63.75;
+async function createRestorationGpu(ort, source, width, height) {
+  const device = ort.env.webgpu.device;
+  if (!device) throw Error('ONNX Runtime no expuso el dispositivo WebGPU.');
+  const buffers = [];
+  const allocate = (size,usage) => {
+    const buffer = device.createBuffer({size,usage});
+    buffers.push(buffer);
+    return buffer;
+  };
+  try {
+    const module = device.createShaderModule({code: `
+@group(0) @binding(0) var<storage,read> original: array<u32>;
+@group(0) @binding(1) var<storage,read_write> tensor: array<f32>;
+@group(0) @binding(2) var<storage,read_write> output: array<u32>;
+@group(0) @binding(3) var<uniform> layoutInfo: array<vec4u,3>;
+@group(0) @binding(4) var<storage,read> residuals: array<f32>;
+
+@compute @workgroup_size(8,8)
+fn packInput(@builtin(global_invocation_id) p:vec3u) {
+  let region = layoutInfo[0];
+  if (p.x >= region.z || p.y >= region.w) { return; }
+  let pos = p.y*region.z+p.x;
+  let plane = region.z*region.w;
+  let rgb = unpack4x8unorm(original[(p.y+region.y)*layoutInfo[2].x+p.x+region.x]);
+  tensor[pos] = rgb.r;
+  tensor[plane+pos] = rgb.g;
+  tensor[2u*plane+pos] = rgb.b;
+}
+
+@compute @workgroup_size(8,8)
+fn assemble(@builtin(global_invocation_id) p:vec3u) {
+  let region = layoutInfo[0];
+  let core = layoutInfo[1];
+  let full = layoutInfo[2].x;
+  if (p.x >= core.z*2u || p.y >= core.w*2u) { return; }
+  let x = core.x+p.x/2u;
+  let y = core.y+p.y/2u;
+  let base = (y-region.y)*region.z+x-region.x;
+  let plane = region.z*region.w;
+  let phase = (p.y%2u)*8u+(p.x%2u)*2u;
+  let sample = unpack4x8unorm(original[y*full+x]);
+  var rgb = vec3f(0.0);
+  for (var c=0u; c<3u; c++) {
+    let i = (c*16u+phase)*plane+base;
+    rgb[c] = sample[c] + (residuals[i]+residuals[i+plane]+residuals[i+4u*plane]+residuals[i+5u*plane])*0.25;
+  }
+  let dest = (core.y*2u+p.y)*(full*2u)+core.x*2u+p.x;
+  output[dest] = pack4x8unorm(vec4f(clamp(rgb,vec3f(0.0),vec3f(1.0)),sample.a));
+}`});
+    const pack = await device.createComputePipelineAsync({layout:'auto',compute:{module,entryPoint:'packInput'}});
+    const assemble = await device.createComputePipelineAsync({layout:'auto',compute:{module,entryPoint:'assemble'}});
+    const original = allocate(width*height*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST);
+    const fullSize = width*height*16;
+    const output = allocate(fullSize,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC);
+    const staging = allocate(fullSize,GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ);
+    const info = allocate(48,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST);
+    const originalPixels = source.getImageData(0,0,width,height);
+    device.queue.writeBuffer(original,0,originalPixels.data);
+    function dispatch(pipeline, bindings, w, h) {
+      const group = device.createBindGroup({layout:pipeline.getBindGroupLayout(0),entries:bindings.map(([binding,buffer])=>({binding,resource:{buffer}}))});
+      const encoder = device.createCommandEncoder();
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0,group);
+      pass.dispatchWorkgroups(Math.ceil(w/8),Math.ceil(h/8));
+      pass.end();
+      device.queue.submit([encoder.finish()]);
+    }
+    return {
+      async tile(session, left, top, w, h, x, y, cw, ch) {
+        const input = device.createBuffer({size:w*h*12,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC|GPUBufferUsage.COPY_DST});
+        let tensor, outputs;
+        try {
+          device.queue.writeBuffer(info,0,new Uint32Array([left,top,w,h,x,y,cw,ch,width,height,0,0]));
+          dispatch(pack,[[0,original],[1,input],[3,info]],w,h);
+          tensor = ort.Tensor.fromGpuBuffer(input,{dataType:'float32',dims:[1,3,h,w]});
+          outputs = await session.run({[session.inputNames[0]]:tensor});
+          const result = outputs[session.outputNames[0]];
+          if (result.location !== 'gpu-buffer' || result.dims.join(',') !== [1,48,h,w].join(',')) throw Error('WebGPU no devolvió el tensor esperado.');
+          dispatch(assemble,[[0,original],[2,output],[3,info],[4,result.gpuBuffer]],cw*2,ch*2);
+        } finally {
+          try { await device.queue.onSubmittedWorkDone(); }
+          finally {
+            for(const item of Object.values(outputs||{})) item.dispose();
+            tensor?.dispose();
+            input.destroy();
+          }
+        }
+      },
+      async png(result) {
+        const encoder=device.createCommandEncoder();
+        encoder.copyBufferToBuffer(output,0,staging,0,fullSize);
+        device.queue.submit([encoder.finish()]);
+        await staging.mapAsync(GPUMapMode.READ);
+        const pixels=result.createImageData(width*2,height*2);
+        pixels.data.set(new Uint8Array(staging.getMappedRange()));
+        staging.unmap();
+        if (hasOutputStripes(pixels) && !hasOutputStripes(originalPixels)) throw Error('Se detectaron franjas. La salida GPU fue descartada.');
+        result.putImageData(pixels,0,0);
+        return result.canvas.convertToBlob({type:'image/png'});
+      },
+      release() { for(const buffer of buffers) buffer.destroy(); }
+    };
+  } catch(error) {
+    for(const buffer of buffers) buffer.destroy();
+    throw error;
+  }
 }
 
 function restorationPlan(probeMiB, weightsBytes, bindingLimit) {
@@ -106,7 +206,7 @@ function restorationPlan(probeMiB, weightsBytes, bindingLimit) {
     const pixels = (core + 2 * halo) ** 2;
     return weightsBytes + pixels * 960 <= budget && pixels * 256 <= bindingLimit;
   });
-  const maxSide = budget >= 44 * 1048576 ? 768 : budget >= 30 * 1048576 ? 576 : 448;
+  const maxSide = budget >= 44 * 1048576 ? 576 : budget >= 30 * 1048576 ? 448 : 320;
   return {budget, halo, candidates, maxSide};
 }
 
@@ -210,13 +310,16 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB}}) => {
     const bindingLimit = adapter ? Math.min(adapter.limits.maxStorageBufferBindingSize, adapter.limits.maxBufferSize) : Infinity;
     const quick = variant === 'fast' && !useCpu;
     const plan = restorationPlan(probeMiB, 4866418, bindingLimit);
-    const tiles = useCpu ? [96] : plan.candidates;
-    if (!quick && !tiles.length) throw Error('El presupuesto estimado no alcanza para el bloque mínimo de Real-ESRGAN en GPU.');
     image = await createImageBitmap(photo);
     if (image.width * image.height > 16000000 || Math.max(image.width,image.height) > 8192) throw Error('La foto supera el tamaño admitido.');
     const scale = Math.min(1, (useCpu ? 224 : quick ? Math.min(1600, Math.floor(Math.sqrt(Math.min(bindingLimit / 4, (probeMiB || 24) * 1048576 * 0.7 / 12)))) : plan.maxSide) / Math.max(image.width, image.height));
     const width = Math.max(1, Math.round(image.width * scale));
     const height = Math.max(1, Math.round(image.height * scale));
+    const tiles = useCpu ? [96] : plan.candidates.filter(core => {
+      const area = Math.min(width,core+2*plan.halo)*Math.min(height,core+2*plan.halo);
+      return 4866418 + area*960 + width*height*36 <= plan.budget && width*height*16 <= bindingLimit;
+    });
+    if (!quick && !tiles.length) throw Error('El presupuesto estimado no alcanza para el bloque mínimo de Real-ESRGAN en GPU.');
     const source = new OffscreenCanvas(width,height).getContext('2d',{willReadFrequently:true});
     source.imageSmoothingQuality = 'high';
     source.drawImage(image,0,0,width,height);
@@ -245,23 +348,22 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB}}) => {
       if (hash !== adapted) throw Error('La versión optimizada no pasó la verificación.');
     }
     const runtime = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
-    let route = useCpu ? 'CPU/WASM' : 'WebGPU';
+    const route = useCpu ? 'CPU/WASM' : 'WebGPU estricta';
     async function createRestorationSession(ort) {
       if (useCpu) return ort.InferenceSession.create(graph, {executionProviders: ['wasm']});
-      self.postMessage({phase: 'Comprobando compatibilidad del modelo con WebGPU…'});
+      self.postMessage({phase: 'Preparando Real-ESRGAN en WebGPU estricta…'});
       try {
-        const session = await ort.InferenceSession.create(graph, {
+        return await ort.InferenceSession.create(graph, {
           executionProviders: ['webgpu'],
+          preferredOutputLocation: 'gpu-buffer',
           extra: {session: {disable_cpu_ep_fallback: '1'}}
         });
-        route = 'WebGPU estricta';
-        return session;
       } catch (error) {
         const message = String(error.message || error);
-        if (!/assigned to the default CPU EP|fallback to CPU EP has been explicitly disabled/i.test(message)) throw error;
-        route = 'WebGPU + CPU/WASM';
-        self.postMessage({phase: 'El modelo necesita algunas operaciones en CPU. Probando WebGPU + CPU/WASM…'});
-        return ort.InferenceSession.create(graph, {executionProviders: ['webgpu', 'wasm']});
+        if (/assigned to the default CPU EP|fallback to CPU EP has been explicitly disabled/i.test(message)) {
+          throw Error('Este dispositivo no admite ejecutar todo el modelo en GPU. La app no pasó a CPU.');
+        }
+        throw error;
       }
     }
     async function infer(core, halo) {
@@ -271,8 +373,9 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB}}) => {
       ort.env.wasm.numThreads = 1;
       if (adapter) ort.env.webgpu.adapter = adapter;
       const session = await createRestorationSession(ort);
-      let firstTileMs;
+      let firstTileMs, gpuPixels;
       try {
+        if (!useCpu) gpuPixels = await createRestorationGpu(ort, source, width, height);
         const result = new OffscreenCanvas(width * 2,height * 2).getContext('2d');
         result.imageSmoothingQuality = 'high';
         for (let y=0;y<height;y+=core) {
@@ -280,6 +383,13 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB}}) => {
             const left=Math.max(0,x-halo), top=Math.max(0,y-halo);
             const coreWidth=Math.min(core,width-x), coreHeight=Math.min(core,height-y);
             const w=Math.min(width,x+coreWidth+halo)-left, h=Math.min(height,y+coreHeight+halo)-top;
+            const tileStart = performance.now();
+            if (gpuPixels) {
+              await gpuPixels.tile(session,left,top,w,h,x,y,coreWidth,coreHeight);
+              if (firstTileMs === undefined) firstTileMs = Math.round(performance.now() - tileStart);
+              self.postMessage({progress:Math.round(100*(y*width+coreHeight*(x+coreWidth))/(width*height)),backend,route,core,budget:plan.budget/1048576});
+              continue;
+            }
             const rgba=source.getImageData(left,top,w,h).data;
             const plane=w*h, data=new Float32Array(3*plane);
             for(let c=0;c<3;c++) for(let i=0;i<plane;i++) data[c*plane+i]=rgba[4*i+c]/255;
@@ -291,7 +401,7 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB}}) => {
               const output=outputs[session.outputNames[0]];
               const ow=w*4, oh=h*4, n=ow*oh;
               const values = output.location === 'cpu' ? output.data : await output.getData();
-              if(output.dims.join(',')!==(useCpu ? [1,3,oh,ow] : [1,48,h,w]).join(',') || !values.every(Number.isFinite)) throw Error('Salida inesperada del modelo.');
+              if(output.dims.join(',')!==[1,3,oh,ow].join(',') || !values.every(Number.isFinite)) throw Error('Salida inesperada del modelo.');
               if (firstTileMs === undefined) {
                 firstTileMs = Math.round(performance.now() - start);
                 self.postMessage({phase: route + ' completó el bloque de prueba en ' + firstTileMs + ' ms. Continuando…'});
@@ -305,7 +415,7 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB}}) => {
                   const src=sy*ow+sx;
                   for(let c=0;c<3;c++){
                     const p=c*n+src;
-                    pixels.data[dst+c]=useCpu ? (values[p]+values[p+1]+values[p+ow]+values[p+ow+1])*63.75 : restorationSample(values,data,c,sx,sy,w,h);
+                    pixels.data[dst+c]=(values[p]+values[p+1]+values[p+ow]+values[p+ow+1])*63.75;
                   }
                   pixels.data[dst+3]=rgba[(Math.floor(sy/4)*w+Math.floor(sx/4))*4+3];
                 }
@@ -319,8 +429,11 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB}}) => {
             }
           }
         }
-        return {png: await result.canvas.convertToBlob({type:'image/png'}), firstTileMs};
-      } finally { await session.release(); }
+        return {png: await (gpuPixels ? gpuPixels.png(result) : result.canvas.convertToBlob({type:'image/png'})), firstTileMs};
+      } finally {
+        gpuPixels?.release();
+        await session.release();
+      }
     }
     for (const [index, core] of tiles.entries()) {
       try {
@@ -1693,7 +1806,7 @@ function startRestoration(useCpu) {
   const code = document.querySelector('#restore-worker').textContent;
   const url = URL.createObjectURL(new Blob([code], {type: 'text/javascript'}));
   let worker, timer, finished = false;
-  restoreStatus.textContent = !useCpu && restoreMode.value === 'fast' ? 'Preparando WebGPU…' : 'Cargando Real-ESRGAN con salida corregida…';
+  restoreStatus.textContent = !useCpu && restoreMode.value === 'fast' ? 'Preparando WebGPU…' : 'Cargando Real-ESRGAN para ejecución GPU estricta…';
   const finish = async data => {
     if (finished) return;
     finished = true;
