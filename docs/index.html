@@ -703,7 +703,9 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic}}) 
 <input id="edit-temp" type="range" min="-100" max="100" value="0">
 <label for="edit-sat">Saturación <output id="value-sat">0</output></label>
 <input id="edit-sat" type="range" min="-100" max="100" value="0">
-<canvas id="color-preview" style="width:100%;height:auto" aria-label="Vista previa de color"></canvas>
+<p id="color-size"></p>
+<img id="color-original" alt="Foto activa sin ajustes de color" style="width:100%;height:auto" hidden>
+<canvas id="color-preview" style="width:100%;height:auto" aria-label="Vista previa de color" hidden></canvas>
 <p id="color-status" role="status"></p>
 <button id="use-color">Usar ajuste para seguir editando</button>
 <button id="save-color">Descargar ajuste</button>
@@ -2075,7 +2077,7 @@ function startRestoration(useCpu) {
       restoreReference = await createImageBitmap(data.reference);
       correction = makeCorrectionField(restoreReference, restoredBitmap, data.width, data.height);
       restoreFile = photo;
-      const scale = Math.min(1, 640 / Math.max(restoreOriginal.width, restoreOriginal.height));
+      const scale = editorPreviewScale(restoreOriginal.width, restoreOriginal.height);
       restorePreview.width = Math.max(1, Math.round(restoreOriginal.width * scale));
       restorePreview.height = Math.max(1, Math.round(restoreOriginal.height * scale));
       restoreStrength.value = '50';
@@ -2169,6 +2171,12 @@ const colorTools=document.querySelector('#color-tools'), colorPreview=document.q
 const useColor=document.querySelector('#use-color'), saveColor=document.querySelector('#save-color');
 const colorKeys=['light','temp','sat'], colorSliders=colorKeys.map(key=>document.querySelector('#edit-'+key));
 let colorBitmap, colorVersion=0, editorBusy=false;
+const colorOriginal = document.querySelector('#color-original');
+const colorSize = document.querySelector('#color-size');
+
+function editorPreviewScale(width,height) {
+  return Math.min(1, 2048/Math.max(width,height), Math.sqrt(2500000/(width*height)));
+}
 function colorPixels(data, light, temperature, saturation) {
   const exposure=2**(light/100), warmth=temperature*0.0025, chroma=1+saturation/100;
   for(let i=0;i<data.length;i+=4){
@@ -2194,7 +2202,14 @@ function paintColors(canvas) {
 }
 function redrawColors(){
   colorSliders.forEach((slider,i)=>{document.querySelector('#value-'+colorKeys[i]).textContent=slider.value;});
-  if(colorBitmap) paintColors(colorPreview);
+  if (!colorBitmap) return;
+  const adjusted = colorSliders.some(slider=>Number(slider.value));
+  colorOriginal.hidden = adjusted;
+  colorPreview.hidden = !adjusted;
+  colorSize.textContent = 'Foto activa: ' + colorBitmap.width + ' × ' + colorBitmap.height + ' px'
+    + (adjusted && (colorPreview.width !== colorBitmap.width || colorPreview.height !== colorBitmap.height)
+      ? ' · Vista previa ajustada: ' + colorPreview.width + ' × ' + colorPreview.height + ' px' : '') + '.';
+  if (adjusted) paintColors(colorPreview);
 }
 for(const slider of colorSliders) slider.oninput=redrawColors;
 async function refreshColorSource(){
@@ -2206,6 +2221,10 @@ async function refreshColorSource(){
   colorSliders.forEach(slider=>{slider.value='0';});
   colorStatus.textContent='';
   colorPreview.width=colorPreview.height=1;
+  colorPreview.hidden = true;
+  colorOriginal.hidden = true;
+  colorOriginal.removeAttribute('src');
+  colorSize.textContent = '';
   redrawColors();
   if(!workingPhoto) return;
   try{
@@ -2216,7 +2235,8 @@ async function refreshColorSource(){
       throw Error('La foto supera los límites de tamaño del editor.');
     }
     colorBitmap=bitmap;
-    const scale=Math.min(1,640/Math.max(bitmap.width,bitmap.height));
+    colorOriginal.src = originalUrl;
+    const scale=editorPreviewScale(bitmap.width,bitmap.height);
     colorPreview.width=Math.max(1,Math.round(bitmap.width*scale));
     colorPreview.height=Math.max(1,Math.round(bitmap.height*scale));
     redrawColors();
