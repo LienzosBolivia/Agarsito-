@@ -22,6 +22,13 @@ input{display:block;margin:1rem 0;max-width:100%}
 #mask-tools button{margin:.2rem 0}
 #framing canvas{display:block;max-width:100%;max-height:25rem;width:auto;height:auto;background:repeating-conic-gradient(#ddd 0 25%,#fff 0 50%) 0 0/20px 20px}
 #framing{margin-block:1.5rem}
+input[type=range]{appearance:none;-webkit-appearance:none;display:block;width:100%;max-width:none;height:48px;margin:.15rem 0 1rem;background:transparent;cursor:pointer}
+input[type=range]::-webkit-slider-runnable-track{height:9px;background:#c9d5ce;border-radius:12px}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:27px;height:27px;margin-top:-9px;background:#244e3e;border:2px solid white;border-radius:50%;box-shadow:0 0 0 1px #244e3e}
+input[type=range]::-moz-range-track{height:9px;background:#c9d5ce;border-radius:12px}
+input[type=range]::-moz-range-thumb{width:24px;height:24px;background:#244e3e;border:2px solid white;border-radius:50%}
+input[type=range]:disabled{opacity:.45;cursor:default}
+#compare-color{display:inline;width:23px;height:23px;margin:0 .4rem 0 0;vertical-align:middle;accent-color:#244e3e}
 </style>
 <main>
 <h1>Quitar fondo</h1>
@@ -43,11 +50,11 @@ input{display:block;margin:1rem 0;max-width:100%}
 </select>
 <label for="print-orientation">Orientación</label>
 <select id="print-orientation"><option value="portrait">Vertical</option><option value="landscape">Horizontal</option></select>
-<label for="frame-x">Posición horizontal</label>
-<input type="range" id="frame-x" min="0" max="100" value="50">
-<label for="frame-y">Posición vertical</label>
-<input type="range" id="frame-y" min="0" max="100" value="50">
-<label for="frame-zoom">Zoom del encuadre</label>
+<label for="frame-x">Posición horizontal <output id="frame-x-value">50 %</output></label>
+<input type="range" id="frame-x" min="0" max="100" step="0.5" value="50">
+<label for="frame-y">Posición vertical <output id="frame-y-value">50 %</output></label>
+<input type="range" id="frame-y" min="0" max="100" step="0.5" value="50">
+<label for="frame-zoom">Zoom del encuadre <output id="frame-zoom-value">100 %</output></label>
 <input type="range" id="frame-zoom" min="100" max="250" value="100">
 <canvas id="frame-preview" aria-label="Vista previa del encuadre"></canvas>
 <p id="frame-status" role="status"></p>
@@ -315,7 +322,7 @@ fn main(@builtin(global_invocation_id) pos: vec3u) {
   }
   let detail = center.rgb - sum / weight;
   let luma = dot(detail, vec3f(0.2126, 0.7152, 0.0722));
-  let gain = smoothstep(0.006,0.045,abs(luma)) * 0.65;
+  let gain = smoothstep(0.003,0.028,abs(luma)) * 1.5;
   let rgb = clamp(center.rgb + vec3f(luma * gain),vec3f(0.0),vec3f(1.0));
   result[pos.y*dims.x+pos.x] = pack4x8unorm(vec4f(rgb, center.a));
 }`});
@@ -717,6 +724,7 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic}}) 
 <input id="edit-temp" type="range" min="-100" max="100" value="0">
 <label for="edit-sat">Saturación <output id="value-sat">0</output></label>
 <input id="edit-sat" type="range" min="-100" max="100" value="0">
+<p><label><input id="compare-color" type="checkbox" checked> Mostrar ajustes de color</label></p>
 <p id="color-size"></p>
 <img id="color-original" alt="Foto activa sin ajustes de color" style="width:100%;height:auto" hidden>
 <canvas id="color-preview" style="width:100%;height:auto" aria-label="Vista previa de color" hidden></canvas>
@@ -1592,7 +1600,7 @@ function cropBox(width, height, ratioWidth, ratioHeight, x, y, zoom = 1) {
   const cropWidth = Math.min(width, Math.max(1, Math.round(Math.min(width, height * ratio) / zoom)));
   const cropHeight = Math.min(height, Math.max(1, Math.round(Math.min(height, width / ratio) / zoom)));
   return {
-    x: Math.round((width - cropWidth) * x / 100),
+    x: Math.round((width - cropWidth) / 2 + (x - 50) / 100 * Math.max(width - cropWidth, width * 0.24)),
     y: Math.round((height - cropHeight) * y / 100),
     width: cropWidth,
     height: cropHeight
@@ -1610,9 +1618,10 @@ function showFramePreview() {
   framePreview.width = Math.max(1, Math.round(box.width * scale));
   framePreview.height = Math.max(1, Math.round(box.height * scale));
   framePreview.getContext('2d').drawImage(frameImage, box.x, box.y, box.width, box.height, 0, 0, framePreview.width, framePreview.height);
-  frameX.disabled = box.width === frameImage.naturalWidth;
+  frameX.disabled = editorBusy;
+  for (const slider of [frameX,frameY,frameZoom]) document.querySelector('#'+slider.id+'-value').textContent = slider.value+' %';
   frameY.disabled = box.height === frameImage.naturalHeight;
-  frameStatus.textContent = box.width + ' × ' + box.height + ' px · resolución original del recorte';
+  frameStatus.textContent = box.width + ' × ' + box.height + ' px · resolución original del recorte' + (box.x < 0 || box.x + box.width > frameImage.naturalWidth ? ' · margen transparente en el borde' : '') + '.';
 }
 async function openFraming(source, label) {
   const request = ++frameRequest;
@@ -2127,12 +2136,12 @@ function addRestorationDelta(original, field, strength) {
     if (original[i + 3] === 0 || field[i + 3] < 250) continue;
     for (let c = 0; c < 3; c++) {
       const delta = field[i + c] - 128;
-      original[i + c] += strength * Math.max(-45, Math.min(45, delta));
+      original[i + c] += strength * delta;
     }
   }
 }
 
-function makeCorrectionField(reference, restored, width, height) {
+function makeCorrectionField(reference, restored, width, height, variant) {
   const canvas = new OffscreenCanvas(width, height);
   const ctx = canvas.getContext('2d', {willReadFrequently:true});
   ctx.imageSmoothingQuality = 'high';
@@ -2142,8 +2151,10 @@ function makeCorrectionField(reference, restored, width, height) {
   ctx.drawImage(restored, 0, 0, width, height);
   const result = ctx.getImageData(0, 0, width, height);
   const field = ctx.createImageData(width, height);
+  const gain = variant === 'strong' ? 2.6 : variant === 'fast' ? 1 : 1.65;
+  const limit = variant === 'strong' ? 85 : 55;
   for (let p = 0; p < field.data.length; p += 4) {
-    for (let c = 0; c < 3; c++) field.data[p+c] = 128 + Math.max(-45,Math.min(45,result.data[p+c]-base.data[p+c]));
+    for (let c = 0; c < 3; c++) field.data[p+c] = 128 + Math.max(-limit,Math.min(limit,(result.data[p+c]-base.data[p+c])*gain));
     field.data[p+3] = Math.min(base.data[p+3],result.data[p+3]);
   }
   ctx.putImageData(field, 0, 0);
@@ -2184,6 +2195,7 @@ function startRestoration(useCpu) {
   busy(true);
   restoreMode.disabled = true;
   const photo = workingPhoto;
+  const variant = restoreMode.value;
   const code = document.querySelector('#restore-worker').textContent;
   const url = URL.createObjectURL(new Blob([code], {type: 'text/javascript'}));
   let worker, timer, finished = false;
@@ -2199,7 +2211,7 @@ function startRestoration(useCpu) {
       restoreOriginal = await createImageBitmap(photo);
       restoredBitmap = await createImageBitmap(data.png);
       restoreReference = await createImageBitmap(data.reference);
-      correction = makeCorrectionField(restoreReference, restoredBitmap, data.width, data.height);
+      correction = makeCorrectionField(restoreReference, restoredBitmap, data.width, data.height, variant);
       restoreFile = photo;
       const scale = editorPreviewScale(restoreOriginal.width, restoreOriginal.height);
       restorePreview.width = Math.max(1, Math.round(restoreOriginal.width * scale));
@@ -2297,6 +2309,8 @@ const colorKeys=['light','temp','sat'], colorSliders=colorKeys.map(key=>document
 let colorBitmap, colorVersion=0, editorBusy=false;
 const colorOriginal = document.querySelector('#color-original');
 const colorSize = document.querySelector('#color-size');
+const compareColor = document.querySelector('#compare-color');
+const colorEnabled = () => compareColor.checked && colorSliders.some(slider=>Number(slider.value));
 
 function editorPreviewScale(width,height) {
   return Math.min(1, 2048/Math.max(width,height), Math.sqrt(2500000/(width*height)));
@@ -2327,7 +2341,7 @@ function paintColors(canvas) {
 function redrawColors(){
   colorSliders.forEach((slider,i)=>{document.querySelector('#value-'+colorKeys[i]).textContent=slider.value;});
   if (!colorBitmap) return;
-  const adjusted = colorSliders.some(slider=>Number(slider.value));
+  const adjusted = colorEnabled();
   colorOriginal.hidden = adjusted;
   colorPreview.hidden = !adjusted;
   colorSize.textContent = 'Foto activa: ' + colorBitmap.width + ' × ' + colorBitmap.height + ' px'
@@ -2336,6 +2350,7 @@ function redrawColors(){
   if (adjusted) paintColors(colorPreview);
 }
 for(const slider of colorSliders) slider.oninput=redrawColors;
+compareColor.onchange=redrawColors;
 async function refreshColorSource(){
   const version=++colorVersion;
   colorBitmap?.close();
@@ -2343,6 +2358,7 @@ async function refreshColorSource(){
   colorTools.hidden=!workingPhoto;
   useColor.disabled=saveColor.disabled=true;
   colorSliders.forEach(slider=>{slider.value='0';});
+  compareColor.checked = true;
   colorStatus.textContent='';
   colorPreview.width=colorPreview.height=1;
   colorPreview.hidden = true;
@@ -2380,7 +2396,7 @@ async function finishColor(continueEditing){
   busy(true);
   try{
     let blob=workingPhoto;
-    if(colorSliders.some(slider=>Number(slider.value))){
+    if(colorEnabled()){
       const canvas=new OffscreenCanvas(colorBitmap.width,colorBitmap.height);
       paintColors(canvas);
       blob=await canvas.convertToBlob({type:'image/png'});
@@ -2405,6 +2421,7 @@ function busy(value) {
   else if (frameImage) showFramePreview();
   restoreStrength.disabled = value;
   colorSliders.forEach(slider=>{slider.disabled=value;});
+  compareColor.disabled = value;
   diagnoseButton.disabled = value;
   restoreButton.disabled = value || !workingPhoto;
   restoreCpu.disabled = restoreButton.disabled;
