@@ -89,6 +89,7 @@ input[type=range]:disabled{opacity:.45;cursor:default}
 <p>La mejora se aplica sobre la foto original para conservar su textura. La intensidad también afecta el rostro.</p>
 <label for="restore-mode">Modelo</label>
 <select id="restore-mode">
+<option value="super2">Superresolución IA ×2 (más píxeles)</option>
 <option value="focus">Recuperar enfoque sin alisar piel</option>
 <option value="fast">Nitidez rápida en GPU</option>
 <option value="light">Mejora suave de píxeles</option>
@@ -165,7 +166,7 @@ function adaptRestorationModel(bytes) {
   output.set(bytes.subarray(read),write);
   return output;
 }
-async function createRestorationGpu(ort, source, width, height) {
+async function createRestorationGpu(ort, source, width, height, tileSize = 0) {
   const device = ort.env.webgpu.device;
   if (!device) throw Error('ONNX Runtime no expuso el dispositivo WebGPU.');
   const buffers = [];
@@ -211,13 +212,13 @@ fn assemble(@builtin(global_invocation_id) p:vec3u) {
     let i = (c*16u+phase)*plane+base;
     rgb[c] = sample[c] + (residuals[i]+residuals[i+plane]+residuals[i+4u*plane]+residuals[i+5u*plane])*0.25;
   }
-  let dest = (core.y*2u+p.y)*(full*2u)+core.x*2u+p.x;
+  let dest = select((core.y*2u+p.y)*(full*2u)+core.x*2u+p.x,p.y*core.z*2u+p.x,layoutInfo[2].z==1u);
   output[dest] = pack4x8unorm(vec4f(clamp(rgb,vec3f(0.0),vec3f(1.0)),sample.a));
 }`});
     const pack = await device.createComputePipelineAsync({layout:'auto',compute:{module,entryPoint:'packInput'}});
     const assemble = await device.createComputePipelineAsync({layout:'auto',compute:{module,entryPoint:'assemble'}});
     const original = allocate(width*height*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST);
-    const fullSize = width*height*16;
+    const fullSize = tileSize ? Math.min(width,tileSize)*Math.min(height,tileSize)*16 : width*height*16;
     const output = allocate(fullSize,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC);
     const staging = allocate(fullSize,GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ);
     const info = allocate(48,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST);
@@ -234,17 +235,28 @@ fn assemble(@builtin(global_invocation_id) p:vec3u) {
       device.queue.submit([encoder.finish()]);
     }
     return {
-      async tile(session, left, top, w, h, x, y, cw, ch) {
+      async tile(session, left, top, w, h, x, y, cw, ch, canvas) {
         const input = device.createBuffer({size:w*h*12,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC|GPUBufferUsage.COPY_DST});
         let tensor, outputs;
         try {
-          device.queue.writeBuffer(info,0,new Uint32Array([left,top,w,h,x,y,cw,ch,width,height,0,0]));
+          device.queue.writeBuffer(info,0,new Uint32Array([left,top,w,h,x,y,cw,ch,width,height,tileSize ? 1 : 0,0]));
           dispatch(pack,[[0,original],[1,input],[3,info]],w,h);
           tensor = ort.Tensor.fromGpuBuffer(input,{dataType:'float32',dims:[1,3,h,w]});
           outputs = await session.run({[session.inputNames[0]]:tensor});
           const result = outputs[session.outputNames[0]];
           if (result.location !== 'gpu-buffer' || result.dims.join(',') !== [1,48,h,w].join(',')) throw Error('WebGPU no devolvió el tensor esperado.');
           dispatch(assemble,[[0,original],[2,output],[3,info],[4,result.gpuBuffer]],cw*2,ch*2);
+          if (tileSize) {
+            const size = cw*ch*16;
+            const encoder = device.createCommandEncoder();
+            encoder.copyBufferToBuffer(output,0,staging,0,size);
+            device.queue.submit([encoder.finish()]);
+            await staging.mapAsync(GPUMapMode.READ,0,size);
+            const pixels = canvas.createImageData(cw*2,ch*2);
+            try { pixels.data.set(new Uint8Array(staging.getMappedRange(0,size))); }
+            finally { staging.unmap(); }
+            canvas.putImageData(pixels,x*2,y*2);
+          }
         } finally {
           try { await device.queue.onSubmittedWorkDone(); }
           finally {
@@ -255,6 +267,11 @@ fn assemble(@builtin(global_invocation_id) p:vec3u) {
         }
       },
       async png(result, checkStripes=true) {
+        if (tileSize) {
+          const pixels = result.getImageData(0,0,width*2,height*2);
+          if (hasOutputStripes(pixels) && !hasOutputStripes(originalPixels)) throw Error('Se detectaron franjas en la ampliación.');
+          return result.canvas.convertToBlob({type:'image/png'});
+        }
         const encoder=device.createCommandEncoder();
         encoder.copyBufferToBuffer(output,0,staging,0,fullSize);
         device.queue.submit([encoder.finish()]);
@@ -546,17 +563,25 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic}}) 
     if (!useCpu && !adapter) throw Error('WebGPU no está disponible en este navegador. Podés usar la prueba rápida en CPU.');
     const bindingLimit = adapter ? Math.min(adapter.limits.maxStorageBufferBindingSize, adapter.limits.maxBufferSize) : Infinity;
     const nativeFocus = variant === 'focus' && !diagnostic;
+    const super2 = variant === 'super2' && !diagnostic;
+    if (super2 && useCpu) throw Error('La superresolución ×2 requiere WebGPU.');
     const quick = (variant === 'fast' || nativeFocus) && !useCpu;
     if (nativeFocus && useCpu) throw Error('Recuperar enfoque requiere WebGPU. Elegí otro modo para la prueba en CPU.');
     const plan = restorationPlan(probeMiB, 4866418, bindingLimit);
     if (!diagnostic) image = await createImageBitmap(photo);
     if (image && (image.width * image.height > 16000000 || Math.max(image.width,image.height) > 8192)) throw Error('La foto supera el tamaño admitido.');
-    const scale = nativeFocus ? 1 : Math.min(1, (useCpu ? 224 : quick ? Math.min(1600, Math.floor(Math.sqrt(Math.min(bindingLimit / 4, (probeMiB || 24) * 1048576 * 0.7 / 12)))) : plan.maxSide) / (image ? Math.max(image.width, image.height) : 48));
+    if (super2 && (image.width*image.height > 4000000 || Math.max(image.width,image.height) > 4096)) {
+      throw Error('Para ampliar ×2, la foto debe tener como máximo 4 megapíxeles y 4096 px por lado. Podés encuadrarla primero.');
+    }
+    const scale = (nativeFocus || super2) ? 1 : Math.min(1, (useCpu ? 224 : quick ? Math.min(1600, Math.floor(Math.sqrt(Math.min(bindingLimit / 4, (probeMiB || 24) * 1048576 * 0.7 / 12)))) : plan.maxSide) / (image ? Math.max(image.width, image.height) : 48));
     const width = Math.max(1, Math.round((image?.width || 48) * scale));
     const height = Math.max(1, Math.round((image?.height || 48) * scale));
     const tiles = useCpu ? [96] : plan.candidates.filter(core => {
       const area = Math.min(width,core+2*plan.halo)*Math.min(height,core+2*plan.halo);
-      return 4866418 + area*960 + width*height*36 <= plan.budget && width*height*16 <= bindingLimit;
+      const coreArea = Math.min(width,core)*Math.min(height,core);
+      const buffers = super2 ? (width*height*4 + coreArea*32) : width*height*36;
+      const maxBuffer = super2 ? Math.max(width*height*4,coreArea*16) : width*height*16;
+      return 4866418 + area*960 + buffers <= plan.budget && maxBuffer <= bindingLimit;
     });
     if (!diagnostic && !quick && !tiles.length) throw Error('El presupuesto estimado no alcanza para el bloque mínimo de Real-ESRGAN en GPU.');
     const source = new OffscreenCanvas(width,height).getContext('2d',{willReadFrequently:true});
@@ -570,9 +595,11 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic}}) 
       self.postMessage({png,nativeFocus:true,route:'WebGPU directa',width,height,duration:Math.round(performance.now()-start)});
       return;
     }
-    const reference = new OffscreenCanvas(quick ? width : width*2,quick ? height : height*2).getContext('2d');
-    reference.imageSmoothingEnabled = false;
-    reference.drawImage(source.canvas,0,0,reference.canvas.width,reference.canvas.height);
+    const reference = super2 ? null : new OffscreenCanvas(quick ? width : width*2,quick ? height : height*2).getContext('2d');
+    if (reference) {
+      reference.imageSmoothingEnabled = false;
+      reference.drawImage(source.canvas,0,0,reference.canvas.width,reference.canvas.height);
+    }
     if (quick) {
       self.postMessage({phase:'Aplicando nitidez directamente en WebGPU…'});
       const start = performance.now();
@@ -580,19 +607,19 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic}}) 
       self.postMessage({png,reference:await reference.canvas.convertToBlob({type:'image/png'}),route:'WebGPU directa',width,height,duration:Math.round(performance.now()-start)});
       return;
     }
-    const file = variant === 'strong' ? 'realesr-general-x4v3' : 'realesr-general-wdn-x4v3';
+    const file = (variant === 'strong' || super2) ? 'realesr-general-x4v3' : 'realesr-general-wdn-x4v3';
     const response = await fetch('https://huggingface.co/thisismert/real-esrgan-onnx/resolve/main/onnx/' + file + '.onnx');
     if (!response.ok) throw Error('No se pudo descargar el modelo (HTTP ' + response.status + ').');
     const model = new Uint8Array(await response.arrayBuffer());
     const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', model));
     const checksum = Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join('');
-    const expected = variant === 'strong' ? '5518a106453e751655edc12f208973207ab8355d0cafc1816b8a9041b01810dd' : '1a94b28646b806071cf2d8d2d28d71e7f4b0cfc375536aa00c6c70856f115ece';
+    const expected = (variant === 'strong' || super2) ? '5518a106453e751655edc12f208973207ab8355d0cafc1816b8a9041b01810dd' : '1a94b28646b806071cf2d8d2d28d71e7f4b0cfc375536aa00c6c70856f115ece';
     if (checksum !== expected) throw Error('El archivo del modelo no coincide con la versión verificada.');
     const graph = useCpu ? model : adaptRestorationModel(model);
     if (!useCpu) {
       const digest = new Uint8Array(await crypto.subtle.digest('SHA-256',graph));
       const hash = Array.from(digest,b=>b.toString(16).padStart(2,'0')).join('');
-      const adapted = variant === 'strong' ? 'd3fbd15602b14fe873d0465b098395c1d02ff4b2bf9de4ab23f5551745652eac' : '862a748db9f0c95bf2e18c5fd94563fba6105a0131d23172d8fbf185abf3feb5';
+      const adapted = (variant === 'strong' || super2) ? 'd3fbd15602b14fe873d0465b098395c1d02ff4b2bf9de4ab23f5551745652eac' : '862a748db9f0c95bf2e18c5fd94563fba6105a0131d23172d8fbf185abf3feb5';
       if (hash !== adapted) throw Error('La versión optimizada no pasó la verificación.');
     }
     const runtime = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
@@ -645,7 +672,7 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic}}) 
       const session = await createRestorationSession(ort);
       let firstTileMs, gpuPixels;
       try {
-        if (!useCpu) gpuPixels = await createRestorationGpu(ort, source, width, height);
+        if (!useCpu) gpuPixels = await createRestorationGpu(ort, source, width, height, super2 ? core : 0);
         const result = new OffscreenCanvas(width * 2,height * 2).getContext('2d');
         result.imageSmoothingQuality = 'high';
         for (let y=0;y<height;y+=core) {
@@ -655,7 +682,7 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic}}) 
             const w=Math.min(width,x+coreWidth+halo)-left, h=Math.min(height,y+coreHeight+halo)-top;
             const tileStart = performance.now();
             if (gpuPixels) {
-              await gpuPixels.tile(session,left,top,w,h,x,y,coreWidth,coreHeight);
+              await gpuPixels.tile(session,left,top,w,h,x,y,coreWidth,coreHeight,result);
               if (firstTileMs === undefined) firstTileMs = Math.round(performance.now() - tileStart);
               self.postMessage({progress:Math.round(100*(y*width+coreHeight*(x+coreWidth))/(width*height)),backend,route,core,budget:plan.budget/1048576});
               continue;
@@ -708,7 +735,7 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic}}) 
     for (const [index, core] of tiles.entries()) {
       try {
         const {png, firstTileMs} = await infer(core, plan.halo);
-        self.postMessage({png,reference:await reference.canvas.convertToBlob({type:'image/png'}),route,width,height,core,firstTileMs});
+        self.postMessage({png,reference:await reference?.canvas.convertToBlob({type:'image/png'}),super2,route,width,height,core,firstTileMs});
         return;
       } catch (error) {
         if (index === tiles.length - 1 || !/out.of.memory|allocation|buffer.*size/i.test(error.message)) {
@@ -2160,14 +2187,14 @@ const restoreStrength = document.querySelector('#restore-strength');
 const restoreValue = document.querySelector('#restore-value');
 const restorePreview = document.querySelector('#restore-preview');
 const restoreSave = document.querySelector('#save-restore');
-let restoredBitmap, restoreOriginal, restoreReference, restoreFile, correction, nativeRestoration;
+let restoredBitmap, restoreOriginal, restoreReference, restoreFile, correction, nativeRestoration, enlargedRestoration;
 
 function clearRestoration() {
   restoredBitmap?.close();
   restoreOriginal?.close();
   restoreReference?.close();
   restoredBitmap = restoreOriginal = restoreReference = restoreFile = correction = undefined;
-  nativeRestoration = false;
+  nativeRestoration = enlargedRestoration = false;
   restoreResult.hidden = true;
   restorePreview.width = restorePreview.height = 1;
   restoreStatus.textContent = '';
@@ -2258,19 +2285,21 @@ function startRestoration(useCpu) {
       if (!data.png) throw Error(data.error);
       restoreOriginal = await createImageBitmap(photo);
       restoredBitmap = await createImageBitmap(data.png);
-      nativeRestoration = !!data.nativeFocus;
+      enlargedRestoration = !!data.super2;
+      nativeRestoration = !!data.nativeFocus || enlargedRestoration;
       if (!nativeRestoration) {
         restoreReference = await createImageBitmap(data.reference);
         correction = makeCorrectionField(restoreReference, restoredBitmap, data.width, data.height, variant);
       }
       restoreFile = photo;
-      const scale = editorPreviewScale(restoreOriginal.width, restoreOriginal.height);
-      restorePreview.width = Math.max(1, Math.round(restoreOriginal.width * scale));
-      restorePreview.height = Math.max(1, Math.round(restoreOriginal.height * scale));
-      restoreStrength.value = '50';
+      const previewSource = enlargedRestoration ? restoredBitmap : restoreOriginal;
+      const scale = editorPreviewScale(previewSource.width, previewSource.height);
+      restorePreview.width = Math.max(1, Math.round(previewSource.width * scale));
+      restorePreview.height = Math.max(1, Math.round(previewSource.height * scale));
+      restoreStrength.value = enlargedRestoration ? '100' : '50';
       restoreStrength.oninput();
       restoreResult.hidden = false;
-      restoreStatus.textContent = data.duration !== undefined ? 'Nitidez en ' + data.route + ' · ' + data.duration + ' ms · entrada: ' + data.width + ' × ' + data.height + ' px.' : 'Modelo ejecutado en ' + data.route + ' · primer bloque: ' + data.firstTileMs + ' ms · bloque: ' + data.core + ' px · entrada de IA: ' + data.width + ' × ' + data.height + ' px.';
+      restoreStatus.textContent = enlargedRestoration ? 'Superresolución IA ×2 · salida: ' + restoredBitmap.width + ' × ' + restoredBitmap.height + ' px · ' + data.route + '.' : data.duration !== undefined ? 'Nitidez en ' + data.route + ' · ' + data.duration + ' ms · entrada: ' + data.width + ' × ' + data.height + ' px.' : 'Modelo ejecutado en ' + data.route + ' · primer bloque: ' + data.firstTileMs + ' ms · bloque: ' + data.core + ' px · entrada de IA: ' + data.width + ' × ' + data.height + ' px.';
     } catch (error) {
       clearRestoration();
       restoreStatus.textContent = error.message;
@@ -2287,7 +2316,7 @@ function startRestoration(useCpu) {
       else restoreStatus.textContent = 'Procesando en ' + (data.route || (data.backend === 'webgpu' ? 'WebGPU' : 'CPU/WASM')) + (data.backend === 'webgpu' ? ' · presupuesto estimado: ' + data.budget.toFixed(1) + ' MiB' : '') + ' · bloque: ' + data.core + ' px · ' + data.progress + ' %';
     };
     worker.onerror = () => finish({error: 'El navegador interrumpió la mejora.'});
-    timer = setTimeout(() => finish({error: 'La mejora superó el tiempo límite.'}), 240000);
+    timer = setTimeout(() => finish({error: 'La mejora superó el tiempo límite.'}), variant === 'super2' ? 720000 : 240000);
     worker.postMessage({photo, variant: restoreMode.value, useCpu, probeMiB: profile?.probeMiB});
   } catch (error) { finish({error: error.message}); }
 };
@@ -2298,12 +2327,13 @@ async function finishRestoration(continueEditing) {
     const strength=Number(restoreStrength.value)/100;
     let blob=restoreFile;
     if(strength){
-      const canvas=new OffscreenCanvas(restoreOriginal.width,restoreOriginal.height);
+      const output = enlargedRestoration ? restoredBitmap : restoreOriginal;
+      const canvas=new OffscreenCanvas(output.width,output.height);
       paintRestoration(canvas,strength);
       blob=await canvas.convertToBlob({type:'image/png'});
     }
     if(continueEditing) setWorkingPhoto(blob,'Foto restaurada',true);
-    else downloadEdit(blob,blob.name || 'foto-mejorada.png');
+    else downloadEdit(blob,blob.name || (enlargedRestoration ? 'foto-superresolucion-x2.png' : 'foto-mejorada.png'));
   }catch(error){restoreStatus.textContent='No se pudo guardar el resultado. '+error.message;}
   finally{busy(false);}
 }
