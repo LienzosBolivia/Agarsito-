@@ -110,15 +110,33 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB}}) => {
     const expected = variant === 'strong' ? '5518a106453e751655edc12f208973207ab8355d0cafc1816b8a9041b01810dd' : '1a94b28646b806071cf2d8d2d28d71e7f4b0cfc375536aa00c6c70856f115ece';
     if (checksum !== expected) throw Error('El archivo del modelo no coincide con la versión verificada.');
     const runtime = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
+    let route = useCpu ? 'CPU/WASM' : 'WebGPU';
+    async function createRestorationSession(ort) {
+      if (useCpu) return ort.InferenceSession.create(model, {executionProviders: ['wasm']});
+      self.postMessage({phase: 'Comprobando compatibilidad del modelo con WebGPU…'});
+      try {
+        const session = await ort.InferenceSession.create(model, {
+          executionProviders: ['webgpu'],
+          extra: {session: {disable_cpu_ep_fallback: '1'}}
+        });
+        route = 'WebGPU estricta';
+        return session;
+      } catch (error) {
+        const message = String(error.message || error);
+        if (!/assigned to the default CPU EP|fallback to CPU EP has been explicitly disabled/i.test(message)) throw error;
+        route = 'WebGPU + CPU/WASM';
+        self.postMessage({phase: 'El modelo necesita algunas operaciones en CPU. Probando WebGPU + CPU/WASM…'});
+        return ort.InferenceSession.create(model, {executionProviders: ['webgpu', 'wasm']});
+      }
+    }
     async function infer(core, halo) {
       self.postMessage({progress:0,backend,core,budget:plan.budget/1048576});
       const ort = await import(runtime + (backend === 'webgpu' ? 'ort.webgpu.min.mjs' : 'ort.wasm.min.mjs'));
       ort.env.wasm.wasmPaths = runtime;
       ort.env.wasm.numThreads = 1;
       if (adapter) ort.env.webgpu.adapter = adapter;
-      const options = {executionProviders: [backend]};
-      if (backend === 'webgpu') options.extra = {session: {disable_cpu_ep_fallback: '1'}};
-      const session = await ort.InferenceSession.create(model, options);
+      const session = await createRestorationSession(ort);
+      let firstTileMs;
       try {
         const result = new OffscreenCanvas(width * 2,height * 2).getContext('2d');
         result.imageSmoothingQuality = 'high';
@@ -133,11 +151,16 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB}}) => {
             const input=new ort.Tensor('float32',data,[1,3,h,w]);
             let outputs;
             try {
+              const start = performance.now();
               outputs=await session.run({[session.inputNames[0]]:input});
               const output=outputs[session.outputNames[0]];
               const ow=w*4, oh=h*4, n=ow*oh;
-              const values = output.data;
+              const values = output.location === 'cpu' ? output.data : await output.getData();
               if(output.dims.join(',')!==[1,3,oh,ow].join(',') || !values.every(Number.isFinite)) throw Error('Salida inesperada del modelo.');
+              if (firstTileMs === undefined) {
+                firstTileMs = Math.round(performance.now() - start);
+                self.postMessage({phase: route + ' completó el bloque de prueba en ' + firstTileMs + ' ms. Continuando…'});
+              }
               const pixels=result.createImageData(coreWidth*2,coreHeight*2);
               for(let row=0;row<pixels.height;row++){
                 const sy=(y-top)*4+row*2;
@@ -153,20 +176,20 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB}}) => {
                 }
               }
               result.putImageData(pixels,x*2,y*2);
-              self.postMessage({progress:Math.round(100*(y*width+coreHeight*(x+coreWidth))/(width*height)),backend,core,budget:plan.budget/1048576});
+              self.postMessage({progress:Math.round(100*(y*width+coreHeight*(x+coreWidth))/(width*height)),backend,route,core,budget:plan.budget/1048576});
             } finally {
               input.dispose();
               for(const tensor of Object.values(outputs || {})) tensor.dispose();
             }
           }
         }
-        return result.canvas.convertToBlob({type:'image/png'});
+        return {png: await result.canvas.convertToBlob({type:'image/png'}), firstTileMs};
       } finally { await session.release(); }
     }
     for (const [index, core] of tiles.entries()) {
       try {
-        const png = await infer(core, plan.halo);
-        self.postMessage({png,backend,width,height,core});
+        const {png, firstTileMs} = await infer(core, plan.halo);
+        self.postMessage({png,route,width,height,core,firstTileMs});
         return;
       } catch (error) {
         if (index === tiles.length - 1 || !/out.of.memory|allocation|buffer.*size/i.test(error.message)) {
@@ -1552,7 +1575,7 @@ function startRestoration(useCpu) {
       restoreStrength.value = '50';
       restoreStrength.oninput();
       restoreResult.hidden = false;
-      restoreStatus.textContent = 'Modelo ejecutado en ' + (data.backend === 'webgpu' ? 'WebGPU' : 'CPU/WASM') + ' · bloque: ' + data.core + ' px · entrada de IA: ' + data.width + ' × ' + data.height + ' px.';
+      restoreStatus.textContent = 'Modelo ejecutado en ' + data.route + ' · primer bloque: ' + data.firstTileMs + ' ms · bloque: ' + data.core + ' px · entrada de IA: ' + data.width + ' × ' + data.height + ' px.';
     } catch (error) {
       clearRestoration();
       restoreStatus.textContent = error.message;
@@ -1564,8 +1587,9 @@ function startRestoration(useCpu) {
   try {
     worker = new Worker(url, {type: 'module'});
     worker.onmessage = ({data}) => {
-      if (data.progress === undefined) finish(data);
-      else restoreStatus.textContent = 'Procesando en ' + (data.backend === 'webgpu' ? 'WebGPU · presupuesto estimado: ' + data.budget.toFixed(1) + ' MiB' : 'CPU/WASM') + ' · bloque: ' + data.core + ' px · ' + data.progress + ' %';
+      if (data.phase) restoreStatus.textContent = data.phase;
+      else if (data.progress === undefined) finish(data);
+      else restoreStatus.textContent = 'Procesando en ' + (data.route || (data.backend === 'webgpu' ? 'WebGPU' : 'CPU/WASM')) + (data.backend === 'webgpu' ? ' · presupuesto estimado: ' + data.budget.toFixed(1) + ' MiB' : '') + ' · bloque: ' + data.core + ' px · ' + data.progress + ' %';
     };
     worker.onerror = () => finish({error: 'El navegador interrumpió la mejora.'});
     timer = setTimeout(() => finish({error: 'La mejora superó el tiempo límite.'}), 240000);
