@@ -53,7 +53,7 @@ input{display:block;margin:1rem 0;max-width:100%}
 <a id="download" download="foto-sin-fondo.png" hidden>Descargar PNG transparente</a>
 <section id="restore">
 <h2>Mejorar calidad</h2>
-<p>La intensidad afecta toda la foto. Compará las facciones con el original antes de exportar.</p>
+<p>La mejora se aplica sobre la foto original para conservar su textura. La intensidad también afecta el rostro.</p>
 <label for="restore-mode">Modelo</label>
 <select id="restore-mode">
 <option value="fast">Nitidez rápida en GPU</option>
@@ -496,11 +496,14 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic}}) 
     if (image) source.drawImage(image,0,0,width,height);
     image?.close();
     image = undefined;
+    const reference = new OffscreenCanvas(quick ? width : width*2,quick ? height : height*2).getContext('2d');
+    reference.imageSmoothingEnabled = false;
+    reference.drawImage(source.canvas,0,0,reference.canvas.width,reference.canvas.height);
     if (quick) {
       self.postMessage({phase:'Aplicando nitidez directamente en WebGPU…'});
       const start = performance.now();
       const png = await gpuDetail(adapter,source,width,height);
-      self.postMessage({png,route:'WebGPU directa',width,height,duration:Math.round(performance.now()-start)});
+      self.postMessage({png,reference:await reference.canvas.convertToBlob({type:'image/png'}),route:'WebGPU directa',width,height,duration:Math.round(performance.now()-start)});
       return;
     }
     const file = variant === 'strong' ? 'realesr-general-x4v3' : 'realesr-general-wdn-x4v3';
@@ -631,7 +634,7 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic}}) 
     for (const [index, core] of tiles.entries()) {
       try {
         const {png, firstTileMs} = await infer(core, plan.halo);
-        self.postMessage({png,route,width,height,core,firstTileMs});
+        self.postMessage({png,reference:await reference.canvas.convertToBlob({type:'image/png'}),route,width,height,core,firstTileMs});
         return;
       } catch (error) {
         if (index === tiles.length - 1 || !/out.of.memory|allocation|buffer.*size/i.test(error.message)) {
@@ -1962,27 +1965,50 @@ const restoreStrength = document.querySelector('#restore-strength');
 const restoreValue = document.querySelector('#restore-value');
 const restorePreview = document.querySelector('#restore-preview');
 const restoreSave = document.querySelector('#save-restore');
-let restoredBitmap, restoreOriginal, restoreFile;
+let restoredBitmap, restoreOriginal, restoreReference, restoreFile;
 
 function clearRestoration() {
   restoredBitmap?.close();
   restoreOriginal?.close();
-  restoredBitmap = restoreOriginal = restoreFile = undefined;
+  restoreReference?.close();
+  restoredBitmap = restoreOriginal = restoreReference = restoreFile = undefined;
   restoreResult.hidden = true;
   restorePreview.width = restorePreview.height = 1;
   restoreStatus.textContent = '';
 }
+function addRestorationDelta(original, reference, restored, strength) {
+  for (let i = 0; i < original.length; i += 4) {
+    if (original[i + 3] === 0 || reference[i + 3] < 250 || restored[i + 3] < 250) continue;
+    for (let c = 0; c < 3; c++) {
+      const delta = restored[i + c] - reference[i + c];
+      original[i + c] += strength * Math.max(-45, Math.min(45, delta));
+    }
+  }
+}
+
 function paintRestoration(canvas, strength) {
   const ctx = canvas.getContext('2d');
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  ctx.save();
-  ctx.imageSmoothingQuality = 'high';
-  ctx.globalAlpha = 1 - strength;
-  ctx.drawImage(restoreOriginal, 0, 0, canvas.width, canvas.height);
-  ctx.globalCompositeOperation = 'lighter';
-  ctx.globalAlpha = strength;
-  ctx.drawImage(restoredBitmap, 0, 0, canvas.width, canvas.height);
-  ctx.restore();
+  const {width, height} = canvas;
+  if (!strength) {
+    ctx.clearRect(0, 0, width, height);
+    ctx.drawImage(restoreOriginal, 0, 0, width, height);
+    return;
+  }
+  const strip = new OffscreenCanvas(width, Math.min(128, height)).getContext('2d', {willReadFrequently:true});
+  strip.imageSmoothingQuality = 'high';
+  function sample(bitmap, top, rows) {
+    strip.clearRect(0, 0, width, rows);
+    strip.drawImage(bitmap, 0, -top, width, height);
+    return strip.getImageData(0, 0, width, rows);
+  }
+  for (let top = 0; top < height; top += 128) {
+    const rows = Math.min(128, height - top);
+    const original = sample(restoreOriginal, top, rows);
+    const reference = sample(restoreReference, top, rows);
+    const restored = sample(restoredBitmap, top, rows);
+    addRestorationDelta(original.data, reference.data, restored.data, strength);
+    ctx.putImageData(original, 0, top);
+  }
 }
 restoreStrength.oninput = () => {
   restoreValue.textContent = restoreStrength.value + ' %';
@@ -2010,6 +2036,7 @@ function startRestoration(useCpu) {
       if (!data.png) throw Error(data.error);
       restoreOriginal = await createImageBitmap(photo);
       restoredBitmap = await createImageBitmap(data.png);
+      restoreReference = await createImageBitmap(data.reference);
       restoreFile = photo;
       const scale = Math.min(1, 640 / Math.max(restoreOriginal.width, restoreOriginal.height));
       restorePreview.width = Math.max(1, Math.round(restoreOriginal.width * scale));
