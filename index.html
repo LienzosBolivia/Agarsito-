@@ -89,6 +89,7 @@ input[type=range]:disabled{opacity:.45;cursor:default}
 <p>La mejora se aplica sobre la foto original para conservar su textura. La intensidad también afecta el rostro.</p>
 <label for="restore-mode">Modelo</label>
 <select id="restore-mode">
+<option value="focus">Recuperar enfoque sin alisar piel</option>
 <option value="fast">Nitidez rápida en GPU</option>
 <option value="light">Mejora suave de píxeles</option>
 <option value="strong">Restauración intensa de ruido y compresión</option>
@@ -284,9 +285,11 @@ function restorationPlan(probeMiB, weightsBytes, bindingLimit) {
   return {budget, halo, candidates, maxSide};
 }
 
-async function gpuDetail(adapter, source, width, height) {
+async function gpuDetail(adapter, source, width, height, nativeFocus = false, budget = 16*1048576) {
   const device = await adapter.requestDevice();
-  const size = width * height * 4;
+  const bytesPerRow = width * 4;
+  const rows = nativeFocus ? Math.max(1, Math.min(256, Math.floor(Math.min(budget / 3, device.limits.maxStorageBufferBindingSize, device.limits.maxBufferSize)/bytesPerRow)-8)) : height;
+  const size = bytesPerRow * Math.min(height, rows + (nativeFocus ? 8 : 0));
   const buffers = [];
   function buffer(length, usage) {
     const item = device.createBuffer({size: length, usage});
@@ -320,6 +323,22 @@ fn main(@builtin(global_invocation_id) pos: vec3u) {
       }
     }
   }
+  if (dims.z == 1u) {
+    let lumaWeights = vec3f(0.2126,0.7152,0.0722);
+    let originalY = dot(center.rgb,lumaWeights);
+    let fine = originalY - dot(sum/weight,lumaWeights);
+    let x = i32(pos.x);
+    let y = i32(pos.y);
+    let broad = 0.25 * dot(sampleAt(x-3,y).rgb + sampleAt(x+3,y).rgb + sampleAt(x,y-3).rgb + sampleAt(x,y+3).rgb,lumaWeights);
+    let edges = originalY - broad;
+    let amount = clamp(1.35*fine + 0.72*edges,-0.088,0.088);
+    let gate = smoothstep(0.003,0.018,max(abs(fine),abs(edges)));
+    let lower = -min(center.r,min(center.g,center.b));
+    let upper = 1.0-max(center.r,max(center.g,center.b));
+    let rgb = center.rgb + vec3f(clamp(amount*gate,lower,upper));
+    result[pos.y*dims.x+pos.x] = pack4x8unorm(vec4f(rgb,center.a));
+    return;
+  }
   let detail = center.rgb - sum / weight;
   let luma = dot(detail, vec3f(0.2126, 0.7152, 0.0722));
   let gain = smoothstep(0.003,0.028,abs(luma)) * 1.5;
@@ -331,23 +350,32 @@ fn main(@builtin(global_invocation_id) pos: vec3u) {
     const output = buffer(size, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
     const staging = buffer(size, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ);
     const dimensions = buffer(16,GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
-    device.queue.writeBuffer(input,0,source.getImageData(0,0,width,height).data);
-    device.queue.writeBuffer(dimensions,0,new Uint32Array([width,height,0,0]));
     const bindGroup=device.createBindGroup({layout:pipeline.getBindGroupLayout(0),entries:[input,output,dimensions].map((item,binding)=>({binding,resource:{buffer:item}}))});
-    const encoder=device.createCommandEncoder();
-    const pass=encoder.beginComputePass();
-    pass.setPipeline(pipeline);
-    pass.setBindGroup(0,bindGroup);
-    pass.dispatchWorkgroups(Math.ceil(width/8),Math.ceil(height/8));
-    pass.end();
-    encoder.copyBufferToBuffer(output,0,staging,0,size);
-    device.queue.submit([encoder.finish()]);
-    await staging.mapAsync(GPUMapMode.READ);
-    const pixels=source.createImageData(width,height);
-    pixels.data.set(new Uint8Array(staging.getMappedRange()));
-    staging.unmap();
-    source.putImageData(pixels,0,0);
-    return await source.canvas.convertToBlob({type:'image/png'});
+    const destination = nativeFocus ? new OffscreenCanvas(width,height).getContext('2d') : source;
+    for (let y=0;y<height;y+=rows) {
+      const pad = nativeFocus ? 4 : 0;
+      const top = Math.max(0,y-pad);
+      const end = Math.min(height,y+rows+pad);
+      const inputRows = end-top;
+      const outputRows = Math.min(rows,height-y);
+      device.queue.writeBuffer(input,0,source.getImageData(0,top,width,inputRows).data);
+      device.queue.writeBuffer(dimensions,0,new Uint32Array([width,inputRows,nativeFocus ? 1 : 0,0]));
+      const encoder=device.createCommandEncoder();
+      const pass=encoder.beginComputePass();
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0,bindGroup);
+      pass.dispatchWorkgroups(Math.ceil(width/8),Math.ceil(inputRows/8));
+      pass.end();
+      encoder.copyBufferToBuffer(output,(y-top)*bytesPerRow,staging,0,outputRows*bytesPerRow);
+      device.queue.submit([encoder.finish()]);
+      await staging.mapAsync(GPUMapMode.READ,0,outputRows*bytesPerRow);
+      const pixels=destination.createImageData(width,outputRows);
+      pixels.data.set(new Uint8Array(staging.getMappedRange()));
+      staging.unmap();
+      destination.putImageData(pixels,0,y);
+      if (nativeFocus) self.postMessage({phase:'Recuperando enfoque en WebGPU · '+Math.round(100*(y+outputRows)/height)+' %'});
+    }
+    return await destination.canvas.convertToBlob({type:'image/png'});
   } finally {
     for(const item of buffers) item.destroy();
     device.destroy();
@@ -513,11 +541,13 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic}}) 
     const adapter = useCpu ? null : await navigator.gpu?.requestAdapter();
     if (!useCpu && !adapter) throw Error('WebGPU no está disponible en este navegador. Podés usar la prueba rápida en CPU.');
     const bindingLimit = adapter ? Math.min(adapter.limits.maxStorageBufferBindingSize, adapter.limits.maxBufferSize) : Infinity;
-    const quick = variant === 'fast' && !useCpu;
+    const nativeFocus = variant === 'focus' && !diagnostic;
+    const quick = (variant === 'fast' || nativeFocus) && !useCpu;
+    if (nativeFocus && useCpu) throw Error('Recuperar enfoque requiere WebGPU. Elegí otro modo para la prueba en CPU.');
     const plan = restorationPlan(probeMiB, 4866418, bindingLimit);
     if (!diagnostic) image = await createImageBitmap(photo);
     if (image && (image.width * image.height > 16000000 || Math.max(image.width,image.height) > 8192)) throw Error('La foto supera el tamaño admitido.');
-    const scale = Math.min(1, (useCpu ? 224 : quick ? Math.min(1600, Math.floor(Math.sqrt(Math.min(bindingLimit / 4, (probeMiB || 24) * 1048576 * 0.7 / 12)))) : plan.maxSide) / (image ? Math.max(image.width, image.height) : 48));
+    const scale = nativeFocus ? 1 : Math.min(1, (useCpu ? 224 : quick ? Math.min(1600, Math.floor(Math.sqrt(Math.min(bindingLimit / 4, (probeMiB || 24) * 1048576 * 0.7 / 12)))) : plan.maxSide) / (image ? Math.max(image.width, image.height) : 48));
     const width = Math.max(1, Math.round((image?.width || 48) * scale));
     const height = Math.max(1, Math.round((image?.height || 48) * scale));
     const tiles = useCpu ? [96] : plan.candidates.filter(core => {
@@ -530,6 +560,12 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic}}) 
     if (image) source.drawImage(image,0,0,width,height);
     image?.close();
     image = undefined;
+    if (nativeFocus) {
+      const start = performance.now();
+      const png = await gpuDetail(adapter,source,width,height,true,plan.budget);
+      self.postMessage({png,nativeFocus:true,route:'WebGPU directa',width,height,duration:Math.round(performance.now()-start)});
+      return;
+    }
     const reference = new OffscreenCanvas(quick ? width : width*2,quick ? height : height*2).getContext('2d');
     reference.imageSmoothingEnabled = false;
     reference.drawImage(source.canvas,0,0,reference.canvas.width,reference.canvas.height);
@@ -2120,13 +2156,14 @@ const restoreStrength = document.querySelector('#restore-strength');
 const restoreValue = document.querySelector('#restore-value');
 const restorePreview = document.querySelector('#restore-preview');
 const restoreSave = document.querySelector('#save-restore');
-let restoredBitmap, restoreOriginal, restoreReference, restoreFile, correction;
+let restoredBitmap, restoreOriginal, restoreReference, restoreFile, correction, nativeRestoration;
 
 function clearRestoration() {
   restoredBitmap?.close();
   restoreOriginal?.close();
   restoreReference?.close();
   restoredBitmap = restoreOriginal = restoreReference = restoreFile = correction = undefined;
+  nativeRestoration = false;
   restoreResult.hidden = true;
   restorePreview.width = restorePreview.height = 1;
   restoreStatus.textContent = '';
@@ -2178,8 +2215,15 @@ function paintRestoration(canvas, strength) {
   for (let top = 0; top < height; top += 128) {
     const rows = Math.min(128, height - top);
     const original = sample(restoreOriginal, top, rows);
-    const field = sample(correction, top, rows);
-    addRestorationDelta(original.data, field.data, strength);
+    if (nativeRestoration) {
+      const enhanced = sample(restoredBitmap,top,rows).data;
+      for(let i=0;i<original.data.length;i+=4) for(let c=0;c<3;c++) {
+        original.data[i+c] += strength*(enhanced[i+c]-original.data[i+c]);
+      }
+    } else {
+      const field = sample(correction, top, rows);
+      addRestorationDelta(original.data, field.data, strength);
+    }
     ctx.putImageData(original, 0, top);
   }
 }
@@ -2199,7 +2243,7 @@ function startRestoration(useCpu) {
   const code = document.querySelector('#restore-worker').textContent;
   const url = URL.createObjectURL(new Blob([code], {type: 'text/javascript'}));
   let worker, timer, finished = false;
-  restoreStatus.textContent = !useCpu && restoreMode.value === 'fast' ? 'Preparando WebGPU…' : 'Cargando Real-ESRGAN para ejecución GPU estricta…';
+  restoreStatus.textContent = !useCpu && ['fast','focus'].includes(restoreMode.value) ? 'Preparando WebGPU…' : 'Cargando Real-ESRGAN para ejecución GPU estricta…';
   const finish = async data => {
     if (finished) return;
     finished = true;
@@ -2210,8 +2254,11 @@ function startRestoration(useCpu) {
       if (!data.png) throw Error(data.error);
       restoreOriginal = await createImageBitmap(photo);
       restoredBitmap = await createImageBitmap(data.png);
-      restoreReference = await createImageBitmap(data.reference);
-      correction = makeCorrectionField(restoreReference, restoredBitmap, data.width, data.height, variant);
+      nativeRestoration = !!data.nativeFocus;
+      if (!nativeRestoration) {
+        restoreReference = await createImageBitmap(data.reference);
+        correction = makeCorrectionField(restoreReference, restoredBitmap, data.width, data.height, variant);
+      }
       restoreFile = photo;
       const scale = editorPreviewScale(restoreOriginal.width, restoreOriginal.height);
       restorePreview.width = Math.max(1, Math.round(restoreOriginal.width * scale));
