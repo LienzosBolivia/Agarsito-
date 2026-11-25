@@ -97,6 +97,7 @@ input[type=range]:disabled{opacity:.45;cursor:default}
 </select>
 <button id="run-restore" disabled>Mejorar con GPU</button>
 <button id="run-restore-cpu" disabled>Prueba rápida en CPU</button>
+<button id="pause-restore" type="button" hidden>Pausar ampliación</button>
 <p id="restore-status" role="status"></p>
 <button id="restore-diagnostic">Diagnosticar compatibilidad GPU</button>
 <div id="restore-report" hidden>
@@ -558,7 +559,22 @@ async function diagnoseRestoration(ort, model, adapter, note) {
   }
 }
 
-self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic}}) => {
+let paused = false;
+let resumeProcessing;
+async function waitForRestorationResume() {
+  while (paused) {
+    await new Promise(resolve => { resumeProcessing = resolve; });
+  }
+}
+self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic, control}}) => {
+  if (control) {
+    paused = control === 'pause';
+    if (!paused) {
+      resumeProcessing?.();
+      resumeProcessing = undefined;
+    }
+    return;
+  }
   let image;
   try {
     const backend = useCpu ? 'wasm' : 'webgpu';
@@ -685,6 +701,7 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic}}) 
         result.imageSmoothingQuality = 'high';
         for (let y=0;y<height;y+=core) {
           for (let x=0;x<width;x+=core) {
+            if (super2) await waitForRestorationResume();
             const left=Math.max(0,x-halo), top=Math.max(0,y-halo);
             const coreWidth=Math.min(core,width-x), coreHeight=Math.min(core,height-y);
             const w=Math.min(width,x+coreWidth+halo)-left, h=Math.min(height,y+coreHeight+halo)-top;
@@ -693,6 +710,10 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic}}) 
               await gpuPixels.tile(session,left,top,w,h,x,y,coreWidth,coreHeight,result);
               if (firstTileMs === undefined) firstTileMs = Math.round(performance.now() - tileStart);
               self.postMessage({progress:Math.round(100*(y*width+coreHeight*(x+coreWidth))/(width*height)),backend,route,core,budget:plan.budget/1048576});
+              if (super2 && (x + core < width || y + core < height)) {
+                const restMs = Math.min(120, Math.max(20, (performance.now() - tileStart) * 0.15));
+                await new Promise(resolve => setTimeout(resolve, restMs));
+              }
               continue;
             }
             const rgba=source.getImageData(left,top,w,h).data;
@@ -2187,6 +2208,7 @@ function clearOutput() {
 }
 
 const restoreButton = document.querySelector('#run-restore');
+const pauseRestore = document.querySelector('#pause-restore');
 const restoreCpu = document.querySelector('#run-restore-cpu');
 const restoreMode = document.querySelector('#restore-mode');
 const restoreStatus = document.querySelector('#restore-status');
@@ -2282,8 +2304,19 @@ function startRestoration(useCpu) {
   const code = document.querySelector('#restore-worker').textContent;
   const url = URL.createObjectURL(new Blob([code], {type: 'text/javascript'}));
   let worker, timer, finished = false;
+  let pausedByUser = false, paused = false;
+  function syncPause() {
+    const nextPaused = pausedByUser || document.hidden;
+    if (nextPaused === paused) return;
+    paused = nextPaused;
+    worker.postMessage({control: paused ? 'pause' : 'resume'});
+    pauseRestore.textContent = pausedByUser ? 'Reanudar ampliación' : 'Pausar ampliación';
+    restoreStatus.textContent = paused ? 'Pausa solicitada. El bloque en curso puede terminar.' : 'Reanudando la ampliación…';
+    restartTimer();
+  }
   function restartTimer() {
     clearTimeout(timer);
+    if (paused) return;
     timer = setTimeout(() => finish({error: variant === 'super2' ? 'La superresolución dejó de avanzar. Probá con la pestaña en primer plano.' : 'La mejora superó el tiempo límite.'}), variant === 'super2' ? 120000 : 240000);
   }
   restoreStatus.textContent = !useCpu && ['fast','focus'].includes(restoreMode.value) ? 'Preparando WebGPU…' : 'Cargando Real-ESRGAN para ejecución GPU estricta…';
@@ -2291,6 +2324,9 @@ function startRestoration(useCpu) {
     if (finished) return;
     finished = true;
     clearTimeout(timer);
+    document.removeEventListener('visibilitychange', syncPause);
+    pauseRestore.hidden = true;
+    pauseRestore.onclick = null;
     worker?.terminate();
     URL.revokeObjectURL(url);
     try {
@@ -2323,14 +2359,27 @@ function startRestoration(useCpu) {
   try {
     worker = new Worker(url, {type: 'module'});
     worker.onmessage = ({data}) => {
-      if (variant === 'super2' && (data.phase || data.progress !== undefined)) restartTimer();
+      if (data.phase || data.progress !== undefined) {
+        if (paused) return;
+        if (variant === 'super2') restartTimer();
+      }
       if (data.phase) restoreStatus.textContent = data.phase;
       else if (data.progress === undefined) finish(data);
       else restoreStatus.textContent = 'Procesando en ' + (data.route || (data.backend === 'webgpu' ? 'WebGPU' : 'CPU/WASM')) + (data.backend === 'webgpu' ? ' · presupuesto estimado: ' + data.budget.toFixed(1) + ' MiB' : '') + ' · bloque: ' + data.core + ' px · ' + data.progress + ' %';
     };
     worker.onerror = () => finish({error: 'El navegador interrumpió la mejora.'});
     restartTimer();
-    worker.postMessage({photo, variant: restoreMode.value, useCpu, probeMiB: profile?.probeMiB});
+    if (variant === 'super2') {
+      pauseRestore.hidden = false;
+      pauseRestore.textContent = 'Pausar ampliación';
+      pauseRestore.onclick = () => {
+        pausedByUser = !pausedByUser;
+        syncPause();
+      };
+      document.addEventListener('visibilitychange', syncPause);
+      syncPause();
+    }
+    worker.postMessage({photo, variant, useCpu, probeMiB: profile?.probeMiB});
   } catch (error) { finish({error: error.message}); }
 };
 async function finishRestoration(continueEditing) {
