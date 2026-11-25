@@ -1182,7 +1182,7 @@ async function regenerateEdge(ctx, edge, subject, width, height) {
   if (checksum !== '6f1f3530a1a2324b19752018ce756088b07973cda8d7d890034ace5c8a48c40b') {
     throw new Error('La descarga de MI-GAN no coincide con la versión verificada.');
   }
-  const session = await ort.InferenceSession.create(graph, {executionProviders: ['wasm']});
+  const session = await ort.InferenceSession.create(model, {executionProviders: ['wasm']});
   const imageTensor = new ort.Tensor('uint8', image, [1, 3, ch, cw]);
   const maskTensor = new ort.Tensor('uint8', mask, [1, 1, ch, cw]);
   let outputs;
