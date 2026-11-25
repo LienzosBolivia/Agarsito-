@@ -71,9 +71,37 @@ input{display:block;margin:1rem 0;max-width:100%}
 </div>
 </section>
 <script id="restore-worker" type="text/plain">
+// Keep the learned convolutions. Reassemble the final CRD shuffle while writing
+// the 2x preview, without running DepthToSpace/Resize/Add in WebGPU.
+function adaptRestorationModel(bytes) {
+  const edits = [
+    [20, 4, '87ffa802'],
+    [9667, 473, ''],
+    [4866363, 51, '623b0a162f626f64792e36362f436f6e765f6f75747075745f3012210a1f0801121b0a0208010a0208300a0812066865696768740a0712057769647468']
+  ];
+  const output = new Uint8Array(bytes.length + edits.reduce((n, [,length,hex]) => n + hex.length/2 - length,0));
+  let write=0, read=0;
+  for (const [at,length,hex] of edits) {
+    output.set(bytes.subarray(read,at),write);
+    write += at-read;
+    for (let i=0;i<hex.length;i+=2) output[write++] = parseInt(hex.slice(i,i+2),16);
+    read=at+length;
+  }
+  output.set(bytes.subarray(read),write);
+  return output;
+}
+function restorationSample(values, input, c, sx, sy, w, h) {
+  const plane = w*h;
+  const base = Math.floor(sy/4)*w+Math.floor(sx/4);
+  const index = (c*16+(sy%4)*4+sx%4)*plane+base;
+  const original = input[c*plane+base];
+  return (Math.fround(values[index]+original)+Math.fround(values[index+plane]+original)
+    +Math.fround(values[index+4*plane]+original)+Math.fround(values[index+5*plane]+original))*63.75;
+}
+
 function restorationPlan(probeMiB, weightsBytes, bindingLimit) {
   const budget = Math.floor((probeMiB || 24) * 1048576 * 0.7);
-  const halo = 32;
+  const halo = 34;
   const candidates = [192, 160, 128, 96, 64, 48, 32].filter(core => {
     const pixels = (core + 2 * halo) ** 2;
     return weightsBytes + pixels * 960 <= budget && pixels * 256 <= bindingLimit;
@@ -209,13 +237,20 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB}}) => {
     const checksum = Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join('');
     const expected = variant === 'strong' ? '5518a106453e751655edc12f208973207ab8355d0cafc1816b8a9041b01810dd' : '1a94b28646b806071cf2d8d2d28d71e7f4b0cfc375536aa00c6c70856f115ece';
     if (checksum !== expected) throw Error('El archivo del modelo no coincide con la versión verificada.');
+    const graph = useCpu ? model : adaptRestorationModel(model);
+    if (!useCpu) {
+      const digest = new Uint8Array(await crypto.subtle.digest('SHA-256',graph));
+      const hash = Array.from(digest,b=>b.toString(16).padStart(2,'0')).join('');
+      const adapted = variant === 'strong' ? '995856445b561dab96d7018698601e93388d35892080025de0966aefde30d3d8' : 'c7c3461dfd10fcc89f9be80283df3a1eb56d292e0bdeb1d31c55db37256fff7f';
+      if (hash !== adapted) throw Error('La versión optimizada no pasó la verificación.');
+    }
     const runtime = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
     let route = useCpu ? 'CPU/WASM' : 'WebGPU';
     async function createRestorationSession(ort) {
-      if (useCpu) return ort.InferenceSession.create(model, {executionProviders: ['wasm']});
+      if (useCpu) return ort.InferenceSession.create(graph, {executionProviders: ['wasm']});
       self.postMessage({phase: 'Comprobando compatibilidad del modelo con WebGPU…'});
       try {
-        const session = await ort.InferenceSession.create(model, {
+        const session = await ort.InferenceSession.create(graph, {
           executionProviders: ['webgpu'],
           extra: {session: {disable_cpu_ep_fallback: '1'}}
         });
@@ -226,7 +261,7 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB}}) => {
         if (!/assigned to the default CPU EP|fallback to CPU EP has been explicitly disabled/i.test(message)) throw error;
         route = 'WebGPU + CPU/WASM';
         self.postMessage({phase: 'El modelo necesita algunas operaciones en CPU. Probando WebGPU + CPU/WASM…'});
-        return ort.InferenceSession.create(model, {executionProviders: ['webgpu', 'wasm']});
+        return ort.InferenceSession.create(graph, {executionProviders: ['webgpu', 'wasm']});
       }
     }
     async function infer(core, halo) {
@@ -256,7 +291,7 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB}}) => {
               const output=outputs[session.outputNames[0]];
               const ow=w*4, oh=h*4, n=ow*oh;
               const values = output.location === 'cpu' ? output.data : await output.getData();
-              if(output.dims.join(',')!==[1,3,oh,ow].join(',') || !values.every(Number.isFinite)) throw Error('Salida inesperada del modelo.');
+              if(output.dims.join(',')!==(useCpu ? [1,3,oh,ow] : [1,48,h,w]).join(',') || !values.every(Number.isFinite)) throw Error('Salida inesperada del modelo.');
               if (firstTileMs === undefined) {
                 firstTileMs = Math.round(performance.now() - start);
                 self.postMessage({phase: route + ' completó el bloque de prueba en ' + firstTileMs + ' ms. Continuando…'});
@@ -270,12 +305,12 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB}}) => {
                   const src=sy*ow+sx;
                   for(let c=0;c<3;c++){
                     const p=c*n+src;
-                    pixels.data[dst+c]=(values[p]+values[p+1]+values[p+ow]+values[p+ow+1])*63.75;
+                    pixels.data[dst+c]=useCpu ? (values[p]+values[p+1]+values[p+ow]+values[p+ow+1])*63.75 : restorationSample(values,data,c,sx,sy,w,h);
                   }
                   pixels.data[dst+3]=rgba[(Math.floor(sy/4)*w+Math.floor(sx/4))*4+3];
                 }
               }
-              if (hasOutputStripes(pixels) && (backend === 'webgpu' || !hasOutputStripes({width:w,height:h,data:rgba}))) throw Error('Se detectaron franjas en la salida. El resultado fue descartado. Probá Nitidez rápida en GPU.');
+              if (hasOutputStripes(pixels) && !hasOutputStripes({width:w,height:h,data:rgba})) throw Error('Se detectaron franjas en la salida. El resultado fue descartado. Probá el mismo modelo con la opción CPU.');
               result.putImageData(pixels,x*2,y*2);
               self.postMessage({progress:Math.round(100*(y*width+coreHeight*(x+coreWidth))/(width*height)),backend,route,core,budget:plan.budget/1048576});
             } finally {
@@ -603,7 +638,7 @@ async function regenerateEdge(ctx, edge, subject, width, height) {
   if (checksum !== '6f1f3530a1a2324b19752018ce756088b07973cda8d7d890034ace5c8a48c40b') {
     throw new Error('La descarga de MI-GAN no coincide con la versión verificada.');
   }
-  const session = await ort.InferenceSession.create(model, {executionProviders: ['wasm']});
+  const session = await ort.InferenceSession.create(graph, {executionProviders: ['wasm']});
   const imageTensor = new ort.Tensor('uint8', image, [1, 3, ch, cw]);
   const maskTensor = new ort.Tensor('uint8', mask, [1, 1, ch, cw]);
   let outputs;
@@ -1658,7 +1693,7 @@ function startRestoration(useCpu) {
   const code = document.querySelector('#restore-worker').textContent;
   const url = URL.createObjectURL(new Blob([code], {type: 'text/javascript'}));
   let worker, timer, finished = false;
-  restoreStatus.textContent = !useCpu && restoreMode.value === 'fast' ? 'Preparando WebGPU…' : 'Cargando Real-ESRGAN…';
+  restoreStatus.textContent = !useCpu && restoreMode.value === 'fast' ? 'Preparando WebGPU…' : 'Cargando Real-ESRGAN con salida corregida…';
   const finish = async data => {
     if (finished) return;
     finished = true;
