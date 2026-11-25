@@ -36,6 +36,7 @@ input[type=range]:disabled{opacity:.45;cursor:default}
 <label for="photo">Elegí una foto</label>
 <input id="photo" type="file" accept="image/*">
 <button id="frame-original" hidden>Encuadrar foto</button>
+<button id="open-original-edge" type="button" hidden>Reconstruir borde con IA en foto activa</button>
 <section id="framing" hidden>
 <h2>Encuadre</h2>
 <p id="frame-source"></p>
@@ -1209,13 +1210,16 @@ async function regenerateEdge(ctx, edge, subject, width, height) {
     for (let row = 0; row < cropHeight; row += 64) {
       const rows = Math.min(64, cropHeight - row);
       band.clearRect(0, 0, cropWidth, rows);
-      band.drawImage(subject, x0, y0 + row, cropWidth, rows, 0, 0, cropWidth, rows);
-      const protectedPixels = band.getImageData(0, 0, cropWidth, rows).data;
+      let protectedPixels;
+      if (subject) {
+        band.drawImage(subject, x0, y0 + row, cropWidth, rows, 0, 0, cropWidth, rows);
+        protectedPixels = band.getImageData(0, 0, cropWidth, rows).data;
+      }
       band.clearRect(0, 0, cropWidth, rows);
       band.drawImage(tile, 0, -row, cropWidth, cropHeight);
       const patchBand = band.getImageData(0, 0, cropWidth, rows);
       for (let p = 3; p < patchBand.data.length; p += 4) {
-        if (protectedPixels[p] >= 235) patchBand.data[p] = 0;
+        if (protectedPixels?.[p] >= 235) patchBand.data[p] = 0;
         else if (patchBand.data[p]) applied = true;
       }
       band.putImageData(patchBand, 0, 0);
@@ -1230,8 +1234,7 @@ async function regenerateEdge(ctx, edge, subject, width, height) {
   }
 }
 
-function blendMarkedEdge(ctx, subject, current, strokes) {
-  const {width, height} = subject;
+function rasterEdgeStrokes(width, height, strokes) {
   const scale = Math.min(1, 480 / Math.max(width, height));
   const w = Math.max(1, Math.round(width * scale));
   const h = Math.max(1, Math.round(height * scale));
@@ -1249,6 +1252,14 @@ function blendMarkedEdge(ctx, subject, current, strokes) {
     brush.stroke();
   }
   const marked = brush.getImageData(0, 0, w, h).data;
+  const weights = new Uint8Array(w*h);
+  for (let i = 0; i < weights.length; i++) weights[i] = marked[i*4+3];
+  return {w,h,weights};
+}
+
+function blendMarkedEdge(ctx, subject, current, strokes) {
+  const {width, height} = subject;
+  const {w,h,weights} = rasterEdgeStrokes(width, height, strokes);
   const tile = new OffscreenCanvas(width, Math.min(height, 64)).getContext('2d', {willReadFrequently: true});
   let changed = false;
   for (let top = 0; top < height; top += 64) {
@@ -1264,7 +1275,7 @@ function blendMarkedEdge(ctx, subject, current, strokes) {
       const row = Math.floor((y + top) * h / height) * w;
       for (let x = 0; x < width; x++) {
         const p = (y * width + x) * 4;
-        const amount = edgeBlendAmount(matte[p + 3], marked[(row + Math.floor(x * w / width)) * 4 + 3]);
+        const amount = edgeBlendAmount(matte[p + 3], weights[((row + Math.floor(x * w / width)) * 4) / 4]);
         if (!amount) continue;
         for (let c = 0; c < 3; c++) {
           const before = strip.data[p + c];
@@ -1284,9 +1295,22 @@ function edgeBlendAmount(opacity, mark) {
   return 0.52 * Math.min(1, opacity / 22) * (1 - a) * (mark / 255);
 }
 
-self.onmessage = async ({data: {cutout, background, strokes, original, generate, currentComposition, mesh, catalogBackground}}) => {
+self.onmessage = async ({data: {cutout, background, strokes, original, generate, currentComposition, mesh, catalogBackground, standalonePhoto}}) => {
   let subject, backdrop, originalPhoto, current;
   try {
+    if (standalonePhoto) {
+      current = await createImageBitmap(standalonePhoto);
+      const {width,height} = current;
+      if (width*height > 16000000 || Math.max(width,height) > 8192) throw Error('La foto supera el tamaño admitido.');
+      const canvas = new OffscreenCanvas(width,height);
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(current,0,0);
+      const edge = rasterEdgeStrokes(width,height,strokes);
+      const generated = await regenerateEdge(ctx,edge,null,width,height);
+      const image = await canvas.convertToBlob({type:'image/png'});
+      self.postMessage({image,cleanImage:image,generated});
+      return;
+    }
     subject = await createImageBitmap(cutout);
     backdrop = await createImageBitmap(background);
     if ((!catalogBackground && backdrop.width * backdrop.height > 16000000) || Math.max(backdrop.width, backdrop.height) > 8192) {
@@ -2128,14 +2152,17 @@ let strokes = [];
 let activeStroke;
 let marking = false;
 let composing = false;
+let standaloneEdge = false;
+const openOriginalEdge = document.querySelector('#open-original-edge');
 
 function refreshHairControls() {
   markHair.setAttribute('aria-pressed', String(marking));
   markHair.textContent = marking ? 'Terminar de marcar' : 'Marcar cabello';
   guideCanvas.hidden = !marking;
   clearHair.disabled = composing || !strokes.length;
-  applyHair.disabled = composing || !strokes.length;
-  generateHair.disabled = applyHair.disabled;
+  generateHair.disabled = composing || !strokes.length;
+  applyHair.disabled = standaloneEdge || generateHair.disabled;
+  applyHair.hidden = standaloneEdge;
   markHair.disabled = composing;
 }
 function drawStrokes() {
@@ -2198,6 +2225,8 @@ const composite = document.querySelector('#composite');
 const saveComposite = document.querySelector('#save-composite');
 
 function clearComposite() {
+  if (standaloneEdge) composition.hidden = !cutoutBlob;
+  standaloneEdge = false;
   clearMesh();
   if (frameImage === composite) closeFraming();
   frameComposite.hidden = true;
@@ -2234,6 +2263,20 @@ composeButton.onclick = () => {
 applyHair.onclick = () => {
   if (!applyHair.disabled && compositeBlob) composeBackground(strokes, false, compositeBlob);
 };
+openOriginalEdge.onclick = () => {
+  if (!workingPhoto || editorBusy) return;
+  clearComposite();
+  standaloneEdge = true;
+  composition.hidden = false;
+  composite.closest('figure').querySelector('figcaption').textContent = 'Foto activa';
+  composite.src = originalUrl;
+  composite.closest('figure').hidden = false;
+  hairTools.hidden = false;
+  marking = true;
+  refreshHairControls();
+  drawStrokes();
+  composite.scrollIntoView({block:'center'});
+};
 generateHair.onclick = () => {
   if (!generateHair.disabled) composeBackground(strokes, true);
 };
@@ -2263,6 +2306,10 @@ async function composeBackground(selectedStrokes, generate = false, currentCompo
     composedResult = image;
     refreshMeshControls();
     useComposite.hidden = false;
+    useComposite.textContent = standaloneEdge ? 'Usar foto reconstruida para seguir editando' : 'Usar foto con fondo para seguir editando';
+    saveComposite.download = standaloneEdge ? 'foto-borde-reconstruido.png' : 'foto-con-fondo.png';
+    saveComposite.textContent = standaloneEdge ? 'Descargar foto reconstruida' : 'Descargar foto con fondo';
+    composite.closest('figure').querySelector('figcaption').textContent = standaloneEdge ? 'Foto reconstruida' : 'Foto con el fondo elegido';
     compositeUrl = URL.createObjectURL(image);
     hairTools.hidden = false;
     if (frameImage === composite) closeFraming();
@@ -2274,8 +2321,8 @@ async function composeBackground(selectedStrokes, generate = false, currentCompo
     composeStatus.textContent = generated ? 'Borde reconstruido con MI-GAN.' : generate ? 'La IA no produjo un cambio visible en el borde marcado. Para restos opacos, usá Quitar restos del fondo.' : integrated ? 'Unión del cabello suavizada sobre la composición actual.' : selectedStrokes.length ? 'Marcá una zona donde el cabello toque el fondo.' : 'Fondo aplicado. Ya podés marcar el cabello.';
   };
   try {
-    const number = catalogBackground.value.trim();
-    const backdrop = number ? await catalogAsset('fondos', number) : background.files[0];
+    const number = standaloneEdge ? '' : catalogBackground.value.trim();
+    const backdrop = standaloneEdge ? undefined : number ? await catalogAsset('fondos', number) : background.files[0];
     worker = new Worker(url);
     worker.onmessage = ({data}) => {
       if (data.progress) composeStatus.textContent = data.progress;
@@ -2283,7 +2330,7 @@ async function composeBackground(selectedStrokes, generate = false, currentCompo
     };
     worker.onerror = () => finish({error: 'El navegador interrumpió la composición.'});
     timeout = setTimeout(() => finish({error: 'La composición superó el tiempo límite.'}), generate ? 150000 : 45000);
-    worker.postMessage({cutout: cutoutBlob, background: backdrop, catalogBackground: !!number, strokes: selectedStrokes, original: currentComposition ? undefined : workingPhoto, generate, currentComposition});
+    worker.postMessage({cutout: cutoutBlob, background: backdrop, catalogBackground: !!number, strokes: selectedStrokes, original: currentComposition ? undefined : workingPhoto, generate, currentComposition, standalonePhoto: standaloneEdge ? workingPhoto : undefined});
   } catch (error) {
     finish({error: error.message});
   }
@@ -2652,11 +2699,13 @@ async function finishColor(continueEditing){
 useColor.onclick=()=>finishColor(true);
 saveColor.onclick=()=>finishColor(false);
 useComposite.onclick=()=>{
-  if(composedResult && !editorBusy) setWorkingPhoto(composedResult,'Foto con fondo',true);
+  if(composedResult && !editorBusy) setWorkingPhoto(composedResult,standaloneEdge ? 'Foto reconstruida' : 'Foto con fondo',true);
 };
 
 function busy(value) {
   editorBusy = value;
+  openOriginalEdge.hidden = !workingPhoto;
+  openOriginalEdge.disabled = value;
   applyFrame.disabled = frameOriginal.disabled = frameCutout.disabled = frameComposite.disabled = value;
   saveFrame.disabled = value;
   format.disabled = orientation.disabled = frameZoom.disabled = value;
