@@ -22,12 +22,45 @@ input{display:block;margin:1rem 0;max-width:100%}
 #mask-tools button{margin:.2rem 0}
 #framing canvas{display:block;max-width:100%;max-height:25rem;width:auto;height:auto;background:repeating-conic-gradient(#ddd 0 25%,#fff 0 50%) 0 0/20px 20px}
 #framing{margin-block:1.5rem}
+input[type=range]{appearance:none;-webkit-appearance:none;display:block;width:100%;max-width:none;height:48px;margin:.15rem 0 1rem;background:transparent;cursor:pointer}
+input[type=range]::-webkit-slider-runnable-track{height:9px;background:#c9d5ce;border-radius:12px}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:27px;height:27px;margin-top:-9px;background:#244e3e;border:2px solid white;border-radius:50%;box-shadow:0 0 0 1px #244e3e}
+input[type=range]::-moz-range-track{height:9px;background:#c9d5ce;border-radius:12px}
+input[type=range]::-moz-range-thumb{width:24px;height:24px;background:#244e3e;border:2px solid white;border-radius:50%}
+input[type=range]:disabled{opacity:.45;cursor:default}
+#compare-color{display:inline;width:23px;height:23px;margin:0 .4rem 0 0;vertical-align:middle;accent-color:#244e3e}
 </style>
 <main>
 <h1>Quitar fondo</h1>
 <p>Probá U²-Net con una foto de hasta 20 MB y 16 megapíxeles. El procesamiento se realiza en este navegador.</p>
 <label for="photo">Elegí una foto</label>
 <input id="photo" type="file" accept="image/*">
+<button id="frame-original" hidden>Encuadrar foto</button>
+<section id="framing" hidden>
+<h2>Encuadre</h2>
+<p id="frame-source"></p>
+<label for="print-format">Proporción de la medida</label>
+<select id="print-format">
+<option value="20,27">20 × 27 cm</option>
+<option value="16,22">16 × 22 cm</option>
+<option value="30,42">30 × 42 cm</option>
+<option value="40,50">50 × 40 cm</option>
+<option value="50,60">50 × 60 cm</option>
+<option value="50,110">50 × 110 cm</option>
+</select>
+<label for="print-orientation">Orientación</label>
+<select id="print-orientation"><option value="portrait">Vertical</option><option value="landscape">Horizontal</option></select>
+<label for="frame-x">Posición horizontal <output id="frame-x-value">50 %</output></label>
+<input type="range" id="frame-x" min="0" max="100" step="0.5" value="50">
+<label for="frame-y">Posición vertical <output id="frame-y-value">50 %</output></label>
+<input type="range" id="frame-y" min="0" max="100" step="0.5" value="50">
+<label for="frame-zoom">Zoom del encuadre <output id="frame-zoom-value">100 %</output></label>
+<input type="range" id="frame-zoom" min="100" max="250" value="100">
+<canvas id="frame-preview" aria-label="Vista previa del encuadre"></canvas>
+<p id="frame-status" role="status"></p>
+<button id="apply-frame" hidden>Aplicar encuadre</button>
+<button id="save-frame">Descargar PNG encuadrado</button>
+</section>
 <p><label for="fine"><input id="fine" type="checkbox" checked> Bordes finos y limpieza de halo por color local</label></p>
 <button id="cut" disabled>Quitar fondo</button>
 <button id="cut-cpu" disabled>Probar en CPU</button>
@@ -289,7 +322,7 @@ fn main(@builtin(global_invocation_id) pos: vec3u) {
   }
   let detail = center.rgb - sum / weight;
   let luma = dot(detail, vec3f(0.2126, 0.7152, 0.0722));
-  let gain = smoothstep(0.006,0.045,abs(luma)) * 0.65;
+  let gain = smoothstep(0.003,0.028,abs(luma)) * 1.5;
   let rgb = clamp(center.rgb + vec3f(luma * gain),vec3f(0.0),vec3f(1.0));
   result[pos.y*dims.x+pos.x] = pack4x8unorm(vec4f(rgb, center.a));
 }`});
@@ -648,39 +681,13 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic}}) 
 };
 </script>
 <button id="frame-cutout" hidden>Encuadrar antes de colocar fondo</button>
-<section id="framing" hidden>
-<h2>Encuadre</h2>
-<p id="frame-source"></p>
-<label for="print-format">Proporción de la medida</label>
-<select id="print-format">
-<option value="20,27">20 × 27 cm</option>
-<option value="16,22">16 × 22 cm</option>
-<option value="30,42">30 × 42 cm</option>
-<option value="40,50">50 × 40 cm</option>
-<option value="50,60">50 × 60 cm</option>
-<option value="50,110">50 × 110 cm</option>
-</select>
-<label for="print-orientation">Orientación</label>
-<select id="print-orientation"><option value="portrait">Vertical</option><option value="landscape">Horizontal</option></select>
-<label for="frame-x">Posición horizontal</label>
-<input type="range" id="frame-x" min="0" max="100" value="50">
-<label for="frame-y">Posición vertical</label>
-<input type="range" id="frame-y" min="0" max="100" value="50">
-<label for="frame-zoom">Zoom del encuadre</label>
-<input type="range" id="frame-zoom" min="100" max="250" value="100">
-<canvas id="frame-preview" aria-label="Vista previa del encuadre"></canvas>
-<p id="frame-status" role="status"></p>
-<button id="apply-frame" hidden>Aplicar encuadre y elegir fondo</button>
-<button id="save-frame">Descargar PNG encuadrado</button>
-</section>
+
 <section id="composition" hidden>
 <h2>Colocar un fondo</h2>
 <label for="background">Elegí una imagen de fondo</label>
 <input id="background" type="file" accept="image/*">
 <label for="catalog-background">Fondo del catálogo N.º</label>
 <input id="catalog-background" inputmode="numeric" placeholder="1–26">
-<label for="catalog-mesh">Malla del catálogo N.º (opcional)</label>
-<input id="catalog-mesh" inputmode="numeric" placeholder="1–3">
 <button id="compose" disabled>Aplicar fondo</button>
 <p id="compose-status" role="status"></p>
 <figure id="composition-view" hidden><figcaption>Foto con el fondo elegido</figcaption><div id="composition-stage"><img id="composite" alt="Retrato con el fondo elegido"><canvas id="hair-guide" aria-label="Área para marcar el borde del cabello" hidden></canvas></div></figure>
@@ -696,6 +703,18 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic}}) 
 <a id="save-composite" download="foto-con-fondo.png" hidden>Descargar foto con fondo</a>
 </section>
 <button id="frame-composite" hidden>Encuadrar foto con fondo</button>
+<section id="mesh-tools" hidden>
+<h2>Colocar una malla</h2>
+<p id="mesh-source"></p>
+<label for="catalog-mesh">Malla del catálogo N.º</label>
+<input id="catalog-mesh" inputmode="numeric" placeholder="1–3">
+<button id="apply-mesh" disabled>Aplicar malla</button>
+<p id="mesh-status" role="status"></p>
+<figure id="mesh-view" hidden><figcaption>Foto con malla superpuesta</figcaption><img id="mesh-preview" alt="Foto con malla"></figure>
+<button id="use-mesh" hidden>Usar foto con malla para seguir editando</button>
+<a id="save-mesh" download="foto-con-malla.png" hidden>Descargar foto con malla</a>
+<p>La malla se superpone a la foto sin quitar el fondo. Si vas a cambiar el fondo después, aplicá la malla al final.</p>
+</section>
 
 <section id="color-tools" hidden>
 <h2>Ajustar color</h2>
@@ -705,6 +724,7 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic}}) 
 <input id="edit-temp" type="range" min="-100" max="100" value="0">
 <label for="edit-sat">Saturación <output id="value-sat">0</output></label>
 <input id="edit-sat" type="range" min="-100" max="100" value="0">
+<p><label><input id="compare-color" type="checkbox" checked> Mostrar ajustes de color</label></p>
 <p id="color-size"></p>
 <img id="color-original" alt="Foto activa sin ajustes de color" style="width:100%;height:auto" hidden>
 <canvas id="color-preview" style="width:100%;height:auto" aria-label="Vista previa de color" hidden></canvas>
@@ -1560,6 +1580,7 @@ let originalUrl, outputUrl, cutoutBlob, compositeUrl, compositeBlob, workingPhot
 const useComposite = document.querySelector('#use-composite');
 const useRestored = document.querySelector('#use-restored');
 
+const frameOriginal = document.querySelector('#frame-original');
 const frameCutout = document.querySelector('#frame-cutout');
 const frameComposite = document.querySelector('#frame-composite');
 const framing = document.querySelector('#framing');
@@ -1572,14 +1593,14 @@ const framePreview = document.querySelector('#frame-preview');
 const frameStatus = document.querySelector('#frame-status');
 const saveFrame = document.querySelector('#save-frame');
 const applyFrame = document.querySelector('#apply-frame');
-let frameImage;
+let frameImage, frameRequest = 0;
 
 function cropBox(width, height, ratioWidth, ratioHeight, x, y, zoom = 1) {
   const ratio = ratioWidth / ratioHeight;
   const cropWidth = Math.min(width, Math.max(1, Math.round(Math.min(width, height * ratio) / zoom)));
   const cropHeight = Math.min(height, Math.max(1, Math.round(Math.min(height, width / ratio) / zoom)));
   return {
-    x: Math.round((width - cropWidth) * x / 100),
+    x: Math.round((width - cropWidth) / 2 + (x - 50) / 100 * Math.max(width - cropWidth, width * 0.24)),
     y: Math.round((height - cropHeight) * y / 100),
     width: cropWidth,
     height: cropHeight
@@ -1597,19 +1618,21 @@ function showFramePreview() {
   framePreview.width = Math.max(1, Math.round(box.width * scale));
   framePreview.height = Math.max(1, Math.round(box.height * scale));
   framePreview.getContext('2d').drawImage(frameImage, box.x, box.y, box.width, box.height, 0, 0, framePreview.width, framePreview.height);
-  frameX.disabled = box.width === frameImage.naturalWidth;
+  frameX.disabled = editorBusy;
+  for (const slider of [frameX,frameY,frameZoom]) document.querySelector('#'+slider.id+'-value').textContent = slider.value+' %';
   frameY.disabled = box.height === frameImage.naturalHeight;
-  frameStatus.textContent = box.width + ' × ' + box.height + ' px · resolución original del recorte';
+  frameStatus.textContent = box.width + ' × ' + box.height + ' px · resolución original del recorte' + (box.x < 0 || box.x + box.width > frameImage.naturalWidth ? ' · margen transparente en el borde' : '') + '.';
 }
 async function openFraming(source, label) {
+  const request = ++frameRequest;
   frameImage = undefined;
   framing.hidden = true;
   const url = source.src;
   try {
     await source.decode();
-    if (url !== source.src || source.closest('figure').hidden) return;
+    if (request !== frameRequest || url !== source.src || source.closest('figure').hidden) return;
     frameImage = source;
-    applyFrame.hidden = source !== after;
+    applyFrame.hidden = source !== before && source !== after;
     orientation.value = source.naturalWidth > source.naturalHeight ? 'landscape' : 'portrait';
     frameX.value = frameY.value = '50';
     frameZoom.value = '100';
@@ -1622,11 +1645,13 @@ async function openFraming(source, label) {
   }
 }
 function closeFraming() {
+  ++frameRequest;
   frameImage = undefined;
   framing.hidden = true;
   framePreview.width = framePreview.height = 1;
 }
 for (const control of [format, orientation, frameX, frameY, frameZoom]) control.oninput = showFramePreview;
+frameOriginal.onclick = () => openFraming(before, 'Encuadrá la foto antes de continuar. No es necesario quitar el fondo.');
 frameCutout.onclick = () => openFraming(after, 'Encuadrá la silueta antes de elegir el fondo.');
 frameComposite.onclick = () => openFraming(composite, 'Foto con fondo');
 async function framedPng(source, box) {
@@ -1635,10 +1660,17 @@ async function framedPng(source, box) {
   return await canvas.convertToBlob({type:'image/png'});
 }
 applyFrame.onclick = async () => {
-  if (editorBusy || frameImage !== after || !cutoutBlob || !workingPhoto) return;
+  if (editorBusy || !workingPhoto || (frameImage !== before && (frameImage !== after || !cutoutBlob))) return;
+  const source = frameImage;
   const box = currentFrame();
   busy(true);
   try {
+    if (source === before) {
+      const original = await framedPng(source, box);
+      setWorkingPhoto(original, 'Foto encuadrada', true);
+      photoStatus.textContent = 'Encuadre aplicado: ' + box.width + ' × ' + box.height + ' px. Podés seguir editando, quitar el fondo o conservarlo.';
+      return;
+    }
     await before.decode();
     if (before.naturalWidth !== after.naturalWidth || before.naturalHeight !== after.naturalHeight) {
       throw Error('Las dimensiones del original y del recorte no coinciden.');
@@ -1747,6 +1779,7 @@ eraseToggle.onclick = () => {
   setEraseMode(!eraseMode);
 };
 function showCutout(png) {
+  clearMesh();
   closeFraming();
   frameCutout.hidden = false;
   cutoutBlob = png;
@@ -1758,6 +1791,7 @@ function showCutout(png) {
   maskTools.hidden = false;
   download.href = outputUrl;
   download.hidden = false;
+  refreshMeshControls();
 }
 eraseApply.onclick = async () => {
   if (eraseApply.disabled || !cutoutBlob) return;
@@ -1801,6 +1835,15 @@ const composition = document.querySelector('#composition');
 const background = document.querySelector('#background');
 const catalogBackground = document.querySelector('#catalog-background');
 const catalogMesh = document.querySelector('#catalog-mesh');
+const meshTools = document.querySelector('#mesh-tools');
+const meshSourceLabel = document.querySelector('#mesh-source');
+const meshButton = document.querySelector('#apply-mesh');
+const meshStatus = document.querySelector('#mesh-status');
+const meshView = document.querySelector('#mesh-view');
+const meshPreview = document.querySelector('#mesh-preview');
+const useMesh = document.querySelector('#use-mesh');
+const saveMesh = document.querySelector('#save-mesh');
+let meshResult, meshUrl;
 let catalog;
 
 async function catalogAsset(group, number) {
@@ -1816,6 +1859,69 @@ async function catalogAsset(group, number) {
   if (!response.ok) throw new Error('No se pudo cargar ' + path + '.');
   return response.blob();
 }
+function meshSource() {
+  if (compositeBlob) return {blob: compositeBlob, label: 'Foto con fondo nuevo'};
+  if (cutoutBlob) return {blob: cutoutBlob, label: 'Foto con fondo transparente'};
+  return {blob: workingPhoto, label: 'Foto activa con su fondo original'};
+}
+function refreshMeshControls() {
+  const source = meshSource();
+  meshTools.hidden = !source.blob;
+  meshSourceLabel.textContent = source.blob ? 'Se aplicará encima de: ' + source.label : '';
+  catalogMesh.disabled = editorBusy;
+  meshButton.disabled = editorBusy || !source.blob || !catalogMesh.value.trim();
+  useMesh.disabled = editorBusy || !meshResult;
+  saveMesh.hidden = !meshResult || editorBusy;
+}
+function clearMesh() {
+  if (meshUrl) URL.revokeObjectURL(meshUrl);
+  meshUrl = meshResult = undefined;
+  meshPreview.removeAttribute('src');
+  meshView.hidden = useMesh.hidden = saveMesh.hidden = true;
+  saveMesh.removeAttribute('href');
+  meshStatus.textContent = '';
+}
+catalogMesh.oninput = () => {
+  clearMesh();
+  refreshMeshControls();
+};
+meshButton.onclick = async () => {
+  if (meshButton.disabled || editorBusy) return;
+  const source = meshSource();
+  const number = catalogMesh.value.trim();
+  clearMesh();
+  busy(true);
+  meshStatus.textContent = 'Aplicando malla a resolución completa…';
+  let photo, overlay;
+  try {
+    photo = await createImageBitmap(source.blob);
+    if (photo.width * photo.height > 16000000 || Math.max(photo.width, photo.height) > 8192) {
+      throw Error('La foto supera los límites de tamaño del editor.');
+    }
+    overlay = await createImageBitmap(await catalogAsset('mallas', number));
+    const canvas = new OffscreenCanvas(photo.width, photo.height);
+    const ctx = canvas.getContext('2d', {alpha: true});
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(photo, 0, 0);
+    ctx.drawImage(overlay, 0, 0, photo.width, photo.height);
+    meshResult = await canvas.convertToBlob({type: 'image/png'});
+    meshUrl = URL.createObjectURL(meshResult);
+    meshPreview.src = meshUrl;
+    meshView.hidden = useMesh.hidden = false;
+    saveMesh.href = meshUrl;
+    meshStatus.textContent = 'Malla aplicada: ' + photo.width + ' × ' + photo.height + ' px.';
+  } catch (error) {
+    clearMesh();
+    meshStatus.textContent = error.message || 'No se pudo aplicar la malla.';
+  } finally {
+    photo?.close();
+    overlay?.close();
+    busy(false);
+  }
+};
+useMesh.onclick = () => {
+  if (meshResult && !editorBusy) setWorkingPhoto(meshResult, 'Foto con malla', true);
+};
 const hairTools = document.querySelector('#hair-tools');
 const markHair = document.querySelector('#mark-hair');
 const clearHair = document.querySelector('#clear-hair');
@@ -1896,6 +2002,7 @@ const composite = document.querySelector('#composite');
 const saveComposite = document.querySelector('#save-composite');
 
 function clearComposite() {
+  clearMesh();
   if (frameImage === composite) closeFraming();
   frameComposite.hidden = true;
   hairTools.hidden = true;
@@ -1919,7 +2026,7 @@ background.onchange = () => {
   busy(false);
   if (background.files[0]?.size > 20000000) composeStatus.textContent = 'El fondo supera los 20 MB.';
 };
-catalogBackground.oninput = catalogMesh.oninput = () => {
+catalogBackground.oninput = () => {
   clearComposite();
   busy(false);
 };
@@ -1955,8 +2062,10 @@ async function composeBackground(selectedStrokes, generate = false, currentCompo
       return;
     }
     if (compositeUrl) URL.revokeObjectURL(compositeUrl);
+    clearMesh();
     compositeBlob = cleanImage;
     composedResult = image;
+    refreshMeshControls();
     useComposite.hidden = false;
     compositeUrl = URL.createObjectURL(image);
     hairTools.hidden = false;
@@ -1970,9 +2079,7 @@ async function composeBackground(selectedStrokes, generate = false, currentCompo
   };
   try {
     const number = catalogBackground.value.trim();
-    const meshNumber = catalogMesh.value.trim();
     const backdrop = number ? await catalogAsset('fondos', number) : background.files[0];
-    const overlay = meshNumber ? await catalogAsset('mallas', meshNumber) : undefined;
     worker = new Worker(url);
     worker.onmessage = ({data}) => {
       if (data.progress) composeStatus.textContent = data.progress;
@@ -1980,7 +2087,7 @@ async function composeBackground(selectedStrokes, generate = false, currentCompo
     };
     worker.onerror = () => finish({error: 'El navegador interrumpió la composición.'});
     timeout = setTimeout(() => finish({error: 'La composición superó el tiempo límite.'}), generate ? 150000 : 45000);
-    worker.postMessage({cutout: cutoutBlob, background: backdrop, mesh: overlay, catalogBackground: !!number, strokes: selectedStrokes, original: currentComposition ? undefined : workingPhoto, generate, currentComposition});
+    worker.postMessage({cutout: cutoutBlob, background: backdrop, catalogBackground: !!number, strokes: selectedStrokes, original: currentComposition ? undefined : workingPhoto, generate, currentComposition});
   } catch (error) {
     finish({error: error.message});
   }
@@ -2029,12 +2136,12 @@ function addRestorationDelta(original, field, strength) {
     if (original[i + 3] === 0 || field[i + 3] < 250) continue;
     for (let c = 0; c < 3; c++) {
       const delta = field[i + c] - 128;
-      original[i + c] += strength * Math.max(-45, Math.min(45, delta));
+      original[i + c] += strength * delta;
     }
   }
 }
 
-function makeCorrectionField(reference, restored, width, height) {
+function makeCorrectionField(reference, restored, width, height, variant) {
   const canvas = new OffscreenCanvas(width, height);
   const ctx = canvas.getContext('2d', {willReadFrequently:true});
   ctx.imageSmoothingQuality = 'high';
@@ -2044,8 +2151,10 @@ function makeCorrectionField(reference, restored, width, height) {
   ctx.drawImage(restored, 0, 0, width, height);
   const result = ctx.getImageData(0, 0, width, height);
   const field = ctx.createImageData(width, height);
+  const gain = variant === 'strong' ? 2.6 : variant === 'fast' ? 1 : 1.65;
+  const limit = variant === 'strong' ? 85 : 55;
   for (let p = 0; p < field.data.length; p += 4) {
-    for (let c = 0; c < 3; c++) field.data[p+c] = 128 + Math.max(-45,Math.min(45,result.data[p+c]-base.data[p+c]));
+    for (let c = 0; c < 3; c++) field.data[p+c] = 128 + Math.max(-limit,Math.min(limit,(result.data[p+c]-base.data[p+c])*gain));
     field.data[p+3] = Math.min(base.data[p+3],result.data[p+3]);
   }
   ctx.putImageData(field, 0, 0);
@@ -2086,6 +2195,7 @@ function startRestoration(useCpu) {
   busy(true);
   restoreMode.disabled = true;
   const photo = workingPhoto;
+  const variant = restoreMode.value;
   const code = document.querySelector('#restore-worker').textContent;
   const url = URL.createObjectURL(new Blob([code], {type: 'text/javascript'}));
   let worker, timer, finished = false;
@@ -2101,7 +2211,7 @@ function startRestoration(useCpu) {
       restoreOriginal = await createImageBitmap(photo);
       restoredBitmap = await createImageBitmap(data.png);
       restoreReference = await createImageBitmap(data.reference);
-      correction = makeCorrectionField(restoreReference, restoredBitmap, data.width, data.height);
+      correction = makeCorrectionField(restoreReference, restoredBitmap, data.width, data.height, variant);
       restoreFile = photo;
       const scale = editorPreviewScale(restoreOriginal.width, restoreOriginal.height);
       restorePreview.width = Math.max(1, Math.round(restoreOriginal.width * scale));
@@ -2199,6 +2309,8 @@ const colorKeys=['light','temp','sat'], colorSliders=colorKeys.map(key=>document
 let colorBitmap, colorVersion=0, editorBusy=false;
 const colorOriginal = document.querySelector('#color-original');
 const colorSize = document.querySelector('#color-size');
+const compareColor = document.querySelector('#compare-color');
+const colorEnabled = () => compareColor.checked && colorSliders.some(slider=>Number(slider.value));
 
 function editorPreviewScale(width,height) {
   return Math.min(1, 2048/Math.max(width,height), Math.sqrt(2500000/(width*height)));
@@ -2229,7 +2341,7 @@ function paintColors(canvas) {
 function redrawColors(){
   colorSliders.forEach((slider,i)=>{document.querySelector('#value-'+colorKeys[i]).textContent=slider.value;});
   if (!colorBitmap) return;
-  const adjusted = colorSliders.some(slider=>Number(slider.value));
+  const adjusted = colorEnabled();
   colorOriginal.hidden = adjusted;
   colorPreview.hidden = !adjusted;
   colorSize.textContent = 'Foto activa: ' + colorBitmap.width + ' × ' + colorBitmap.height + ' px'
@@ -2238,6 +2350,7 @@ function redrawColors(){
   if (adjusted) paintColors(colorPreview);
 }
 for(const slider of colorSliders) slider.oninput=redrawColors;
+compareColor.onchange=redrawColors;
 async function refreshColorSource(){
   const version=++colorVersion;
   colorBitmap?.close();
@@ -2245,6 +2358,7 @@ async function refreshColorSource(){
   colorTools.hidden=!workingPhoto;
   useColor.disabled=saveColor.disabled=true;
   colorSliders.forEach(slider=>{slider.value='0';});
+  compareColor.checked = true;
   colorStatus.textContent='';
   colorPreview.width=colorPreview.height=1;
   colorPreview.hidden = true;
@@ -2282,7 +2396,7 @@ async function finishColor(continueEditing){
   busy(true);
   try{
     let blob=workingPhoto;
-    if(colorSliders.some(slider=>Number(slider.value))){
+    if(colorEnabled()){
       const canvas=new OffscreenCanvas(colorBitmap.width,colorBitmap.height);
       paintColors(canvas);
       blob=await canvas.convertToBlob({type:'image/png'});
@@ -2300,9 +2414,14 @@ useComposite.onclick=()=>{
 
 function busy(value) {
   editorBusy = value;
-  applyFrame.disabled = frameCutout.disabled = frameComposite.disabled = value;
+  applyFrame.disabled = frameOriginal.disabled = frameCutout.disabled = frameComposite.disabled = value;
+  saveFrame.disabled = value;
+  format.disabled = orientation.disabled = frameZoom.disabled = value;
+  if (value) frameX.disabled = frameY.disabled = true;
+  else if (frameImage) showFramePreview();
   restoreStrength.disabled = value;
   colorSliders.forEach(slider=>{slider.disabled=value;});
+  compareColor.disabled = value;
   diagnoseButton.disabled = value;
   restoreButton.disabled = value || !workingPhoto;
   restoreCpu.disabled = restoreButton.disabled;
@@ -2316,14 +2435,18 @@ function busy(value) {
   eraseApply.disabled = value || !eraseStrokes.length;
   eraseUndo.disabled = value || !previousCutout;
   fine.disabled = value;
-  background.disabled = catalogBackground.disabled = catalogMesh.disabled = value;
+  background.disabled = catalogBackground.disabled = value;
+  refreshMeshControls();
   composeButton.disabled = value || !cutoutBlob || (!catalogBackground.value.trim() && (!background.files[0] || background.files[0].size > 20000000));
   picker.disabled = value;
   cut.disabled = value || !workingPhoto;
   cutCpu.disabled = cut.disabled;
   cutPortrait.disabled = cut.disabled;
 }
-picker.onchange = () => setWorkingPhoto(picker.files[0], 'Original');
+picker.onchange = () => {
+  setWorkingPhoto(picker.files[0], 'Original');
+  if (workingPhoto) openFraming(before, 'Primer paso: encuadrá la foto o continuá sin cambiar el encuadre.');
+};
 
 function setWorkingPhoto(file, label, fromEdit = false) {
   workingPhoto = !fromEdit && file?.size > 20000000 ? undefined : file;
@@ -2341,6 +2464,7 @@ function setWorkingPhoto(file, label, fromEdit = false) {
   } else if (file) {
     photoStatus.textContent = 'La foto supera el límite de 20 MB.';
   }
+  frameOriginal.hidden = !workingPhoto;
   busy(false);
   refreshColorSource();
 }
