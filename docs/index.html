@@ -368,10 +368,14 @@ fn main(@builtin(global_invocation_id) pos: vec3u) {
       pass.end();
       encoder.copyBufferToBuffer(output,(y-top)*bytesPerRow,staging,0,outputRows*bytesPerRow);
       device.queue.submit([encoder.finish()]);
-      await staging.mapAsync(GPUMapMode.READ,0,outputRows*bytesPerRow);
+      const byteCount = outputRows * bytesPerRow;
+      await staging.mapAsync(GPUMapMode.READ, 0, byteCount);
       const pixels=destination.createImageData(width,outputRows);
-      pixels.data.set(new Uint8Array(staging.getMappedRange()));
-      staging.unmap();
+      try {
+        pixels.data.set(new Uint8Array(staging.getMappedRange(0, byteCount)));
+      } finally {
+        staging.unmap();
+      }
       destination.putImageData(pixels,0,y);
       if (nativeFocus) self.postMessage({phase:'Recuperando enfoque en WebGPU · '+Math.round(100*(y+outputRows)/height)+' %'});
     }
