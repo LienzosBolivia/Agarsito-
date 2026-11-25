@@ -647,7 +647,32 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic}}) 
   finally { image?.close(); }
 };
 </script>
-<button id="frame-cutout" hidden>Encuadrar PNG transparente</button>
+<button id="frame-cutout" hidden>Encuadrar antes de colocar fondo</button>
+<section id="framing" hidden>
+<h2>Encuadre</h2>
+<p id="frame-source"></p>
+<label for="print-format">Proporción de la medida</label>
+<select id="print-format">
+<option value="20,27">20 × 27 cm</option>
+<option value="16,22">16 × 22 cm</option>
+<option value="30,42">30 × 42 cm</option>
+<option value="40,50">50 × 40 cm</option>
+<option value="50,60">50 × 60 cm</option>
+<option value="50,110">50 × 110 cm</option>
+</select>
+<label for="print-orientation">Orientación</label>
+<select id="print-orientation"><option value="portrait">Vertical</option><option value="landscape">Horizontal</option></select>
+<label for="frame-x">Posición horizontal</label>
+<input type="range" id="frame-x" min="0" max="100" value="50">
+<label for="frame-y">Posición vertical</label>
+<input type="range" id="frame-y" min="0" max="100" value="50">
+<label for="frame-zoom">Zoom del encuadre</label>
+<input type="range" id="frame-zoom" min="100" max="250" value="100">
+<canvas id="frame-preview" aria-label="Vista previa del encuadre"></canvas>
+<p id="frame-status" role="status"></p>
+<button id="apply-frame" hidden>Aplicar encuadre y elegir fondo</button>
+<button id="save-frame">Descargar PNG encuadrado</button>
+</section>
 <section id="composition" hidden>
 <h2>Colocar un fondo</h2>
 <label for="background">Elegí una imagen de fondo</label>
@@ -671,30 +696,7 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic}}) 
 <a id="save-composite" download="foto-con-fondo.png" hidden>Descargar foto con fondo</a>
 </section>
 <button id="frame-composite" hidden>Encuadrar foto con fondo</button>
-<section id="framing" hidden>
-<h2>Encuadre de exportación</h2>
-<p id="frame-source"></p>
-<label for="print-format">Proporción de la medida</label>
-<select id="print-format">
-<option value="20,27">20 × 27 cm</option>
-<option value="16,22">16 × 22 cm</option>
-<option value="30,42">30 × 42 cm</option>
-<option value="40,50">50 × 40 cm</option>
-<option value="50,60">50 × 60 cm</option>
-<option value="50,110">50 × 110 cm</option>
-</select>
-<label for="print-orientation">Orientación</label>
-<select id="print-orientation"><option value="portrait">Vertical</option><option value="landscape">Horizontal</option></select>
-<label for="frame-x">Posición horizontal</label>
-<input type="range" id="frame-x" min="0" max="100" value="50">
-<label for="frame-y">Posición vertical</label>
-<input type="range" id="frame-y" min="0" max="100" value="50">
-<label for="frame-zoom">Zoom del encuadre</label>
-<input type="range" id="frame-zoom" min="100" max="250" value="100">
-<canvas id="frame-preview" aria-label="Vista previa del encuadre"></canvas>
-<p id="frame-status" role="status"></p>
-<button id="save-frame">Descargar PNG encuadrado</button>
-</section>
+
 <section id="color-tools" hidden>
 <h2>Ajustar color</h2>
 <label for="edit-light">Iluminación <output id="value-light">0</output></label>
@@ -1569,6 +1571,7 @@ const frameZoom = document.querySelector('#frame-zoom');
 const framePreview = document.querySelector('#frame-preview');
 const frameStatus = document.querySelector('#frame-status');
 const saveFrame = document.querySelector('#save-frame');
+const applyFrame = document.querySelector('#apply-frame');
 let frameImage;
 
 function cropBox(width, height, ratioWidth, ratioHeight, x, y, zoom = 1) {
@@ -1606,6 +1609,7 @@ async function openFraming(source, label) {
     await source.decode();
     if (url !== source.src || source.closest('figure').hidden) return;
     frameImage = source;
+    applyFrame.hidden = source !== after;
     orientation.value = source.naturalWidth > source.naturalHeight ? 'landscape' : 'portrait';
     frameX.value = frameY.value = '50';
     frameZoom.value = '100';
@@ -1623,17 +1627,39 @@ function closeFraming() {
   framePreview.width = framePreview.height = 1;
 }
 for (const control of [format, orientation, frameX, frameY, frameZoom]) control.oninput = showFramePreview;
-frameCutout.onclick = () => openFraming(after, 'PNG transparente');
+frameCutout.onclick = () => openFraming(after, 'Encuadrá la silueta antes de elegir el fondo.');
 frameComposite.onclick = () => openFraming(composite, 'Foto con fondo');
+async function framedPng(source, box) {
+  const canvas = new OffscreenCanvas(box.width, box.height);
+  canvas.getContext('2d').drawImage(source, box.x, box.y, box.width, box.height, 0, 0, box.width, box.height);
+  return await canvas.convertToBlob({type:'image/png'});
+}
+applyFrame.onclick = async () => {
+  if (editorBusy || frameImage !== after || !cutoutBlob || !workingPhoto) return;
+  const box = currentFrame();
+  busy(true);
+  try {
+    await before.decode();
+    if (before.naturalWidth !== after.naturalWidth || before.naturalHeight !== after.naturalHeight) {
+      throw Error('Las dimensiones del original y del recorte no coinciden.');
+    }
+    const cutout = await framedPng(after, box);
+    const original = await framedPng(before, box);
+    setWorkingPhoto(original, 'Foto encuadrada', true);
+    showCutout(cutout);
+    composeStatus.textContent = 'Encuadre aplicado: ' + box.width + ' × ' + box.height + ' px. Elegí un fondo y pulsá Aplicar fondo.';
+    composition.scrollIntoView({block:'start'});
+  } catch (error) {
+    frameStatus.textContent = error.message || 'No se pudo aplicar el encuadre.';
+  } finally { busy(false); }
+};
 saveFrame.onclick = async () => {
   if (!frameImage || saveFrame.disabled) return;
   const box = currentFrame();
   const name = 'foto-' + format.value.replace(',', 'x') + '.png';
   saveFrame.disabled = true;
   try {
-    const canvas = new OffscreenCanvas(box.width, box.height);
-    canvas.getContext('2d').drawImage(frameImage, box.x, box.y, box.width, box.height, 0, 0, box.width, box.height);
-    const png = await canvas.convertToBlob({type: 'image/png'});
+    const png = await framedPng(frameImage, box);
     const link = document.createElement('a');
     const url = URL.createObjectURL(png);
     link.href = url;
@@ -2274,6 +2300,7 @@ useComposite.onclick=()=>{
 
 function busy(value) {
   editorBusy = value;
+  applyFrame.disabled = frameCutout.disabled = frameComposite.disabled = value;
   restoreStrength.disabled = value;
   colorSliders.forEach(slider=>{slider.disabled=value;});
   diagnoseButton.disabled = value;
