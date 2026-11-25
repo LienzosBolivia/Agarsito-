@@ -609,6 +609,13 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic, co
       const maxBuffer = super2 ? Math.max(area*4,coreArea*16) : width*height*16;
       return 4866418 + area*960 + buffers <= plan.budget && maxBuffer <= bindingLimit;
     });
+    const trialCore = 96;
+    const trialArea = (trialCore + 2*plan.halo)**2;
+    const canTryLarger = super2 && !useCpu && (tiles[0] ?? 0) < trialCore &&
+      width >= trialCore + 2*plan.halo && height >= trialCore + 2*plan.halo &&
+      4866418 + trialArea*964 + trialCore**2*32 <= (probeMiB ?? 0)*1048576 &&
+      trialArea*256 <= bindingLimit;
+    if (canTryLarger) tiles.unshift(trialCore);
     if (!diagnostic && !quick && !tiles.length) throw Error('El presupuesto estimado no alcanza para el bloque mínimo de Real-ESRGAN en GPU.');
     const source = new OffscreenCanvas(width,height).getContext('2d',{willReadFrequently:true});
     source.imageSmoothingQuality = 'high';
@@ -692,7 +699,9 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic, co
       throw Error('No se validó la salida de la GPU. ' + failures.join(' | ') + ' Podés probar este modelo en CPU.');
     }
     async function infer(core, halo) {
-      self.postMessage({progress:0,backend,core,budget:plan.budget/1048576});
+      const trial = canTryLarger && core === trialCore;
+      if (trial) self.postMessage({phase:'Probando un bloque de 96 px con Real-ESRGAN…'});
+      else self.postMessage({progress:0,backend,core,budget:plan.budget/1048576});
       const ort = await import(runtime + (backend === 'webgpu' ? 'ort.webgpu.min.mjs' : 'ort.wasm.min.mjs'));
       ort.env.wasm.wasmPaths = runtime;
       ort.env.wasm.numThreads = 1;
@@ -701,7 +710,13 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic, co
       let firstTileMs, gpuPixels, uploadByTile;
       const timing = {blocks:0, uploadMs:0, runMs:0, finishMs:0, pngMs:0, restMs:0};
       let nextRest = performance.now() + 500;
+      const trialDevice = trial ? ort.env.webgpu.device : null;
+      let trialScopeOpen = false;
       try {
+        if (trialDevice) {
+          trialDevice.pushErrorScope('out-of-memory');
+          trialScopeOpen = true;
+        }
         if (!useCpu) {
           const area = Math.min(width,core+2*halo)*Math.min(height,core+2*halo);
           const keepOnGpu = width*height*16 <= bindingLimit && 4866418 + area*960 + width*height*36 <= plan.budget;
@@ -713,6 +728,14 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic, co
         }
         const result = new OffscreenCanvas(width * 2,height * 2).getContext('2d');
         result.imageSmoothingQuality = 'high';
+        if (trialDevice) {
+          await waitForRestorationResume();
+          const side = core + 2*halo;
+          await gpuPixels.tile(session,0,0,side,side,halo,halo,core,core,result);
+          trialScopeOpen = false;
+          const error = await trialDevice.popErrorScope();
+          if (error) throw Error('out of memory: ' + error.message);
+        }
         for (let y=0;y<height;y+=core) {
           for (let x=0;x<width;x+=core) {
             if (super2) await waitForRestorationResume();
@@ -778,8 +801,15 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic, co
         timing.pngMs = performance.now() - pngStart;
         return {png, firstTileMs, timing, uploadByTile};
       } finally {
-        gpuPixels?.release();
-        await session.release();
+        try {
+          if (trialScopeOpen) {
+            const error = await trialDevice.popErrorScope();
+            if (error) throw Error('out of memory: ' + error.message);
+          }
+        } finally {
+          gpuPixels?.release();
+          await session.release();
+        }
       }
     }
     for (const [index, core] of tiles.entries()) {
@@ -788,6 +818,9 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic, co
         self.postMessage({png,reference:await reference?.canvas.convertToBlob({type:'image/png'}),super2,route,width,height,core,firstTileMs,timing,uploadByTile,cpuThreads:navigator.hardwareConcurrency,processingMs:Math.round(performance.now()-processingStarted)});
         return;
       } catch (error) {
+        if (index < tiles.length - 1 && canTryLarger && core === trialCore && /out.of.memory|allocation|buffer.*size/i.test(error.message)) {
+          self.postMessage({phase:'La GPU rechazó el bloque de 96 px por memoria. Probando un bloque menor…'});
+        }
         if (index === tiles.length - 1 || !/out.of.memory|allocation|buffer.*size/i.test(error.message)) {
           throw Error((useCpu ? 'CPU/WASM: ' : 'WebGPU: ') + error.message);
         }
