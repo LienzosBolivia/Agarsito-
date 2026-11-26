@@ -140,7 +140,7 @@ main.agarsito-editor {width:min(1440px,100%);max-width:none;height:100dvh;margin
 <a id="download" download="foto-sin-fondo.png" hidden>Descargar PNG transparente</a>
 <section id="restore">
 <h2>Mejorar calidad</h2>
-<p>La mejora se aplica sobre la foto original para conservar su textura. La intensidad también afecta el rostro.</p>
+<p>Compará la foto original y el resultado en la misma vista.</p>
 <label for="restore-mode">Modelo</label>
 <select id="restore-mode">
 <option value="fsrcnn">FSRCNN ×2 (liviano)</option>
@@ -163,9 +163,9 @@ main.agarsito-editor {width:min(1440px,100%);max-width:none;height:100dvh;margin
 <p id="restore-diagnostic-status" role="status"></p>
 </div>
 <div id="restore-result" hidden>
-<label for="restore-strength">Intensidad <output id="restore-value">50 %</output></label>
-<input id="restore-strength" type="range" min="0" max="100" value="50">
-<canvas id="restore-preview" style="width:100%;height:auto" aria-label="Vista previa de la mejora"></canvas>
+<label><input id="compare-restoration" type="checkbox" checked> Mostrar mejora (100 %)</label>
+<canvas id="restore-preview" aria-label="Foto mejorada"></canvas>
+<canvas id="restore-before-preview" aria-label="Foto antes de la mejora"></canvas>
 <button id="save-restore">Descargar resultado</button>
 <button id="use-restored">Usar restauración para seguir editando</button>
 </div>
@@ -3044,8 +3044,8 @@ restoreMode.addEventListener('change',syncHybridOption);
 syncHybridOption();
 const restoreStatus = document.querySelector('#restore-status');
 const restoreResult = document.querySelector('#restore-result');
-const restoreStrength = document.querySelector('#restore-strength');
-const restoreValue = document.querySelector('#restore-value');
+const compareRestoration=document.querySelector('#compare-restoration');
+const restoreBeforePreview=document.querySelector('#restore-before-preview');
 const restorePreview = document.querySelector('#restore-preview');
 const restoreSave = document.querySelector('#save-restore');
 let restoredBitmap, restoreOriginal, restoreReference, restoreFile, correction, nativeRestoration, enlargedRestoration, restoreDraftData;
@@ -3059,14 +3059,16 @@ function clearRestoration() {
   restoreDraftData=undefined;
   restoreResult.hidden = true;
   restorePreview.width = restorePreview.height = 1;
+  restoreBeforePreview.width = restoreBeforePreview.height = 1;
+  compareRestoration.checked=true;
   restoreStatus.textContent = '';
 }
-function addRestorationDelta(original, field, strength) {
+function addRestorationDelta(original, field) {
   for (let i = 0; i < original.length; i += 4) {
     if (original[i + 3] === 0 || field[i + 3] < 250) continue;
     for (let c = 0; c < 3; c++) {
       const delta = field[i + c] - 128;
-      original[i + c] += strength * delta;
+      original[i + c] += delta;
     }
   }
 }
@@ -3090,14 +3092,9 @@ function makeCorrectionField(reference, restored, width, height, variant) {
   ctx.putImageData(field, 0, 0);
   return canvas;
 }
-function paintRestoration(canvas, strength) {
+function paintRestoration(canvas) {
   const ctx = canvas.getContext('2d');
   const {width, height} = canvas;
-  if (!strength) {
-    ctx.clearRect(0, 0, width, height);
-    ctx.drawImage(restoreOriginal, 0, 0, width, height);
-    return;
-  }
   const strip = new OffscreenCanvas(width, Math.min(128, height)).getContext('2d', {willReadFrequently:true});
   strip.imageSmoothingQuality = 'high';
   function sample(bitmap, top, rows) {
@@ -3111,19 +3108,23 @@ function paintRestoration(canvas, strength) {
     if (nativeRestoration) {
       const enhanced = sample(restoredBitmap,top,rows).data;
       for(let i=0;i<original.data.length;i+=4) for(let c=0;c<3;c++) {
-        original.data[i+c] += strength*(enhanced[i+c]-original.data[i+c]);
+        original.data[i+c] = enhanced[i+c];
       }
     } else {
       const field = sample(correction, top, rows);
-      addRestorationDelta(original.data, field.data, strength);
+      addRestorationDelta(original.data,field.data);
     }
     ctx.putImageData(original, 0, top);
   }
 }
-restoreStrength.oninput = () => {
-  restoreValue.textContent = restoreStrength.value + ' %';
-  if (restoredBitmap) paintRestoration(restorePreview, Number(restoreStrength.value) / 100);
-};
+compareRestoration.onchange=()=>syncWorkspaceView();
+
+async function restoredPhotoBlob() {
+  const output=enlargedRestoration ? restoredBitmap : restoreOriginal;
+  const canvas=new OffscreenCanvas(output.width,output.height);
+  paintRestoration(canvas);
+  return canvas.convertToBlob({type:'image/png'});
+}
 const calibrationKey = 'agarsito-restoration-calibration-v1';
 function readCalibration() {
   try { return JSON.parse(localStorage.getItem(calibrationKey)) || {}; }
@@ -3135,7 +3136,7 @@ function saveCalibration(next) {
 }
 restoreButton.onclick = () => startRestoration(false);
 restoreCpu.onclick = () => startRestoration(true);
-async function showRestoration(data,photo,variant,strength) {
+async function showRestoration(data,photo,variant,showImproved=true) {
   restoreOriginal = await createImageBitmap(photo);
   restoredBitmap = await createImageBitmap(data.png);
   enlargedRestoration = !!data.super2;
@@ -3149,8 +3150,13 @@ async function showRestoration(data,photo,variant,strength) {
   const scale = editorPreviewScale(previewSource.width, previewSource.height);
   restorePreview.width = Math.max(1, Math.round(previewSource.width * scale));
   restorePreview.height = Math.max(1, Math.round(previewSource.height * scale));
-  restoreStrength.value = strength ?? (enlargedRestoration ? '100' : '50');
-  restoreStrength.oninput();
+  restoreBeforePreview.width=restorePreview.width;
+  restoreBeforePreview.height=restorePreview.height;
+  const original=restoreBeforePreview.getContext('2d');
+  original.imageSmoothingQuality='high';
+  original.drawImage(restoreOriginal,0,0,restoreBeforePreview.width,restoreBeforePreview.height);
+  compareRestoration.checked=showImproved;
+  paintRestoration(restorePreview);
   restoreResult.hidden = false;
   const {png,reference,width,height,super2,nativeFocus}=data;
   restoreDraftData={data:{png,reference,width,height,super2,nativeFocus},photo,variant};
@@ -3248,14 +3254,7 @@ async function finishRestoration(continueEditing) {
   if(!restoreFile || restoreSave.disabled) return;
   busy(true);
   try{
-    const strength=Number(restoreStrength.value)/100;
-    let blob=restoreFile;
-    if(strength){
-      const output = enlargedRestoration ? restoredBitmap : restoreOriginal;
-      const canvas=new OffscreenCanvas(output.width,output.height);
-      paintRestoration(canvas,strength);
-      blob=await canvas.convertToBlob({type:'image/png'});
-    }
+    const blob=await restoredPhotoBlob();
     if(continueEditing) setWorkingPhoto(blob,'Foto restaurada',true);
     else downloadEdit(blob,blob.name || (enlargedRestoration ? 'foto-superresolucion-x2.png' : 'foto-mejorada.png'));
   }catch(error){restoreStatus.textContent='No se pudo guardar el resultado. '+error.message;}
@@ -3429,7 +3428,7 @@ function busy(value) {
   completeFrame.disabled = value;
   if (value) frameX.disabled = frameY.disabled = true;
   else if (frameImage) showFramePreview();
-  restoreStrength.disabled = value;
+  compareRestoration.disabled = value;
   colorSliders.forEach(slider=>{slider.disabled=value;});
   compareColor.disabled = value;
   diagnoseButton.disabled = value;
@@ -3728,7 +3727,7 @@ const oldPreviews = editor.querySelector('.previews');
 const cutoutView = after.closest('figure');
 const originalView = before.closest('figure');
 const compositeView = composite.closest('figure');
-const workspaceViews = [originalView,cutoutView,compositeView,meshView,framePreview,restorePreview,colorOriginal,colorPreview];
+const workspaceViews = [originalView,cutoutView,compositeView,meshView,framePreview,restorePreview,restoreBeforePreview,colorOriginal,colorPreview];
 for (const view of workspaceViews) {
   view.classList.add('stage-view');
   stage.append(view);
@@ -3815,7 +3814,7 @@ function syncWorkspaceView() {
     cut:cutoutBlob ? cutoutView : base,
     background:!compositeView.hidden ? compositeView : cutoutBlob ? cutoutView : base,
     color:colorBitmap ? (colorEnabled() ? colorPreview : colorOriginal) : base,
-    restore:!restoreResult.hidden ? restorePreview : base,
+    restore:!restoreResult.hidden ? (compareRestoration.checked ? restorePreview : restoreBeforePreview) : base,
     mesh:!meshView.hidden ? meshView : !compositeView.hidden && composedResult ? compositeView : cutoutBlob ? cutoutView : base,
     diagnostic:base
   }[workspaceTab];
@@ -3894,7 +3893,7 @@ function latestWork() {
     previousCutout,composedResult,compositeBlob,meshResult,standaloneEdge,
     frame:frameImage ? {source:frameSources.indexOf(frameImage),values:frameControls.map(control=>control.value),fill:frameFill?.image} : undefined,
     colors:colorSliders.map(slider=>slider.value),showColor:compareColor.checked,
-    restoration:restoreDraftData ? {...restoreDraftData,strength:restoreStrength.value} : undefined,
+    restoration:restoreDraftData ? {...restoreDraftData,showImproved:compareRestoration.checked} : undefined,
     catalogBackground:catalogBackground.value,catalogMesh:catalogMesh.value,background:background.files[0] || draftBackground,
     strokes,marking,eraseStrokes,eraseMode
   };
@@ -3973,9 +3972,9 @@ async function recoverWork(draft) {
         }
       }
       if (draft.restoration) {
-        const {data,photo,variant,strength}=draft.restoration;
+        const {data,photo,variant,showImproved}=draft.restoration;
         restoreMode.value=variant;
-        await showRestoration(data,photo,variant,strength);
+        await showRestoration(data,photo,variant,showImproved);
       }
     }
     await refreshColorSource();
@@ -4019,12 +4018,7 @@ async function workspaceOutput() {
     return savedCutoutActive ? {photo,cutout:photo,cutoutActive:true} : {photo};
   }
   if (workspaceTab === 'restore' && restoredBitmap) {
-    const strength = Number(restoreStrength.value)/100;
-    if (!strength) return {photo:workingPhoto,cutout:cutoutBlob,cutoutActive:savedCutoutActive};
-    const output = enlargedRestoration ? restoredBitmap : restoreOriginal;
-    const canvas = new OffscreenCanvas(output.width,output.height);
-    paintRestoration(canvas,strength);
-    const photo = await canvas.convertToBlob({type:'image/png'});
+    const photo=await restoredPhotoBlob();
     return savedCutoutActive ? {photo,cutout:photo,cutoutActive:true} : {photo};
   }
   if (workspaceTab === 'mesh' && meshResult) return {photo:meshResult};
