@@ -763,17 +763,189 @@ function isRestorationMemoryError(error) {
 }
 
 let paused = false;
-let resumeProcessing;
+const resumeProcessing=new Set();
 async function waitForRestorationResume() {
   while (paused) {
-    await new Promise(resolve => { resumeProcessing = resolve; });
+    await new Promise(resolve => resumeProcessing.add(resolve));
   }
 }
+function restorationSource(image) {
+  const canvas=new OffscreenCanvas(1,1);
+  const ctx=canvas.getContext('2d',{willReadFrequently:true});
+  return {getImageData(x,y,w,h) {
+    canvas.width=w;
+    canvas.height=h;
+    ctx.drawImage(image,x,y,w,h,0,0,w,h);
+    return ctx.getImageData(0,0,w,h);
+  }};
+}
+
+const pngCrcTable=Uint32Array.from({length:256},(_,i)=>{
+  for(let bit=0;bit<8;bit++) i=(i>>>1)^((i&1) ? 0xedb88320 : 0);
+  return i;
+});
+
+function pngChunk(type,bytes) {
+  const chunk=new Uint8Array(bytes.length+12);
+  const view=new DataView(chunk.buffer);
+  view.setUint32(0,bytes.length);
+  for(let i=0;i<4;i++) chunk[4+i]=type.charCodeAt(i);
+  chunk.set(bytes,8);
+  let crc=0xffffffff;
+  for(let i=4;i<chunk.length-4;i++) crc=pngCrcTable[(crc^chunk[i])&255]^(crc>>>8);
+  view.setUint32(chunk.length-4,crc^0xffffffff);
+  return chunk;
+}
+
+function createBandPng(width,height) {
+  if (typeof CompressionStream==='undefined' || typeof DecompressionStream==='undefined') {
+    throw Error('Este navegador no puede guardar ampliaciones grandes por bandas. Actualizá el navegador.');
+  }
+  const header=new Uint8Array(13);
+  const view=new DataView(header.buffer);
+  view.setUint32(0,width);
+  view.setUint32(4,height);
+  header.set([8,6],8);
+  const parts=[Uint8Array.of(137,80,78,71,13,10,26,10),pngChunk('IHDR',header)];
+  const idat=[];
+  let offset=33, totalRows=0;
+  const stream=new CompressionStream('deflate');
+  const writer=stream.writable.getWriter();
+  const read=(async()=>{
+    const reader=stream.readable.getReader();
+    try {
+      while(true){
+        const {done,value}=await reader.read();
+        if(done) break;
+        idat.push([offset+8,value.length]);
+        const chunk=pngChunk('IDAT',value);
+        parts.push(chunk);
+        offset+=chunk.length;
+      }
+    } finally { reader.releaseLock(); }
+  })();
+  read.catch(()=>{});
+  return {
+    async write(pixels,rows) {
+      const stride=width*4;
+      if (pixels.length!==stride*rows || totalRows+rows>height) throw Error('Banda de imagen inválida.');
+      for(let row=0;row<rows;row+=8){
+        const count=Math.min(8,rows-row);
+        const filtered=new Uint8Array((stride+1)*count);
+        for(let i=0;i<count;i++){
+          const start=(row+i)*stride, dest=i*(stride+1);
+          filtered[dest]=1;
+          for(let j=0;j<stride;j++) filtered[dest+1+j]=pixels[start+j]-(j>=4 ? pixels[start+j-4] : 0);
+        }
+        await writer.write(filtered);
+      }
+      totalRows+=rows;
+    },
+    async finish() {
+      if(totalRows!==height) throw Error('Faltan filas de la ampliación.');
+      await writer.close();
+      await read;
+      parts.push(pngChunk('IEND',new Uint8Array()));
+      return {png:new Blob(parts,{type:'image/png'}),idat};
+    },
+    async abort() { await writer.abort().catch(()=>{}); await read.catch(()=>{}); }
+  };
+}
+
+function createRestorationBands(width,height,image) {
+  const ratio=Math.min(1,1600/Math.max(width,height),Math.sqrt(1600000/(width*height)));
+  const preview=new OffscreenCanvas(Math.max(1,Math.round(width*ratio)),Math.max(1,Math.round(height*ratio))).getContext('2d');
+  preview.imageSmoothingQuality='high';
+  const canvas=new OffscreenCanvas(width,1);
+  const ctx=canvas.getContext('2d',{willReadFrequently:true});
+  const encoder=createBandPng(width,height);
+  let top=0,rows=0;
+  return {
+    begin(y,count) { top=y; rows=count; canvas.height=count; ctx.imageSmoothingQuality='high'; },
+    drawBase(image) { ctx.drawImage(image,0,-top,width,height); },
+    createImageData:(w,h)=>ctx.createImageData(w,h),
+    putImageData:(pixels,x,y)=>ctx.putImageData(pixels,x,y-top),
+    getImageData:(x,y,w,h)=>ctx.getImageData(x,y-top,w,h),
+    async flush() {
+      const y0=Math.round(top*preview.canvas.height/height);
+      const y1=Math.round((top+rows)*preview.canvas.height/height);
+      if(y1>y0) preview.drawImage(canvas,0,y0,preview.canvas.width,y1-y0);
+      await encoder.write(ctx.getImageData(0,0,width,rows).data,rows);
+    },
+    async finish() {
+      const previewPng=await preview.canvas.convertToBlob({type:'image/png'});
+      preview.clearRect(0,0,preview.canvas.width,preview.canvas.height);
+      preview.drawImage(image,0,0,preview.canvas.width,preview.canvas.height);
+      const beforePng=await preview.canvas.convertToBlob({type:'image/png'});
+      return {...await encoder.finish(),previewPng,beforePng};
+    },
+    abort:()=>encoder.abort()
+  };
+}
+
+async function exportRestorationBands({photo,png,idat,width,height,strength}) {
+  const image=await createImageBitmap(photo);
+  const output=createBandPng(width,height);
+  const compressed=new Blob(idat.map(([offset,length])=>png.slice(offset,offset+length)));
+  const reader=compressed.stream().pipeThrough(new DecompressionStream('deflate')).getReader();
+  const canvas=new OffscreenCanvas(width,1);
+  const ctx=canvas.getContext('2d',{willReadFrequently:true});
+  let current=new Uint8Array(), consumed=0, succeeded=false;
+  const stride=width*4;
+  const row=new Uint8Array(stride+1);
+  try {
+    for(let top=0;top<height;top+=48){
+      const rows=Math.min(48,height-top);
+      canvas.height=rows;
+      ctx.imageSmoothingQuality='high';
+      ctx.drawImage(image,0,-top,width,height);
+      const pixels=ctx.getImageData(0,0,width,rows).data;
+      for(let y=0;y<rows;y++){
+        for(let filled=0;filled<row.length;){
+          if(consumed===current.length){
+            const {done,value}=await reader.read();
+            if(done) throw Error('PNG de ampliación incompleto.');
+            current=value;
+            consumed=0;
+          }
+          const count=Math.min(row.length-filled,current.length-consumed);
+          row.set(current.subarray(consumed,consumed+count),filled);
+          filled+=count;
+          consumed+=count;
+        }
+        if(row[0]!==1) throw Error('Formato de banda inesperado.');
+        for(let x=0;x<stride;x++){
+          const enhanced=row[x+1]=(row[x+1]+(x>=4 ? row[x-3] : 0))&255;
+          const index=y*stride+x;
+          if((x&3)!==3) pixels[index]+=strength*(enhanced-pixels[index]);
+        }
+      }
+      await output.write(pixels,rows);
+    }
+    const {png:result}=await output.finish();
+    succeeded=true;
+    return result;
+  } finally {
+    image.close();
+    await reader.cancel().catch(()=>{});
+    if(!succeeded) await output.abort();
+  }
+}
+
+function tileProbe(x,y,w,h) {
+  const ctx=new OffscreenCanvas(w*2,h*2).getContext('2d',{willReadFrequently:true});
+  return {
+    createImageData:(width,height)=>ctx.createImageData(width,height),
+    putImageData:(pixels,px,py)=>ctx.putImageData(pixels,px-x*2,py-y*2),
+    getImageData:(px,py,width,height)=>ctx.getImageData(px-x*2,py-y*2,width,height)
+  };
+}
+
 function fsrcnnLuma(r,g,b) {
   return 0.299*r+0.587*g+0.114*b;
 }
 
-async function runFsrcnn(image,adapter,modelUrl,started) {
+async function runFsrcnn(image,adapter,modelUrl,started,large) {
   const {width,height}=image;
   const backend=adapter ? 'webgpu' : 'wasm';
   const route='FSRCNN ×2 · '+(adapter ? 'WebGPU' : 'CPU/WASM');
@@ -791,18 +963,26 @@ async function runFsrcnn(image,adapter,modelUrl,started) {
   const halo=6;
   const limit=adapter ? Math.min(adapter.limits.maxStorageBufferBindingSize,adapter.limits.maxBufferSize) : Infinity;
   const core=[192,128,96,64,32].find(side=>(side+2*halo)**2*56*4<=limit);
-  let completed=0;
+  let completed=0,bands;
   try {
     if (!core) throw Error('La GPU no admite el tamaño mínimo de FSRCNN.');
-    const source=new OffscreenCanvas(width,height).getContext('2d',{willReadFrequently:true});
-    const result=new OffscreenCanvas(width*2,height*2).getContext('2d',{willReadFrequently:true});
-    source.drawImage(image,0,0);
-    result.imageSmoothingQuality='high';
-    result.drawImage(image,0,0,width*2,height*2);
+    if (large) bands=createRestorationBands(width*2,height*2,image);
+    const source=bands ? restorationSource(image) : new OffscreenCanvas(width,height).getContext('2d',{willReadFrequently:true});
+    const result=bands || new OffscreenCanvas(width*2,height*2).getContext('2d',{willReadFrequently:true});
+    if (!bands) {
+      source.drawImage(image,0,0);
+      result.imageSmoothingQuality='high';
+      result.drawImage(image,0,0,width*2,height*2);
+    }
     for (let y=0;y<height;y+=core) {
+      const ch=Math.min(core,height-y);
+      if (bands) {
+        bands.begin(y*2,ch*2);
+        bands.drawBase(image);
+      }
       for (let x=0;x<width;x+=core) {
         await waitForRestorationResume();
-        const cw=Math.min(core,width-x), ch=Math.min(core,height-y);
+        const cw=Math.min(core,width-x);
         const left=Math.max(0,x-halo), top=Math.max(0,y-halo);
         const w=Math.min(width,x+cw+halo)-left, h=Math.min(height,y+ch+halo)-top;
         const rgba=source.getImageData(left,top,w,h).data;
@@ -842,22 +1022,29 @@ async function runFsrcnn(image,adapter,modelUrl,started) {
         self.postMessage({progress:Math.round(100*completed/(width*height)),backend,route,core});
         await new Promise(resolve=>setTimeout(resolve,0));
       }
+      if (bands) await bands.flush();
     }
-    const png=await result.canvas.convertToBlob({type:'image/png'});
-    self.postMessage({png,super2:true,route,width,height,processingMs:Math.round(performance.now()-started)});
+    const output=bands ? await bands.finish() : {png:await result.canvas.convertToBlob({type:'image/png'})};
+    self.postMessage({...output,super2:true,route,width,height,processingMs:Math.round(performance.now()-started)});
   } finally {
+    await bands?.abort();
     await session.release();
   }
 }
 
 self.onmessage = async ({data}) => {
   if (data.hybridCpuTask) return runHybridCpu(data);
+  if (data.bandExport) {
+    try { self.postMessage({png:await exportRestorationBands(data.bandExport)}); }
+    catch (error) { self.postMessage({error:error.message}); }
+    return;
+  }
   const {photo,variant,useCpu,probeMiB,diagnostic,control,hybrid,fsrcnnUrl,calibration = {}} = data;
   if (control) {
     paused = control === 'pause';
     if (!paused) {
-      resumeProcessing?.();
-      resumeProcessing = undefined;
+      for (const resume of resumeProcessing) resume();
+      resumeProcessing.clear();
     }
     return;
   }
@@ -876,10 +1063,9 @@ self.onmessage = async ({data}) => {
     const plan = restorationPlan(probeMiB, 4866418, bindingLimit);
     if (!diagnostic) image = await createImageBitmap(photo);
     if (image && (image.width * image.height > 16000000 || Math.max(image.width,image.height) > 8192)) throw Error('La foto supera el tamaño admitido.');
-    if ((super2 || fsrcnn) && (image.width*image.height > 4000000 || Math.max(image.width,image.height) > 4096)) {
-      throw Error('Para ampliar ×2, la foto debe tener como máximo 4 megapíxeles y 4096 px por lado. Podés encuadrarla primero.');
-    }
-    if (fsrcnn) return await runFsrcnn(image,adapter,fsrcnnUrl,processingStarted);
+    const large=(super2 || fsrcnn) && (image.width*image.height>4000000 || Math.max(image.width,image.height)>4096);
+    if (large) self.postMessage({phase:'Ampliando por bloques a resolución original…'});
+    if (fsrcnn) return await runFsrcnn(image,adapter,fsrcnnUrl,processingStarted,large);
     const scale = (nativeFocus || super2) ? 1 : Math.min(1, (quick ? Math.min(1600, Math.floor(Math.sqrt(Math.min(bindingLimit / 4, (probeMiB || 24) * 1048576 * 0.7 / 12)))) : plan.maxSide) / (image ? Math.max(image.width, image.height) : 48));
     const width = Math.max(1, Math.round((image?.width || 48) * scale));
     const height = Math.max(1, Math.round((image?.height || 48) * scale));
@@ -894,11 +1080,13 @@ self.onmessage = async ({data}) => {
       tiles.push(32);
     }
     if (!diagnostic && !quick && !tiles.length) throw Error('El presupuesto estimado no alcanza para el bloque mínimo de Real-ESRGAN en GPU.');
-    const source = new OffscreenCanvas(width,height).getContext('2d',{willReadFrequently:true});
-    source.imageSmoothingQuality = 'high';
-    if (image) source.drawImage(image,0,0,width,height);
-    image?.close();
-    image = undefined;
+    const source = large ? restorationSource(image) : new OffscreenCanvas(width,height).getContext('2d',{willReadFrequently:true});
+    if (!large) {
+      source.imageSmoothingQuality='high';
+      if (image) source.drawImage(image,0,0,width,height);
+      image?.close();
+      image=undefined;
+    }
     if (nativeFocus) {
       const start = performance.now();
       const png = await (useCpu ? cpuDetail(source,width,height,true) : gpuDetail(adapter,source,width,height,true,plan.budget));
@@ -991,9 +1179,9 @@ self.onmessage = async ({data}) => {
       const area = Math.min(width,core+2*halo)*Math.min(height,core+2*halo);
       const limit = Math.min(bindingLimit,ort.env.webgpu.device.limits.maxStorageBufferBindingSize,ort.env.webgpu.device.limits.maxBufferSize);
       const keepOnGpu = width*height*16 <= limit && 4866418 + area*960 + width*height*36 <= plan.budget;
-      const outputByTile = combine || (super2 && !keepOnGpu);
+      const outputByTile = large || combine || (super2 && !keepOnGpu);
       const coreArea = Math.min(width,core)*Math.min(height,core);
-      const uploadByTile = outputByTile && (width*height*4 > limit ||
+      const uploadByTile = outputByTile && (large || width*height*4 > limit ||
         4866418 + area*960 + width*height*4 + coreArea*32 > plan.budget);
       const pixels = await createRestorationGpu(ort,source,width,height,outputByTile ? core : 0,area,uploadByTile);
       return {pixels,uploadByTile};
@@ -1010,7 +1198,7 @@ self.onmessage = async ({data}) => {
       }
     }
 
-    async function selectSuperresolutionTiles(ort, result) {
+    async function selectSuperresolutionTiles(ort) {
       const session = await createRestorationSession(ort);
       const device = ort.env.webgpu.device;
       const limit = Math.min(bindingLimit,device.limits.maxStorageBufferBindingSize,device.limits.maxBufferSize);
@@ -1025,14 +1213,15 @@ self.onmessage = async ({data}) => {
           const x = Math.max(0,Math.floor((width-core)/2));
           const y = Math.max(0,Math.floor((height-core)/2));
           const {cw,ch,args} = blockAt(core,x,y);
+          const probe=tileProbe(x,y,cw,ch);
           let pixels;
           try {
             const rate = await withGpuMemoryScope(device,async () => {
               ({pixels} = await prepareGpuPixels(ort,core));
-              await pixels.tile(session,...args,result);
+              await pixels.tile(session,...args,probe);
               await waitForRestorationResume();
               const start = performance.now();
-              await pixels.tile(session,...args,result);
+              await pixels.tile(session,...args,probe);
               return cw*ch/Math.max(1,performance.now()-start);
             });
             measured.push({core,rate});
@@ -1057,15 +1246,9 @@ self.onmessage = async ({data}) => {
     ort.env.wasm.wasmPaths = runtime;
     ort.env.wasm.numThreads = 1;
     if (adapter) ort.env.webgpu.adapter = adapter;
-    const result = new OffscreenCanvas(width*2,height*2).getContext('2d');
-    result.imageSmoothingQuality = 'high';
-
-    async function processHybrid(core, gpuPixels, session, timing) {
-      const queue = [];
-      for (let y=0;y<height;y+=core) {
-        for (let x=0;x<width;x+=core) queue.push(blockAt(core,x,y));
-      }
-      let next = 0, completed = 0, retry, stopped = false;
+    async function processHybrid(core, gpuPixels, session, timing, result, bands) {
+      const queue=[];
+      let next=0, completed=0, retry, stopped=false;
       let cpu, cpuNote = '';
       const hybridRoute = () => timing.cpuBlocks ? route + ' + CPU/WASM' : route;
       function report(block, backendName) {
@@ -1084,7 +1267,7 @@ self.onmessage = async ({data}) => {
         return new ImageData(data,block.cw*2,block.ch*2);
       }
       try {
-        if (queue.length > 1) {
+        if (width>core || height>core) {
           try {
             await waitForRestorationResume();
             self.postMessage({phase:'Comprobando que CPU y GPU produzcan el mismo detalle…'});
@@ -1096,12 +1279,13 @@ self.onmessage = async ({data}) => {
             const y = Math.max(0,Math.floor((height-core)/2));
             const sample = blockAt(core,x,y);
             if (calibration[tileKey]?.compatible !== true || calibration[tileKey]?.core !== core || calibrationChanged) {
+              const probe=tileProbe(x,y,sample.cw,sample.ch);
               const [,reference] = await Promise.all([
-                gpuPixels.tile(session,...sample.args,result),
+                gpuPixels.tile(session,...sample.args,probe),
                 cpuTile(sample).catch(error => ({error}))
               ]);
               if (reference.error) throw reference.error;
-              const actual = result.getImageData(x*2,y*2,sample.cw*2,sample.ch*2).data;
+              const actual = probe.getImageData(x*2,y*2,sample.cw*2,sample.ch*2).data;
               const expected = [], visible = [];
               for (let i=0;i<actual.length;i+=4) {
                 if (reference.data[i+3] !== 255) continue;
@@ -1151,21 +1335,33 @@ self.onmessage = async ({data}) => {
               report(block,'cpuBlocks');
             } catch (error) {
               retry = block;
+              cpu?.close();
+              cpu=undefined;
               cpuNote = error.message;
               self.postMessage({phase:'La CPU se detuvo. La GPU terminará el bloque pendiente. ' + cpuNote});
               return;
             }
           }
         }
-        const outcomes = await Promise.allSettled([runGpuQueue(),runCpuQueue()]);
-        for (const outcome of outcomes) {
-          if (outcome.status === 'rejected') throw outcome.reason;
-        }
-        if (retry) {
-          await waitForRestorationResume();
-          const tileTiming = await gpuPixels.tile(session,...retry.args,result);
-          for (const key of ['uploadMs','runMs','finishMs']) timing[key] += tileTiming[key];
-          report(retry,'gpuBlocks');
+        const bandHeight=bands ? core : height;
+        for(let top=0;top<height;top+=bandHeight){
+          queue.length=0;
+          next=0;
+          const end=Math.min(height,top+bandHeight);
+          for(let y=top;y<end;y+=core) for(let x=0;x<width;x+=core) queue.push(blockAt(core,x,y));
+          if(bands) bands.begin(top*2,(end-top)*2);
+          const outcomes = await Promise.allSettled([runGpuQueue(),runCpuQueue()]);
+          for (const outcome of outcomes) {
+            if (outcome.status === 'rejected') throw outcome.reason;
+          }
+          if (retry) {
+            await waitForRestorationResume();
+            const tileTiming = await gpuPixels.tile(session,...retry.args,result);
+            for (const key of ['uploadMs','runMs','finishMs']) timing[key] += tileTiming[key];
+            report(retry,'gpuBlocks');
+          }
+          retry=undefined;
+          if(bands) await bands.flush();
         }
         if (completed !== width*height) throw Error('Quedaron bloques de ampliación pendientes.');
         return cpuNote;
@@ -1177,21 +1373,27 @@ self.onmessage = async ({data}) => {
     async function infer(core) {
       self.postMessage({progress:0,backend,route,core,budget:plan.budget/1048576});
       const session = await createRestorationSession(ort);
-      let firstTileMs, gpuPixels, uploadByTile;
+      let firstTileMs, gpuPixels, uploadByTile, bands;
       const timing = {blocks:0,gpuBlocks:0,cpuBlocks:0,uploadMs:0,runMs:0,finishMs:0,pngMs:0,restMs:0};
       let nextRest = performance.now() + 500;
       const device = !useCpu && (super2 || combine) ? ort.env.webgpu.device : null;
       try {
         return await withGpuMemoryScope(device,async () => {
+          if (large) bands=createRestorationBands(width*2,height*2,image);
+          const result=bands || new OffscreenCanvas(width*2,height*2).getContext('2d');
+          const finish=()=>bands ? bands.finish() : gpuPixels
+            ? gpuPixels.png(result).then(png=>({png}))
+            : result.canvas.convertToBlob({type:'image/png'}).then(png=>({png}));
           if (!useCpu) ({pixels:gpuPixels,uploadByTile} = await prepareGpuPixels(ort,core));
           if (combine) {
-            const cpuNote = await processHybrid(core,gpuPixels,session,timing);
-            const pngStart = performance.now();
-            const png = await gpuPixels.png(result);
-            timing.pngMs = performance.now() - pngStart;
-            return {png,timing,uploadByTile,cpuNote};
+            const cpuNote=await processHybrid(core,gpuPixels,session,timing,result,bands);
+            const pngStart=performance.now();
+            const output=await finish();
+            timing.pngMs=performance.now()-pngStart;
+            return {...output,timing,uploadByTile,cpuNote};
           }
           for (let y=0;y<height;y+=core) {
+            if(bands) bands.begin(y*2,Math.min(core,height-y)*2);
             for (let x=0;x<width;x+=core) {
               if (super2) await waitForRestorationResume();
               const {cw:coreWidth,ch:coreHeight,args} = blockAt(core,x,y);
@@ -1217,14 +1419,16 @@ self.onmessage = async ({data}) => {
               result.putImageData(pixels,x*2,y*2);
               self.postMessage({progress:Math.round(100*(y*width+coreHeight*(x+coreWidth))/(width*height)),backend,route,core,budget:plan.budget/1048576});
             }
+            if(bands) await bands.flush();
           }
-          const pngStart = performance.now();
-          const png = await (gpuPixels ? gpuPixels.png(result) : result.canvas.convertToBlob({type:'image/png'}));
-          timing.pngMs = performance.now() - pngStart;
-          return {png, firstTileMs, timing, uploadByTile};
+          const pngStart=performance.now();
+          const output=await finish();
+          timing.pngMs=performance.now()-pngStart;
+          return {...output,firstTileMs,timing,uploadByTile};
         });
       } finally {
         gpuPixels?.release();
+        await bands?.abort();
         await session.release();
       }
     }
@@ -1235,11 +1439,11 @@ self.onmessage = async ({data}) => {
       Math.min(width,preferredCore+2*halo)*Math.min(height,preferredCore+2*halo)*256 <= bindingLimit;
     const selectedTiles = !autotune ? tiles : canReuseCore
       ? [preferredCore,...tiles.filter(core => core < preferredCore)]
-      : await selectSuperresolutionTiles(ort,result);
+      : await selectSuperresolutionTiles(ort);
     for (const [index, core] of selectedTiles.entries()) {
       try {
-        const {png, firstTileMs, timing, uploadByTile, cpuNote} = await infer(core);
-        self.postMessage({png,reference:await reference?.canvas.convertToBlob({type:'image/png'}),super2,hybrid:combine,cpuNote,route,width,height,core,firstTileMs,timing,uploadByTile,cpuThreads:navigator.hardwareConcurrency,processingMs:Math.round(performance.now()-processingStarted),
+        const {png,previewPng,beforePng,idat,firstTileMs,timing,uploadByTile,cpuNote}=await infer(core);
+        self.postMessage({png,previewPng,beforePng,idat,reference:await reference?.canvas.convertToBlob({type:'image/png'}),super2,hybrid:combine,cpuNote,route,width,height,core,firstTileMs,timing,uploadByTile,cpuThreads:navigator.hardwareConcurrency,processingMs:Math.round(performance.now()-processingStarted),
           calibrated:useCpu ? undefined : {...(autotune ? {[tileKey]:{core,compatible:combine && timing.cpuBlocks>0 && !cpuNote}} : {}),[layoutKey]:verifiedLayout}});
         return;
       } catch (error) {
@@ -3136,9 +3340,32 @@ function updateRestorationStrength() {
 restoreStrength.oninput=updateRestorationStrength;
 compareRestoration.onchange=()=>syncWorkspaceView();
 
+async function renderBandExport(bandExport) {
+  const url=URL.createObjectURL(new Blob([modelWorkerCode('restore-worker')],{type:'text/javascript'}));
+  let worker, timeout;
+  try {
+    worker=new Worker(url,{type:'module'});
+    return await new Promise((resolve,reject)=>{
+      worker.onmessage=({data})=>data.png ? resolve(data.png) : reject(Error(data.error));
+      worker.onerror=()=>reject(Error('El navegador interrumpió la exportación.'));
+      timeout=setTimeout(()=>reject(Error('La exportación superó el tiempo límite.')),180000);
+      worker.postMessage({bandExport});
+    });
+  } finally {
+    clearTimeout(timeout);
+    worker?.terminate();
+    URL.revokeObjectURL(url);
+  }
+}
+
 async function restoredPhotoBlob() {
   const strength=Number(restoreStrength.value)/100;
   if (!strength) return restoreFile;
+  const {data}=restoreDraftData;
+  if (data.idat) {
+    if(strength===1) return data.png;
+    return renderBandExport({photo:restoreFile,png:data.png,idat:data.idat,width:data.width*2,height:data.height*2,strength});
+  }
   const output=enlargedRestoration ? restoredBitmap : restoreOriginal;
   const canvas=new OffscreenCanvas(output.width,output.height);
   paintRestoration(canvas,strength);
@@ -3156,8 +3383,8 @@ function saveCalibration(next) {
 restoreButton.onclick = () => startRestoration(false);
 restoreCpu.onclick = () => startRestoration(true);
 async function showRestoration(data,photo,variant,showImproved=true,strength=100) {
-  restoreOriginal = await createImageBitmap(photo);
-  restoredBitmap = await createImageBitmap(data.png);
+  restoreOriginal = await createImageBitmap(data.beforePng || photo);
+  restoredBitmap = await createImageBitmap(data.previewPng || data.png);
   enlargedRestoration = !!data.super2;
   nativeRestoration = !!data.nativeFocus || enlargedRestoration;
   if (!nativeRestoration) {
@@ -3178,8 +3405,8 @@ async function showRestoration(data,photo,variant,showImproved=true,strength=100
   restoreStrength.value=strength;
   updateRestorationStrength();
   restoreResult.hidden = false;
-  const {png,reference,width,height,super2,nativeFocus}=data;
-  restoreDraftData={data:{png,reference,width,height,super2,nativeFocus},photo,variant};
+  const {png,previewPng,beforePng,idat,reference,width,height,super2,nativeFocus}=data;
+  restoreDraftData={data:{png,previewPng,beforePng,idat,reference,width,height,super2,nativeFocus},photo,variant};
 }
 function startRestoration(useCpu, fallbackMessage = '') {
   if (restoreButton.disabled) return;
@@ -3229,7 +3456,7 @@ function startRestoration(useCpu, fallbackMessage = '') {
     try {
       if (!data.png) throw Error(data.error);
       await showRestoration(data,photo,variant);
-      restoreStatus.textContent = enlargedRestoration ? 'Superresolución IA ×2 · salida: ' + restoredBitmap.width + ' × ' + restoredBitmap.height + ' px · ' + data.route + ' · ' + (data.processingMs / 1000).toFixed(1) + ' s de procesamiento. ' + (data.timing ? data.timing.blocks + ' bloques de ' + data.core + ' px · entrada GPU: ' + (data.uploadByTile ? 'por bloques' : 'foto completa') + ' · hilos lógicos informados: ' + (data.cpuThreads ?? 'sin dato') + ' · preparación y envío: ' + Math.round(data.timing.uploadMs) + ' ms · llamada al modelo: ' + Math.round(data.timing.runMs) + ' ms · composición y sincronización: ' + Math.round(data.timing.finishMs) + ' ms · PNG: ' + Math.round(data.timing.pngMs) + ' ms · descansos: ' + Math.round(data.timing.restMs) + ' ms.' : '') : data.duration !== undefined ? 'Nitidez en ' + data.route + ' · ' + data.duration + ' ms · entrada: ' + data.width + ' × ' + data.height + ' px.' : 'Modelo ejecutado en ' + data.route + ' · primer bloque: ' + data.firstTileMs + ' ms · bloque: ' + data.core + ' px · entrada de IA: ' + data.width + ' × ' + data.height + ' px.';
+      restoreStatus.textContent = enlargedRestoration ? 'Superresolución IA ×2 · salida: ' + (data.idat ? data.width*2 : restoredBitmap.width) + ' × ' + (data.idat ? data.height*2 : restoredBitmap.height) + ' px · ' + data.route + ' · ' + (data.processingMs / 1000).toFixed(1) + ' s de procesamiento. ' + (data.timing ? data.timing.blocks + ' bloques de ' + data.core + ' px · entrada GPU: ' + (data.uploadByTile ? 'por bloques' : 'foto completa') + ' · hilos lógicos informados: ' + (data.cpuThreads ?? 'sin dato') + ' · preparación y envío: ' + Math.round(data.timing.uploadMs) + ' ms · llamada al modelo: ' + Math.round(data.timing.runMs) + ' ms · composición y sincronización: ' + Math.round(data.timing.finishMs) + ' ms · PNG: ' + Math.round(data.timing.pngMs) + ' ms · descansos: ' + Math.round(data.timing.restMs) + ' ms.' : '') : data.duration !== undefined ? 'Nitidez en ' + data.route + ' · ' + data.duration + ' ms · entrada: ' + data.width + ' × ' + data.height + ' px.' : 'Modelo ejecutado en ' + data.route + ' · primer bloque: ' + data.firstTileMs + ' ms · bloque: ' + data.core + ' px · entrada de IA: ' + data.width + ' × ' + data.height + ' px.';
       if (data.hybrid) {
         if (!enlargedRestoration) restoreStatus.textContent = 'Restauración · ' + (data.processingMs/1000).toFixed(1) + ' s · bloques de ' + data.core + ' px.';
         restoreStatus.textContent += ' Reparto · GPU: ' + data.timing.gpuBlocks + ' · CPU: ' + data.timing.cpuBlocks + '.' +
