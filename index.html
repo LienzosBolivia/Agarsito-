@@ -98,6 +98,7 @@ input[type=range]:disabled{opacity:.45;cursor:default}
 </select>
 <button id="run-restore" disabled>Mejorar con GPU</button>
 <button id="run-restore-cpu" disabled>Prueba rápida en CPU</button>
+<label id="restore-hybrid-option"><input type="checkbox" id="restore-hybrid" style="display:inline;margin:.3rem"> Probar GPU + CPU (experimental)</label>
 <button id="pause-restore" type="button" hidden>Pausar ampliación</button>
 <p id="restore-status" role="status"></p>
 <button id="restore-diagnostic">Diagnosticar compatibilidad GPU</button>
@@ -567,6 +568,87 @@ async function diagnoseRestoration(ort, model, adapter, note) {
   }
 }
 
+async function restoreCpuBlock(ort, session, rgba, w, h, insetX, insetY, cw, ch) {
+  const plane = w*h;
+  const data = new Float32Array(3*plane);
+  for (let c=0;c<3;c++) for (let i=0;i<plane;i++) data[c*plane+i] = rgba[4*i+c]/255;
+  const input = new ort.Tensor('float32',data,[1,3,h,w]);
+  let outputs;
+  try {
+    outputs = await session.run({[session.inputNames[0]]:input});
+    const output = outputs[session.outputNames[0]];
+    const ow=w*4, oh=h*4, n=ow*oh;
+    const values = output.data;
+    if (output.dims.join(',') !== [1,3,oh,ow].join(',') || !values.every(Number.isFinite)) {
+      throw Error('Salida inesperada del modelo en CPU.');
+    }
+    const pixels = new ImageData(cw*2,ch*2);
+    for (let row=0;row<pixels.height;row++) {
+      const sy=insetY*4+row*2;
+      for (let col=0;col<pixels.width;col++) {
+        const sx=insetX*4+col*2;
+        const dst=(row*pixels.width+col)*4;
+        const src=sy*ow+sx;
+        for (let c=0;c<3;c++) {
+          const p=c*n+src;
+          pixels.data[dst+c]=(values[p]+values[p+1]+values[p+ow]+values[p+ow+1])*63.75;
+        }
+        pixels.data[dst+3]=rgba[(Math.floor(sy/4)*w+Math.floor(sx/4))*4+3];
+      }
+    }
+    if (hasOutputStripes(pixels) && !hasOutputStripes({width:w,height:h,data:rgba})) {
+      throw Error('Se detectaron franjas en el bloque CPU.');
+    }
+    return pixels;
+  } finally {
+    input.dispose();
+    for (const tensor of Object.values(outputs || {})) tensor.dispose();
+  }
+}
+
+let cpuRuntime, cpuSession;
+async function runHybridCpu({model,runtime,rgba,args}) {
+  try {
+    if (model) {
+      cpuRuntime = await import(runtime + 'ort.wasm.min.mjs');
+      cpuRuntime.env.wasm.wasmPaths = runtime;
+      cpuRuntime.env.wasm.numThreads = 1;
+      cpuSession = await cpuRuntime.InferenceSession.create(model,{executionProviders:['wasm']});
+      self.postMessage({ready:true});
+      return;
+    }
+    const [left,top,w,h,x,y,cw,ch] = args;
+    const pixels = await restoreCpuBlock(cpuRuntime,cpuSession,rgba,w,h,x-left,y-top,cw,ch);
+    self.postMessage({data:pixels.data},[pixels.data.buffer]);
+  } catch (error) {
+    self.postMessage({error:error.message});
+  }
+}
+
+function createHybridCpuWorker() {
+  const worker = new Worker(self.location.href,{type:'module'});
+  let pending;
+  worker.onmessage = ({data}) => pending?.(data);
+  worker.onerror = () => pending?.({error:'El navegador interrumpió el worker CPU.'});
+  worker.onmessageerror = () => pending?.({error:'No se pudo recibir la salida CPU.'});
+  return {
+    request(data,transfer = []) {
+      return new Promise((resolve,reject) => {
+        const timeout = setTimeout(() => pending?.({error:'La CPU superó el tiempo límite.'}),45000);
+        pending = response => {
+          clearTimeout(timeout);
+          pending = undefined;
+          if (response.error) reject(Error(response.error));
+          else resolve(response);
+        };
+        try { worker.postMessage({...data,hybridCpuTask:true},transfer); }
+        catch (error) { pending({error:error.message}); }
+      });
+    },
+    close() { worker.terminate(); }
+  };
+}
+
 function isRestorationMemoryError(error) {
   return /out.of.memory|allocation|buffer.*size|memoria insuficiente/i.test(error.message);
 }
@@ -578,7 +660,9 @@ async function waitForRestorationResume() {
     await new Promise(resolve => { resumeProcessing = resolve; });
   }
 }
-self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic, control}}) => {
+self.onmessage = async ({data}) => {
+  if (data.hybridCpuTask) return runHybridCpu(data);
+  const {photo,variant,useCpu,probeMiB,diagnostic,control,hybrid} = data;
   if (control) {
     paused = control === 'pause';
     if (!paused) {
@@ -712,7 +796,7 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic, co
       const area = Math.min(width,core+2*halo)*Math.min(height,core+2*halo);
       const limit = Math.min(bindingLimit,ort.env.webgpu.device.limits.maxStorageBufferBindingSize,ort.env.webgpu.device.limits.maxBufferSize);
       const keepOnGpu = width*height*16 <= limit && 4866418 + area*960 + width*height*36 <= plan.budget;
-      const outputByTile = super2 && !keepOnGpu;
+      const outputByTile = super2 && (hybrid || !keepOnGpu);
       const coreArea = Math.min(width,core)*Math.min(height,core);
       const uploadByTile = outputByTile && (width*height*4 > limit ||
         4866418 + area*960 + width*height*4 + coreArea*32 > plan.budget);
@@ -781,16 +865,135 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic, co
     const result = new OffscreenCanvas(width*2,height*2).getContext('2d');
     result.imageSmoothingQuality = 'high';
 
+    async function processHybrid(core, gpuPixels, session, timing) {
+      const queue = [];
+      for (let y=0;y<height;y+=core) {
+        for (let x=0;x<width;x+=core) queue.push(blockAt(core,x,y));
+      }
+      let next = 0, completed = 0, retry, stopped = false;
+      let cpu, cpuNote = '';
+      const hybridRoute = () => timing.cpuBlocks ? route + ' + CPU/WASM' : route;
+      function report(block, backendName) {
+        completed += block.cw*block.ch;
+        timing.blocks++;
+        timing[backendName]++;
+        self.postMessage({
+          progress:Math.round(100*completed/(width*height)),backend,route:hybridRoute(),core,
+          budget:plan.budget/1048576,gpuBlocks:timing.gpuBlocks,cpuBlocks:timing.cpuBlocks
+        });
+      }
+      async function cpuTile(block) {
+        const [left,top,w,h] = block.args;
+        const rgba = source.getImageData(left,top,w,h).data;
+        const {data} = await cpu.request({rgba,args:block.args},[rgba.buffer]);
+        return new ImageData(data,block.cw*2,block.ch*2);
+      }
+      try {
+        if (queue.length > 1) {
+          try {
+            await waitForRestorationResume();
+            self.postMessage({phase:'Comprobando que CPU y GPU produzcan el mismo detalle…'});
+            cpu = createHybridCpuWorker();
+            const modelCopy = model.slice();
+            await cpu.request({model:modelCopy,runtime},[modelCopy.buffer]);
+            await waitForRestorationResume();
+            const x = Math.max(0,Math.floor((width-core)/2));
+            const y = Math.max(0,Math.floor((height-core)/2));
+            const sample = blockAt(core,x,y);
+            const [,reference] = await Promise.all([
+              gpuPixels.tile(session,...sample.args,result),
+              cpuTile(sample).catch(error => ({error}))
+            ]);
+            if (reference.error) throw reference.error;
+            const actual = result.getImageData(x*2,y*2,sample.cw*2,sample.ch*2).data;
+            const expected = [], visible = [];
+            for (let i=0;i<actual.length;i+=4) {
+              if (reference.data[i+3] !== 255) continue;
+              for (let c=0;c<3;c++) {
+                expected.push(reference.data[i+c]);
+                visible.push(actual[i+c]);
+              }
+            }
+            if (!expected.length || !compareRestorationProbe(visible,expected).ok) {
+              throw Error('La zona de prueba no permitió confirmar la coincidencia entre CPU y GPU.');
+            }
+          } catch (error) {
+            cpu?.close();
+            cpu = undefined;
+            if (isRestorationMemoryError(error)) throw error;
+            cpuNote = error.message;
+            self.postMessage({phase:'Continuando con GPU. ' + cpuNote});
+          }
+        }
+        async function runGpuQueue() {
+          try {
+            while (true) {
+              await waitForRestorationResume();
+              const block = retry || queue[next++];
+              retry = undefined;
+              if (!block) return;
+              const tileTiming = await gpuPixels.tile(session,...block.args,result);
+              for (const key of ['uploadMs','runMs','finishMs']) timing[key] += tileTiming[key];
+              report(block,'gpuBlocks');
+            }
+          } catch (error) {
+            stopped = true;
+            throw error;
+          }
+        }
+        async function runCpuQueue() {
+          while (!stopped && cpu) {
+            await waitForRestorationResume();
+            if (stopped) return;
+            const block = queue[next++];
+            if (!block) return;
+            try {
+              const pixels = await cpuTile(block);
+              const [,,,,x,y] = block.args;
+              result.putImageData(pixels,x*2,y*2);
+              report(block,'cpuBlocks');
+            } catch (error) {
+              retry = block;
+              cpuNote = error.message;
+              self.postMessage({phase:'La CPU se detuvo. La GPU terminará el bloque pendiente. ' + cpuNote});
+              return;
+            }
+          }
+        }
+        const outcomes = await Promise.allSettled([runGpuQueue(),runCpuQueue()]);
+        for (const outcome of outcomes) {
+          if (outcome.status === 'rejected') throw outcome.reason;
+        }
+        if (retry) {
+          await waitForRestorationResume();
+          const tileTiming = await gpuPixels.tile(session,...retry.args,result);
+          for (const key of ['uploadMs','runMs','finishMs']) timing[key] += tileTiming[key];
+          report(retry,'gpuBlocks');
+        }
+        if (completed !== width*height) throw Error('Quedaron bloques de ampliación pendientes.');
+        return cpuNote;
+      } finally {
+        cpu?.close();
+      }
+    }
+
     async function infer(core) {
       self.postMessage({progress:0,backend,route,core,budget:plan.budget/1048576});
       const session = await createRestorationSession(ort);
       let firstTileMs, gpuPixels, uploadByTile;
-      const timing = {blocks:0, uploadMs:0, runMs:0, finishMs:0, pngMs:0, restMs:0};
+      const timing = {blocks:0,gpuBlocks:0,cpuBlocks:0,uploadMs:0,runMs:0,finishMs:0,pngMs:0,restMs:0};
       let nextRest = performance.now() + 500;
       const device = super2 ? ort.env.webgpu.device : null;
       try {
         return await withGpuMemoryScope(device,async () => {
           if (!useCpu) ({pixels:gpuPixels,uploadByTile} = await prepareGpuPixels(ort,core));
+          if (super2 && hybrid) {
+            const cpuNote = await processHybrid(core,gpuPixels,session,timing);
+            const pngStart = performance.now();
+            const png = await gpuPixels.png(result);
+            timing.pngMs = performance.now() - pngStart;
+            return {png,timing,uploadByTile,cpuNote};
+          }
           for (let y=0;y<height;y+=core) {
             for (let x=0;x<width;x+=core) {
               if (super2) await waitForRestorationResume();
@@ -811,43 +1014,11 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic, co
                 }
                 continue;
               }
-              const rgba=source.getImageData(left,top,w,h).data;
-              const plane=w*h, data=new Float32Array(3*plane);
-              for(let c=0;c<3;c++) for(let i=0;i<plane;i++) data[c*plane+i]=rgba[4*i+c]/255;
-              const input=new ort.Tensor('float32',data,[1,3,h,w]);
-              let outputs;
-              try {
-                const start = performance.now();
-                outputs=await session.run({[session.inputNames[0]]:input});
-                const output=outputs[session.outputNames[0]];
-                const ow=w*4, oh=h*4, n=ow*oh;
-                const values = output.location === 'cpu' ? output.data : await output.getData();
-                if(output.dims.join(',')!==[1,3,oh,ow].join(',') || !values.every(Number.isFinite)) throw Error('Salida inesperada del modelo.');
-                if (firstTileMs === undefined) {
-                  firstTileMs = Math.round(performance.now() - start);
-                  self.postMessage({phase: route + ' completó el bloque de prueba en ' + firstTileMs + ' ms. Continuando…'});
-                }
-                const pixels=result.createImageData(coreWidth*2,coreHeight*2);
-                for(let row=0;row<pixels.height;row++){
-                  const sy=(y-top)*4+row*2;
-                  for(let col=0;col<pixels.width;col++){
-                    const sx=(x-left)*4+col*2;
-                    const dst=(row*pixels.width+col)*4;
-                    const src=sy*ow+sx;
-                    for(let c=0;c<3;c++){
-                      const p=c*n+src;
-                      pixels.data[dst+c]=(values[p]+values[p+1]+values[p+ow]+values[p+ow+1])*63.75;
-                    }
-                    pixels.data[dst+3]=rgba[(Math.floor(sy/4)*w+Math.floor(sx/4))*4+3];
-                  }
-                }
-                if (hasOutputStripes(pixels) && !hasOutputStripes({width:w,height:h,data:rgba})) throw Error('Se detectaron franjas en la salida. El resultado fue descartado. Probá el mismo modelo con la opción CPU.');
-                result.putImageData(pixels,x*2,y*2);
-                self.postMessage({progress:Math.round(100*(y*width+coreHeight*(x+coreWidth))/(width*height)),backend,route,core,budget:plan.budget/1048576});
-              } finally {
-                input.dispose();
-                for(const tensor of Object.values(outputs || {})) tensor.dispose();
-              }
+              const rgba = source.getImageData(left,top,w,h).data;
+              const pixels = await restoreCpuBlock(ort,session,rgba,w,h,x-left,y-top,coreWidth,coreHeight);
+              if (firstTileMs === undefined) firstTileMs = Math.round(performance.now()-tileStart);
+              result.putImageData(pixels,x*2,y*2);
+              self.postMessage({progress:Math.round(100*(y*width+coreHeight*(x+coreWidth))/(width*height)),backend,route,core,budget:plan.budget/1048576});
             }
           }
           const pngStart = performance.now();
@@ -863,8 +1034,8 @@ self.onmessage = async ({data: {photo, variant, useCpu, probeMiB, diagnostic, co
     const selectedTiles = super2 ? await selectSuperresolutionTiles(ort,result) : tiles;
     for (const [index, core] of selectedTiles.entries()) {
       try {
-        const {png, firstTileMs, timing, uploadByTile} = await infer(core);
-        self.postMessage({png,reference:await reference?.canvas.convertToBlob({type:'image/png'}),super2,route,width,height,core,firstTileMs,timing,uploadByTile,cpuThreads:navigator.hardwareConcurrency,processingMs:Math.round(performance.now()-processingStarted)});
+        const {png, firstTileMs, timing, uploadByTile, cpuNote} = await infer(core);
+        self.postMessage({png,reference:await reference?.canvas.convertToBlob({type:'image/png'}),super2,hybrid,cpuNote,route,width,height,core,firstTileMs,timing,uploadByTile,cpuThreads:navigator.hardwareConcurrency,processingMs:Math.round(performance.now()-processingStarted)});
         return;
       } catch (error) {
         if (index === selectedTiles.length - 1 || !isRestorationMemoryError(error)) {
@@ -2364,6 +2535,14 @@ const restoreButton = document.querySelector('#run-restore');
 const pauseRestore = document.querySelector('#pause-restore');
 const restoreCpu = document.querySelector('#run-restore-cpu');
 const restoreMode = document.querySelector('#restore-mode');
+const restoreHybrid = document.querySelector('#restore-hybrid');
+const restoreHybridOption = document.querySelector('#restore-hybrid-option');
+function syncHybridOption() {
+  restoreHybridOption.hidden = restoreMode.value !== 'super2';
+  restoreHybrid.disabled = restoreButton.disabled;
+}
+restoreMode.addEventListener('change',syncHybridOption);
+syncHybridOption();
 const restoreStatus = document.querySelector('#restore-status');
 const restoreResult = document.querySelector('#restore-result');
 const restoreStrength = document.querySelector('#restore-strength');
@@ -2501,6 +2680,10 @@ function startRestoration(useCpu) {
       restoreStrength.oninput();
       restoreResult.hidden = false;
       restoreStatus.textContent = enlargedRestoration ? 'Superresolución IA ×2 · salida: ' + restoredBitmap.width + ' × ' + restoredBitmap.height + ' px · ' + data.route + ' · ' + (data.processingMs / 1000).toFixed(1) + ' s de procesamiento. ' + (data.timing ? data.timing.blocks + ' bloques de ' + data.core + ' px · entrada GPU: ' + (data.uploadByTile ? 'por bloques' : 'foto completa') + ' · hilos lógicos informados: ' + (data.cpuThreads ?? 'sin dato') + ' · preparación y envío: ' + Math.round(data.timing.uploadMs) + ' ms · llamada al modelo: ' + Math.round(data.timing.runMs) + ' ms · composición y sincronización: ' + Math.round(data.timing.finishMs) + ' ms · PNG: ' + Math.round(data.timing.pngMs) + ' ms · descansos: ' + Math.round(data.timing.restMs) + ' ms.' : '') : data.duration !== undefined ? 'Nitidez en ' + data.route + ' · ' + data.duration + ' ms · entrada: ' + data.width + ' × ' + data.height + ' px.' : 'Modelo ejecutado en ' + data.route + ' · primer bloque: ' + data.firstTileMs + ' ms · bloque: ' + data.core + ' px · entrada de IA: ' + data.width + ' × ' + data.height + ' px.';
+      if (data.hybrid) {
+        restoreStatus.textContent += ' Reparto · GPU: ' + data.timing.gpuBlocks + ' · CPU: ' + data.timing.cpuBlocks + '.' +
+          (data.cpuNote ? ' ' + data.cpuNote : '');
+      }
     } catch (error) {
       clearRestoration();
       restoreStatus.textContent = error.message;
@@ -2518,7 +2701,7 @@ function startRestoration(useCpu) {
       }
       if (data.phase) restoreStatus.textContent = data.phase;
       else if (data.progress === undefined) finish(data);
-      else restoreStatus.textContent = 'Procesando en ' + (data.route || (data.backend === 'webgpu' ? 'WebGPU' : 'CPU/WASM')) + (data.backend === 'webgpu' ? ' · presupuesto estimado: ' + data.budget.toFixed(1) + ' MiB de referencia' : '') + ' · bloque: ' + data.core + ' px · ' + data.progress + ' %';
+      else restoreStatus.textContent = 'Procesando en ' + (data.route || (data.backend === 'webgpu' ? 'WebGPU' : 'CPU/WASM')) + (data.backend === 'webgpu' ? ' · presupuesto estimado: ' + data.budget.toFixed(1) + ' MiB de referencia' : '') + ' · bloque: ' + data.core + ' px · ' + data.progress + ' %' + (data.gpuBlocks === undefined ? '' : ' · GPU: ' + data.gpuBlocks + ' · CPU: ' + data.cpuBlocks);
     };
     worker.onerror = () => finish({error: 'El navegador interrumpió la mejora.'});
     restartTimer();
@@ -2532,7 +2715,7 @@ function startRestoration(useCpu) {
       document.addEventListener('visibilitychange', syncPause);
       syncPause();
     }
-    worker.postMessage({photo, variant, useCpu, probeMiB: profile?.probeMiB});
+    worker.postMessage({photo, variant, useCpu, hybrid:variant === 'super2' && !useCpu && restoreHybrid.checked, probeMiB: profile?.probeMiB});
   } catch (error) { finish({error: error.message}); }
 };
 async function finishRestoration(continueEditing) {
@@ -2723,6 +2906,7 @@ function busy(value) {
   diagnoseButton.disabled = value;
   restoreButton.disabled = value || !workingPhoto;
   restoreCpu.disabled = restoreButton.disabled;
+  syncHybridOption();
   restoreSave.disabled = value;
   useRestored.disabled = value;
   useComposite.disabled = value;
