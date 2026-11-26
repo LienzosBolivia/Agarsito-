@@ -29,6 +29,51 @@ input[type=range]::-moz-range-track{height:9px;background:#c9d5ce;border-radius:
 input[type=range]::-moz-range-thumb{width:24px;height:24px;background:#244e3e;border:2px solid white;border-radius:50%}
 input[type=range]:disabled{opacity:.45;cursor:default}
 #compare-color{display:inline;width:23px;height:23px;margin:0 .4rem 0 0;vertical-align:middle;accent-color:#244e3e}
+body {margin:0;background:#edf0eb;color:#182521}
+main.agarsito-editor {width:min(1440px,100%);max-width:none;height:100dvh;margin:0 auto;padding:clamp(10px,2vw,24px);box-sizing:border-box;display:grid;grid-template-rows:auto minmax(0,1fr) auto;gap:12px}
+.agarsito-editor [hidden] {display:none!important}
+.editor-header,.editor-footer {display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.editor-header h1 {font-size:clamp(1.3rem,3vw,2.1rem);margin:0;letter-spacing:-.045em}
+.editor-header input[type=file] {margin:0;max-width:min(54vw,300px);font-size:.78rem}
+.editor-header input::file-selector-button {font:inherit;color:#1f4638;background:#fff;border:1px solid #c7d5cb;border-radius:8px;padding:.55rem .7rem}
+.editor-body {display:grid;grid-template-columns:minmax(0,1fr) clamp(270px,31vw,360px);gap:12px;min-height:0}
+.editor-stage {--stage-height:360px;min-width:0;min-height:0;overflow:hidden;display:grid;place-items:center;position:relative;border:1px solid #32403a;border-radius:16px;background:#202b27;color:#dbe5de}
+.editor-stage .stage-view:not(.is-active) {display:none!important}
+.editor-stage figure {margin:0;min-width:0;max-width:100%}
+.editor-stage figcaption {position:absolute;left:10px;bottom:10px;background:#16251ee8;color:#fff;padding:.25rem .55rem;font-size:.72rem;border-radius:6px;pointer-events:none;z-index:1}
+.editor-stage img,.editor-stage > canvas {display:block;width:auto!important;height:auto!important;max-width:100%;max-height:calc(var(--stage-height) - 2px)!important;object-fit:contain;margin:auto;background:repeating-conic-gradient(#b8c3bc 0 25%,#e9eeea 0 50%) 0 0/18px 18px}
+.editor-stage #cutout-stage,.editor-stage #composition-stage {width:max-content;max-width:100%;margin:auto}
+.editor-empty {padding:18px;text-align:center;font-size:.9rem}
+.editor-tools {border:1px solid #cddad0;border-radius:15px;background:#f8faf6;display:grid;grid-template-rows:auto minmax(0,1fr);min-height:0;min-width:0;overflow:hidden}
+.editor-tabs {display:flex;flex-wrap:wrap;gap:5px;padding:8px;border-bottom:1px solid #dce6de;scrollbar-width:thin}
+.editor-tabs button {white-space:nowrap;background:#e5ede6;color:#244539;padding:.55rem .65rem;font-size:.82rem;border-radius:7px}
+.editor-tabs button[aria-pressed=true] {background:#244e3e;color:white}
+.editor-panel-area {min-height:0;overflow:auto;overscroll-behavior:contain;padding:10px 12px;scrollbar-width:thin}
+.editor-panel h2 {font-size:1rem;margin:.2rem 0 .55rem}
+.editor-panel p {font-size:.83rem;line-height:1.34;margin:.45rem 0;color:#435950;overflow-wrap:anywhere}
+.editor-panel button,.editor-footer button,.editor-header button {font-size:.83rem;padding:.55rem .72rem;border-radius:8px;margin:.12rem .12rem .12rem 0}
+.editor-panel input:not([type=range]):not([type=checkbox]),.editor-panel select {font:inherit;font-size:.85rem;margin:.25rem 0 .5rem;max-width:100%}
+.editor-panel input[type=range] {height:40px;margin:0 0 .3rem}
+.editor-panel input[type=checkbox] {display:inline;vertical-align:middle;margin:0 .35rem 0 0;accent-color:#244e3e}
+.editor-panel label {font-size:.85rem}
+.editor-panel details {font-size:.9rem;margin:.5rem 0}
+.editor-panel summary {cursor:pointer;color:#234b3b}
+.editor-footer {min-height:36px}
+.editor-footer div {display:flex;gap:5px}
+.editor-footer p {font-size:.77rem;color:#435950;margin:0;max-width:100%;overflow-wrap:anywhere}
+.editor-footer button:last-child,.editor-header button {background:#dce9df;color:#214336}
+.agarsito-editor button:disabled {opacity:.5;cursor:default}
+.editor-legacy {display:none!important}
+@media(max-width:700px) {
+  main.agarsito-editor {gap:7px;padding:8px}
+  .editor-body {grid-template-columns:minmax(0,1fr);grid-template-rows:minmax(0,1fr) minmax(95px,39%);gap:7px}
+  .editor-header {gap:4px}
+  .editor-header h1 {font-size:1.2rem}
+  .editor-stage,.editor-tools {border-radius:10px}
+  .editor-tabs {padding:5px}
+  .editor-panel-area {padding:6px 8px}
+  .editor-footer {gap:2px 8px}
+}
 </style>
 <main>
 <h1>Quitar fondo</h1>
@@ -97,7 +142,7 @@ input[type=range]:disabled{opacity:.45;cursor:default}
 <option value="strong">Restauración intensa de ruido y compresión</option>
 </select>
 <button id="run-restore" disabled>Mejorar con GPU</button>
-<button id="run-restore-cpu" disabled>Prueba rápida en CPU</button>
+<button id="run-restore-cpu" disabled>Procesar en CPU</button>
 <label id="restore-hybrid-option"><input type="checkbox" id="restore-hybrid" style="display:inline;margin:.3rem"> Probar GPU + CPU (experimental)</label>
 <button id="pause-restore" type="button" hidden>Pausar ampliación</button>
 <p id="restore-status" role="status"></p>
@@ -415,6 +460,59 @@ fn main(@builtin(global_invocation_id) pos: vec3u) {
     device.destroy();
   }
 }
+async function cpuDetail(source,width,height,focus) {
+  const dest = new OffscreenCanvas(width,height).getContext('2d');
+  const clamp = (v,lo,hi) => Math.max(lo,Math.min(hi,v));
+  const smooth = (lo,hi,v) => {
+    const t = clamp((v-lo)/(hi-lo),0,1);
+    return t*t*(3-2*t);
+  };
+  const luma = (r,g,b) => (0.2126*r+0.7152*g+0.0722*b)/255;
+  for (let y=0;y<height;y+=48) {
+    await waitForRestorationResume();
+    const rows = Math.min(48,height-y);
+    const top = Math.max(0,y-3), bottom = Math.min(height,y+rows+3);
+    const {data} = source.getImageData(0,top,width,bottom-top);
+    const result = dest.createImageData(width,rows);
+    const offset = (x,y) => ((clamp(y,top,bottom-1)-top)*width+clamp(x,0,width-1))*4;
+    const pixelLuma = (x,y) => {
+      const i = offset(x,y);
+      return luma(data[i],data[i+1],data[i+2]);
+    };
+    for (let row=y;row<y+rows;row++) {
+      for (let x=0;x<width;x++) {
+        const i=offset(x,row), r=data[i], g=data[i+1], b=data[i+2];
+        const original=luma(r,g,b);
+        let sum=original*2, weight=2;
+        for (let dy=-1;dy<=1;dy++) for (let dx=-1;dx<=1;dx++) {
+          if (!dx && !dy) continue;
+          const j=offset(x+dx,row+dy);
+          const distance=(r-data[j])**2+(g-data[j+1])**2+(b-data[j+2])**2;
+          const influence=data[j+3]/255/(1+20*distance/65025);
+          sum+=luma(data[j],data[j+1],data[j+2])*influence;
+          weight+=influence;
+        }
+        const fine=original-sum/weight;
+        let amount=fine*smooth(0.003,0.028,Math.abs(fine))*1.5*255;
+        if (focus) {
+          const broad=(pixelLuma(x-3,row)+pixelLuma(x+3,row)+pixelLuma(x,row-3)+pixelLuma(x,row+3))/4;
+          const edge=original-broad;
+          const gain=clamp(1.35*fine+0.72*edge,-0.088,0.088)*smooth(0.003,0.018,Math.max(Math.abs(fine),Math.abs(edge)));
+          amount=clamp(gain*255,-Math.min(r,g,b),255-Math.max(r,g,b));
+        }
+        const out=((row-y)*width+x)*4;
+        result.data[out]=r+amount;
+        result.data[out+1]=g+amount;
+        result.data[out+2]=b+amount;
+        result.data[out+3]=data[i+3];
+      }
+    }
+    dest.putImageData(result,0,y);
+    self.postMessage({phase:'Procesando nitidez en CPU · '+Math.round(100*(y+rows)/height)+' %'});
+    await new Promise(resolve=>setTimeout(resolve,0));
+  }
+  return dest.canvas.convertToBlob({type:'image/png'});
+}
 function hasOutputStripes(pixels) {
   const {width,height,data}=pixels;
   let previous=0, repeats=0;
@@ -662,7 +760,7 @@ async function waitForRestorationResume() {
 }
 self.onmessage = async ({data}) => {
   if (data.hybridCpuTask) return runHybridCpu(data);
-  const {photo,variant,useCpu,probeMiB,diagnostic,control,hybrid} = data;
+  const {photo,variant,useCpu,probeMiB,diagnostic,control,hybrid,calibration = {}} = data;
   if (control) {
     paused = control === 'pause';
     if (!paused) {
@@ -672,6 +770,7 @@ self.onmessage = async ({data}) => {
     return;
   }
   let image;
+  const processingStarted = performance.now();
   try {
     const backend = useCpu ? 'wasm' : 'webgpu';
     const adapter = useCpu ? null : await navigator.gpu?.requestAdapter();
@@ -679,26 +778,25 @@ self.onmessage = async ({data}) => {
     const bindingLimit = adapter ? Math.min(adapter.limits.maxStorageBufferBindingSize, adapter.limits.maxBufferSize) : Infinity;
     const nativeFocus = variant === 'focus' && !diagnostic;
     const super2 = variant === 'super2' && !diagnostic;
-    if (super2 && useCpu) throw Error('La superresolución ×2 requiere WebGPU.');
-    const quick = (variant === 'fast' || nativeFocus) && !useCpu;
-    if (nativeFocus && useCpu) throw Error('Recuperar enfoque requiere WebGPU. Elegí otro modo para la prueba en CPU.');
+    const quick = (variant === 'fast' || nativeFocus) && !diagnostic;
+    const combine = hybrid && !useCpu && !quick && !diagnostic;
     const plan = restorationPlan(probeMiB, 4866418, bindingLimit);
     if (!diagnostic) image = await createImageBitmap(photo);
     if (image && (image.width * image.height > 16000000 || Math.max(image.width,image.height) > 8192)) throw Error('La foto supera el tamaño admitido.');
     if (super2 && (image.width*image.height > 4000000 || Math.max(image.width,image.height) > 4096)) {
       throw Error('Para ampliar ×2, la foto debe tener como máximo 4 megapíxeles y 4096 px por lado. Podés encuadrarla primero.');
     }
-    const scale = (nativeFocus || super2) ? 1 : Math.min(1, (useCpu ? 224 : quick ? Math.min(1600, Math.floor(Math.sqrt(Math.min(bindingLimit / 4, (probeMiB || 24) * 1048576 * 0.7 / 12)))) : plan.maxSide) / (image ? Math.max(image.width, image.height) : 48));
+    const scale = (nativeFocus || super2) ? 1 : Math.min(1, (quick ? Math.min(1600, Math.floor(Math.sqrt(Math.min(bindingLimit / 4, (probeMiB || 24) * 1048576 * 0.7 / 12)))) : plan.maxSide) / (image ? Math.max(image.width, image.height) : 48));
     const width = Math.max(1, Math.round((image?.width || 48) * scale));
     const height = Math.max(1, Math.round((image?.height || 48) * scale));
-    const tiles = useCpu ? [96] : plan.candidates.filter(core => {
+    const tiles = useCpu ? [96,64,48,32] : plan.candidates.filter(core => {
       const area = Math.min(width,core+2*plan.halo)*Math.min(height,core+2*plan.halo);
       const coreArea = Math.min(width,core)*Math.min(height,core);
-      const buffers = super2 ? (area*4 + coreArea*32) : width*height*36;
-      const maxBuffer = super2 ? Math.max(area*4,coreArea*16) : width*height*16;
+      const buffers = (super2 || combine) ? (area*4 + coreArea*32) : width*height*36;
+      const maxBuffer = (super2 || combine) ? Math.max(area*4,coreArea*16) : width*height*16;
       return 4866418 + area*960 + buffers <= plan.budget && maxBuffer <= bindingLimit;
     });
-    if (super2 && !tiles.length && Math.min(width,32+2*plan.halo)*Math.min(height,32+2*plan.halo)*256 <= bindingLimit) {
+    if ((super2 || combine) && !tiles.length && Math.min(width,32+2*plan.halo)*Math.min(height,32+2*plan.halo)*256 <= bindingLimit) {
       tiles.push(32);
     }
     if (!diagnostic && !quick && !tiles.length) throw Error('El presupuesto estimado no alcanza para el bloque mínimo de Real-ESRGAN en GPU.');
@@ -709,8 +807,8 @@ self.onmessage = async ({data}) => {
     image = undefined;
     if (nativeFocus) {
       const start = performance.now();
-      const png = await gpuDetail(adapter,source,width,height,true,plan.budget);
-      self.postMessage({png,nativeFocus:true,route:'WebGPU directa',width,height,duration:Math.round(performance.now()-start)});
+      const png = await (useCpu ? cpuDetail(source,width,height,true) : gpuDetail(adapter,source,width,height,true,plan.budget));
+      self.postMessage({png,nativeFocus:true,route:useCpu ? 'CPU' : 'WebGPU directa',width,height,duration:Math.round(performance.now()-start)});
       return;
     }
     const reference = super2 ? null : new OffscreenCanvas(quick ? width : width*2,quick ? height : height*2).getContext('2d');
@@ -719,20 +817,15 @@ self.onmessage = async ({data}) => {
       reference.drawImage(source.canvas,0,0,reference.canvas.width,reference.canvas.height);
     }
     if (quick) {
-      self.postMessage({phase:'Aplicando nitidez directamente en WebGPU…'});
+      self.postMessage({phase:useCpu ? 'Aplicando nitidez en CPU…' : 'Aplicando nitidez en WebGPU…'});
       const start = performance.now();
-      const png = await gpuDetail(adapter,source,width,height);
-      self.postMessage({png,reference:await reference.canvas.convertToBlob({type:'image/png'}),route:'WebGPU directa',width,height,duration:Math.round(performance.now()-start)});
+      const png = await (useCpu ? cpuDetail(source,width,height,false) : gpuDetail(adapter,source,width,height));
+      self.postMessage({png,reference:await reference.canvas.convertToBlob({type:'image/png'}),route:useCpu ? 'CPU' : 'WebGPU directa',width,height,duration:Math.round(performance.now()-start)});
       return;
     }
     const file = (variant === 'strong' || super2) ? 'realesr-general-x4v3' : 'realesr-general-wdn-x4v3';
-    const response = await fetch('https://huggingface.co/thisismert/real-esrgan-onnx/resolve/main/onnx/' + file + '.onnx');
-    if (!response.ok) throw Error('No se pudo descargar el modelo (HTTP ' + response.status + ').');
-    const model = new Uint8Array(await response.arrayBuffer());
-    const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', model));
-    const checksum = Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join('');
     const expected = (variant === 'strong' || super2) ? '5518a106453e751655edc12f208973207ab8355d0cafc1816b8a9041b01810dd' : '1a94b28646b806071cf2d8d2d28d71e7f4b0cfc375536aa00c6c70856f115ece';
-    if (checksum !== expected) throw Error('El archivo del modelo no coincide con la versión verificada.');
+    const model = new Uint8Array(await loadVerifiedModel('https://huggingface.co/thisismert/real-esrgan-onnx/resolve/main/onnx/' + file + '.onnx',expected));
     const graph = useCpu ? model : adaptRestorationModel(model);
     if (!useCpu) {
       const digest = new Uint8Array(await crypto.subtle.digest('SHA-256',graph));
@@ -754,14 +847,21 @@ self.onmessage = async ({data}) => {
       return;
     }
     let route = useCpu ? 'CPU/WASM' : 'WebGPU estricta';
-    let verifiedLayout;
-    const processingStarted = performance.now();
+    const adapterInfo = adapter?.info;
+    const deviceKey = adapter ? JSON.stringify([runtime,expected,navigator.userAgent,adapterInfo?.vendor,
+      adapterInfo?.architecture,adapterInfo?.device,bindingLimit,adapter.features.has('shader-f16')]) : '';
+    const layoutKey = deviceKey + ':layout';
+    const tileKey = deviceKey + JSON.stringify([variant,!!combine,probeMiB || 0,Math.min(width,196),Math.min(height,196)]);
+    const cachedLayout = ['NCHW','NHWC'].includes(calibration[layoutKey]) ? calibration[layoutKey] : undefined;
+    let verifiedLayout = cachedLayout;
+    let calibrationChanged = false;
     async function createRestorationSession(ort) {
       if (useCpu) return ort.InferenceSession.create(graph, {executionProviders: ['wasm']});
-      const modes = verifiedLayout ? [verifiedLayout] : ['NCHW','NHWC'];
+      const modes = [...new Set([verifiedLayout,'NCHW','NHWC'].filter(Boolean))];
       const failures = [];
       for (const layout of modes) {
-        self.postMessage({phase:'Comprobando la salida de WebGPU ' + layout + ' con una referencia pequeña…'});
+        const known = layout === verifiedLayout;
+        if (!known) self.postMessage({phase:'Comprobando la salida de WebGPU ' + layout + ' con una referencia pequeña…'});
         let session;
         try {
           session = await ort.InferenceSession.create(graph,{
@@ -769,10 +869,11 @@ self.onmessage = async ({data}) => {
             preferredOutputLocation:'gpu-buffer',
             extra:{session:{disable_cpu_ep_fallback:'1'}}
           });
-          if (!verifiedLayout) {
+          if (!known) {
             const comparison = await testRestorationOutput(ort,session,runtime,model);
             if (!comparison.ok) throw Error('Diferencia media de ' + comparison.mean.toFixed(1) + ' niveles por canal frente a la referencia.');
           }
+          calibrationChanged ||= layout !== cachedLayout;
           verifiedLayout = layout;
           route = 'WebGPU estricta (' + layout + ')';
           return session;
@@ -796,7 +897,7 @@ self.onmessage = async ({data}) => {
       const area = Math.min(width,core+2*halo)*Math.min(height,core+2*halo);
       const limit = Math.min(bindingLimit,ort.env.webgpu.device.limits.maxStorageBufferBindingSize,ort.env.webgpu.device.limits.maxBufferSize);
       const keepOnGpu = width*height*16 <= limit && 4866418 + area*960 + width*height*36 <= plan.budget;
-      const outputByTile = super2 && (hybrid || !keepOnGpu);
+      const outputByTile = combine || (super2 && !keepOnGpu);
       const coreArea = Math.min(width,core)*Math.min(height,core);
       const uploadByTile = outputByTile && (width*height*4 > limit ||
         4866418 + area*960 + width*height*4 + coreArea*32 > plan.budget);
@@ -900,22 +1001,24 @@ self.onmessage = async ({data}) => {
             const x = Math.max(0,Math.floor((width-core)/2));
             const y = Math.max(0,Math.floor((height-core)/2));
             const sample = blockAt(core,x,y);
-            const [,reference] = await Promise.all([
-              gpuPixels.tile(session,...sample.args,result),
-              cpuTile(sample).catch(error => ({error}))
-            ]);
-            if (reference.error) throw reference.error;
-            const actual = result.getImageData(x*2,y*2,sample.cw*2,sample.ch*2).data;
-            const expected = [], visible = [];
-            for (let i=0;i<actual.length;i+=4) {
-              if (reference.data[i+3] !== 255) continue;
-              for (let c=0;c<3;c++) {
-                expected.push(reference.data[i+c]);
-                visible.push(actual[i+c]);
+            if (calibration[tileKey]?.compatible !== true || calibration[tileKey]?.core !== core || calibrationChanged) {
+              const [,reference] = await Promise.all([
+                gpuPixels.tile(session,...sample.args,result),
+                cpuTile(sample).catch(error => ({error}))
+              ]);
+              if (reference.error) throw reference.error;
+              const actual = result.getImageData(x*2,y*2,sample.cw*2,sample.ch*2).data;
+              const expected = [], visible = [];
+              for (let i=0;i<actual.length;i+=4) {
+                if (reference.data[i+3] !== 255) continue;
+                for (let c=0;c<3;c++) {
+                  expected.push(reference.data[i+c]);
+                  visible.push(actual[i+c]);
+                }
               }
-            }
-            if (!expected.length || !compareRestorationProbe(visible,expected).ok) {
-              throw Error('La zona de prueba no permitió confirmar la coincidencia entre CPU y GPU.');
+              if (!expected.length || !compareRestorationProbe(visible,expected).ok) {
+                throw Error('La zona de prueba no permitió confirmar la coincidencia entre CPU y GPU.');
+              }
             }
           } catch (error) {
             cpu?.close();
@@ -983,11 +1086,11 @@ self.onmessage = async ({data}) => {
       let firstTileMs, gpuPixels, uploadByTile;
       const timing = {blocks:0,gpuBlocks:0,cpuBlocks:0,uploadMs:0,runMs:0,finishMs:0,pngMs:0,restMs:0};
       let nextRest = performance.now() + 500;
-      const device = super2 ? ort.env.webgpu.device : null;
+      const device = !useCpu && (super2 || combine) ? ort.env.webgpu.device : null;
       try {
         return await withGpuMemoryScope(device,async () => {
           if (!useCpu) ({pixels:gpuPixels,uploadByTile} = await prepareGpuPixels(ort,core));
-          if (super2 && hybrid) {
+          if (combine) {
             const cpuNote = await processHybrid(core,gpuPixels,session,timing);
             const pngStart = performance.now();
             const png = await gpuPixels.png(result);
@@ -1031,11 +1134,19 @@ self.onmessage = async ({data}) => {
         await session.release();
       }
     }
-    const selectedTiles = super2 ? await selectSuperresolutionTiles(ort,result) : tiles;
+    const autotune = !useCpu && (super2 || combine);
+    const cached = calibration[tileKey];
+    const preferredCore = cached?.core;
+    const canReuseCore = Number.isInteger(preferredCore) && preferredCore > 0 && preferredCore <= 192 &&
+      Math.min(width,preferredCore+2*halo)*Math.min(height,preferredCore+2*halo)*256 <= bindingLimit;
+    const selectedTiles = !autotune ? tiles : canReuseCore
+      ? [preferredCore,...tiles.filter(core => core < preferredCore)]
+      : await selectSuperresolutionTiles(ort,result);
     for (const [index, core] of selectedTiles.entries()) {
       try {
         const {png, firstTileMs, timing, uploadByTile, cpuNote} = await infer(core);
-        self.postMessage({png,reference:await reference?.canvas.convertToBlob({type:'image/png'}),super2,hybrid,cpuNote,route,width,height,core,firstTileMs,timing,uploadByTile,cpuThreads:navigator.hardwareConcurrency,processingMs:Math.round(performance.now()-processingStarted)});
+        self.postMessage({png,reference:await reference?.canvas.convertToBlob({type:'image/png'}),super2,hybrid:combine,cpuNote,route,width,height,core,firstTileMs,timing,uploadByTile,cpuThreads:navigator.hardwareConcurrency,processingMs:Math.round(performance.now()-processingStarted),
+          calibrated:useCpu ? undefined : {...(autotune ? {[tileKey]:{core,compatible:combine && timing.cpuBlocks>0 && !cpuNote}} : {}),[layoutKey]:verifiedLayout}});
         return;
       } catch (error) {
         if (index === selectedTiles.length - 1 || !isRestorationMemoryError(error)) {
@@ -1044,7 +1155,7 @@ self.onmessage = async ({data}) => {
         self.postMessage({phase:'Memoria insuficiente para ' + core + ' px. Reintentando con ' + selectedTiles[index+1] + ' px…'});
       }
     }
-  } catch(error) { self.postMessage({error:error.message}); }
+  } catch(error) { self.postMessage({error:error.message,cpuFallback:!useCpu && !diagnostic && !/tamaño admitido|megapíxeles|descargar el modelo|versión verificada/i.test(error.message)}); }
   finally { image?.close(); }
 };
 </script>
@@ -1348,14 +1459,8 @@ async function regenerateEdge(ctx, edge, subject, width, height) {
   const ort = await import(runtime + 'ort.wasm.min.mjs');
   ort.env.wasm.wasmPaths = runtime;
   ort.env.wasm.numThreads = 1;
-  const response = await fetch('https://huggingface.co/edgetools/migan/resolve/main/migan_pipeline_v2.onnx');
-  if (!response.ok) throw new Error('No se pudo descargar MI-GAN (HTTP ' + response.status + ').');
-  const model = await response.arrayBuffer();
-  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', model));
-  const checksum = Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join('');
-  if (checksum !== '6f1f3530a1a2324b19752018ce756088b07973cda8d7d890034ace5c8a48c40b') {
-    throw new Error('La descarga de MI-GAN no coincide con la versión verificada.');
-  }
+  const model = await loadVerifiedModel('https://huggingface.co/edgetools/migan/resolve/main/migan_pipeline_v2.onnx',
+    '6f1f3530a1a2324b19752018ce756088b07973cda8d7d890034ace5c8a48c40b');
   const session = await ort.InferenceSession.create(model, {executionProviders: ['wasm']});
   const imageTensor = new ort.Tensor('uint8', image, [1, 3, ch, cw]);
   const maskTensor = new ort.Tensor('uint8', mask, [1, 1, ch, cw]);
@@ -1761,14 +1866,8 @@ try {
   ort.env.wasm.wasmPaths = runtimeBase;
   ort.env.wasm.numThreads = 1;
   const portraitURL = 'https://huggingface.co/Xenova/modnet/resolve/fa2fa546052fba4c08921230a26cc69a333fca12/onnx/model.onnx';
-  const response = await fetch(portrait ? portraitURL : modelURL);
-  if (!response.ok) throw new Error('Descarga del modelo: HTTP ' + response.status);
-  const bytes = await response.arrayBuffer();
-  const checksum = await sha256(bytes);
   const expectedHash = portrait ? '07c308cf0fc7e6e8b2065a12ed7fc07e1de8febb7dc7839d7b7f15dd66584df9' : '309c8469258dda742793dce0ebea8e6dd393174f89934733ecc8b14c76f4ddd8';
-  if (checksum !== expectedHash) {
-    throw new Error('El archivo recibido no coincide con la versión del modelo.');
-  }
+  const bytes = await loadVerifiedModel(portrait ? portraitURL : modelURL,expectedHash);
   const downloadMiB = bytes.byteLength / 1048576;
   const model = !portrait && backend === 'webgpu' ? adaptWebGpuModel(bytes) : bytes;
   if (!portrait && backend === 'webgpu' && await sha256(model) !== 'a606d95ea45914f7856169e7941492acedc0a709e0d15355c78f30ed82b4fc44') {
@@ -1960,7 +2059,7 @@ const result = document.querySelector('#result');
 const storageKey = 'agarsito-gpu-convolution-v2';
 const decision = document.querySelector('#decision');
 const budget = document.querySelector('#budget');
-let profile;
+let profile, deviceDiagnosed = false;
 const picker = document.querySelector('#photo');
 const cut = document.querySelector('#cut');
 const cutCpu = document.querySelector('#cut-cpu');
@@ -2025,14 +2124,14 @@ async function openFraming(source, label) {
     await source.decode();
     if (request !== frameRequest || url !== source.src || source.closest('figure').hidden) return;
     frameImage = source;
-    applyFrame.hidden = source !== before && source !== after;
+    applyFrame.hidden = false;
     orientation.value = source.naturalWidth > source.naturalHeight ? 'landscape' : 'portrait';
     frameX.value = frameY.value = '50';
     frameZoom.value = '100';
     document.querySelector('#frame-source').textContent = label;
     framing.hidden = false;
     showFramePreview();
-    framing.scrollIntoView({block: 'start'});
+    if (workspaceTab === 'frame') syncWorkspaceView();
   } catch {
     return;
   }
@@ -2044,7 +2143,7 @@ function closeFraming() {
   framePreview.width = framePreview.height = 1;
 }
 for (const control of [format, orientation, frameX, frameY, frameZoom]) control.oninput = showFramePreview;
-frameOriginal.onclick = () => openFraming(before, 'Encuadrá la foto antes de continuar. No es necesario quitar el fondo.');
+frameOriginal.onclick = () => openFraming(before, 'Ajustá el encuadre de la foto activa.');
 frameCutout.onclick = () => openFraming(after, 'Encuadrá la silueta antes de elegir el fondo.');
 frameComposite.onclick = () => openFraming(composite, 'Foto con fondo');
 async function framedPng(source, box) {
@@ -2053,12 +2152,12 @@ async function framedPng(source, box) {
   return await canvas.convertToBlob({type:'image/png'});
 }
 applyFrame.onclick = async () => {
-  if (editorBusy || !workingPhoto || (frameImage !== before && (frameImage !== after || !cutoutBlob))) return;
+  if (editorBusy || !workingPhoto || (frameImage !== before && frameImage !== composite && (frameImage !== after || !cutoutBlob))) return;
   const source = frameImage;
   const box = currentFrame();
   busy(true);
   try {
-    if (source === before) {
+    if (source === before || source === composite) {
       const original = await framedPng(source, box);
       setWorkingPhoto(original, 'Foto encuadrada', true);
       photoStatus.textContent = 'Encuadre aplicado: ' + box.width + ' × ' + box.height + ' px. Podés seguir editando, quitar el fondo o conservarlo.';
@@ -2073,7 +2172,9 @@ applyFrame.onclick = async () => {
     setWorkingPhoto(original, 'Foto encuadrada', true);
     showCutout(cutout);
     composeStatus.textContent = 'Encuadre aplicado: ' + box.width + ' × ' + box.height + ' px. Elegí un fondo y pulsá Aplicar fondo.';
-    composition.scrollIntoView({block:'start'});
+    savedCutoutActive = true;
+    refreshColorSource();
+    selectWorkspaceTool('background');
   } catch (error) {
     frameStatus.textContent = error.message || 'No se pudo aplicar el encuadre.';
   } finally { busy(false); }
@@ -2446,13 +2547,14 @@ openOriginalEdge.onclick = () => {
   standaloneEdge = true;
   composition.hidden = false;
   composite.closest('figure').querySelector('figcaption').textContent = 'Foto activa';
-  composite.src = originalUrl;
+  composite.src = savedCutoutActive && cutoutBlob ? outputUrl : originalUrl;
   composite.closest('figure').hidden = false;
   hairTools.hidden = false;
   marking = true;
   refreshHairControls();
   drawStrokes();
-  composite.scrollIntoView({block:'center'});
+  syncWorkspaceView();
+  requestAnimationFrame(drawStrokes);
 };
 generateHair.onclick = () => {
   if (!generateHair.disabled) composeBackground(strokes, true);
@@ -2463,7 +2565,7 @@ async function composeBackground(selectedStrokes, generate = false, currentCompo
   refreshHairControls();
   busy(true);
   composeStatus.textContent = currentComposition ? 'Suavizando el borde sobre la composición actual…' : selectedStrokes.length ? 'Separando cabello y restos del fondo original…' : 'Preparando la composición…';
-  const code = document.querySelector('#compose-worker').textContent;
+  const code = modelWorkerCode('compose-worker');
   const url = URL.createObjectURL(new Blob([code], {type: 'text/javascript'}));
   let worker, timeout;
   const finish = ({image, cleanImage, error, integrated, generated}) => {
@@ -2507,7 +2609,7 @@ async function composeBackground(selectedStrokes, generate = false, currentCompo
     };
     worker.onerror = () => finish({error: 'El navegador interrumpió la composición.'});
     timeout = setTimeout(() => finish({error: 'La composición superó el tiempo límite.'}), generate ? 150000 : 45000);
-    worker.postMessage({cutout: cutoutBlob, background: backdrop, catalogBackground: !!number, strokes: selectedStrokes, original: currentComposition ? undefined : workingPhoto, generate, currentComposition, standalonePhoto: standaloneEdge ? workingPhoto : undefined});
+    worker.postMessage({cutout: cutoutBlob, background: backdrop, catalogBackground: !!number, strokes: selectedStrokes, original: currentComposition ? undefined : workingPhoto, generate, currentComposition, standalonePhoto: standaloneEdge ? activeEditingBlob() : undefined});
   } catch (error) {
     finish({error: error.message});
   }
@@ -2538,7 +2640,7 @@ const restoreMode = document.querySelector('#restore-mode');
 const restoreHybrid = document.querySelector('#restore-hybrid');
 const restoreHybridOption = document.querySelector('#restore-hybrid-option');
 function syncHybridOption() {
-  restoreHybridOption.hidden = restoreMode.value !== 'super2';
+  restoreHybridOption.hidden = !navigator.gpu || !['super2','light','strong'].includes(restoreMode.value);
   restoreHybrid.disabled = restoreButton.disabled;
 }
 restoreMode.addEventListener('change',syncHybridOption);
@@ -2624,16 +2726,28 @@ restoreStrength.oninput = () => {
   restoreValue.textContent = restoreStrength.value + ' %';
   if (restoredBitmap) paintRestoration(restorePreview, Number(restoreStrength.value) / 100);
 };
+const calibrationKey = 'agarsito-restoration-calibration-v1';
+function readCalibration() {
+  try { return JSON.parse(localStorage.getItem(calibrationKey)) || {}; }
+  catch { return {}; }
+}
+function saveCalibration(next) {
+  try { localStorage.setItem(calibrationKey,JSON.stringify(Object.fromEntries(Object.entries({...readCalibration(),...next}).slice(-40)))); }
+  catch {}
+}
 restoreButton.onclick = () => startRestoration(false);
 restoreCpu.onclick = () => startRestoration(true);
-function startRestoration(useCpu) {
+function startRestoration(useCpu, fallbackMessage = '') {
   if (restoreButton.disabled) return;
+  useCpu ||= !navigator.gpu;
   clearRestoration();
   busy(true);
   restoreMode.disabled = true;
-  const photo = workingPhoto;
+  const photo = activeEditingBlob();
   const variant = restoreMode.value;
-  const code = document.querySelector('#restore-worker').textContent;
+  const hybrid = !useCpu && !restoreHybridOption.hidden && restoreHybrid.checked;
+  const pausable = variant === 'super2' || hybrid;
+  const code = modelWorkerCode('restore-worker');
   const url = URL.createObjectURL(new Blob([code], {type: 'text/javascript'}));
   let worker, timer, finished = false;
   let pausedByUser = false, paused = false;
@@ -2649,9 +2763,9 @@ function startRestoration(useCpu) {
   function restartTimer() {
     clearTimeout(timer);
     if (paused) return;
-    timer = setTimeout(() => finish({error: variant === 'super2' ? 'La superresolución dejó de avanzar. Probá con la pestaña en primer plano.' : 'La mejora superó el tiempo límite.'}), variant === 'super2' ? 120000 : 240000);
+    timer = setTimeout(() => finish({error: variant === 'super2' ? 'La superresolución dejó de avanzar. Probá con la pestaña en primer plano.' : 'La mejora superó el tiempo límite.'}), pausable ? 120000 : 240000);
   }
-  restoreStatus.textContent = !useCpu && ['fast','focus'].includes(restoreMode.value) ? 'Preparando WebGPU…' : 'Cargando Real-ESRGAN para ejecución GPU estricta…';
+  restoreStatus.textContent = fallbackMessage || (useCpu ? 'Preparando CPU…' : 'Preparando el modelo en WebGPU…');
   const finish = async data => {
     if (finished) return;
     finished = true;
@@ -2661,6 +2775,13 @@ function startRestoration(useCpu) {
     pauseRestore.onclick = null;
     worker?.terminate();
     URL.revokeObjectURL(url);
+    if (!useCpu && data.cpuFallback) {
+      restoreMode.disabled = false;
+      busy(false);
+      startRestoration(true,'WebGPU no pudo procesar esta foto. Continuando en CPU…');
+      return;
+    }
+    if (data.calibrated) saveCalibration(data.calibrated);
     try {
       if (!data.png) throw Error(data.error);
       restoreOriginal = await createImageBitmap(photo);
@@ -2681,6 +2802,7 @@ function startRestoration(useCpu) {
       restoreResult.hidden = false;
       restoreStatus.textContent = enlargedRestoration ? 'Superresolución IA ×2 · salida: ' + restoredBitmap.width + ' × ' + restoredBitmap.height + ' px · ' + data.route + ' · ' + (data.processingMs / 1000).toFixed(1) + ' s de procesamiento. ' + (data.timing ? data.timing.blocks + ' bloques de ' + data.core + ' px · entrada GPU: ' + (data.uploadByTile ? 'por bloques' : 'foto completa') + ' · hilos lógicos informados: ' + (data.cpuThreads ?? 'sin dato') + ' · preparación y envío: ' + Math.round(data.timing.uploadMs) + ' ms · llamada al modelo: ' + Math.round(data.timing.runMs) + ' ms · composición y sincronización: ' + Math.round(data.timing.finishMs) + ' ms · PNG: ' + Math.round(data.timing.pngMs) + ' ms · descansos: ' + Math.round(data.timing.restMs) + ' ms.' : '') : data.duration !== undefined ? 'Nitidez en ' + data.route + ' · ' + data.duration + ' ms · entrada: ' + data.width + ' × ' + data.height + ' px.' : 'Modelo ejecutado en ' + data.route + ' · primer bloque: ' + data.firstTileMs + ' ms · bloque: ' + data.core + ' px · entrada de IA: ' + data.width + ' × ' + data.height + ' px.';
       if (data.hybrid) {
+        if (!enlargedRestoration) restoreStatus.textContent = 'Restauración · ' + (data.processingMs/1000).toFixed(1) + ' s · bloques de ' + data.core + ' px.';
         restoreStatus.textContent += ' Reparto · GPU: ' + data.timing.gpuBlocks + ' · CPU: ' + data.timing.cpuBlocks + '.' +
           (data.cpuNote ? ' ' + data.cpuNote : '');
       }
@@ -2697,15 +2819,15 @@ function startRestoration(useCpu) {
     worker.onmessage = ({data}) => {
       if (data.phase || data.progress !== undefined) {
         if (paused) return;
-        if (variant === 'super2') restartTimer();
+        restartTimer();
       }
       if (data.phase) restoreStatus.textContent = data.phase;
       else if (data.progress === undefined) finish(data);
       else restoreStatus.textContent = 'Procesando en ' + (data.route || (data.backend === 'webgpu' ? 'WebGPU' : 'CPU/WASM')) + (data.backend === 'webgpu' ? ' · presupuesto estimado: ' + data.budget.toFixed(1) + ' MiB de referencia' : '') + ' · bloque: ' + data.core + ' px · ' + data.progress + ' %' + (data.gpuBlocks === undefined ? '' : ' · GPU: ' + data.gpuBlocks + ' · CPU: ' + data.cpuBlocks);
     };
-    worker.onerror = () => finish({error: 'El navegador interrumpió la mejora.'});
+    worker.onerror = () => finish({error: 'El navegador interrumpió la mejora.',cpuFallback:!useCpu});
     restartTimer();
-    if (variant === 'super2') {
+    if (pausable) {
       pauseRestore.hidden = false;
       pauseRestore.textContent = 'Pausar ampliación';
       pauseRestore.onclick = () => {
@@ -2715,7 +2837,7 @@ function startRestoration(useCpu) {
       document.addEventListener('visibilitychange', syncPause);
       syncPause();
     }
-    worker.postMessage({photo, variant, useCpu, hybrid:variant === 'super2' && !useCpu && restoreHybrid.checked, probeMiB: profile?.probeMiB});
+    worker.postMessage({photo,variant,useCpu,hybrid,calibration:readCalibration(),probeMiB:profile?.probeMiB});
   } catch (error) { finish({error: error.message}); }
 };
 async function finishRestoration(continueEditing) {
@@ -2758,7 +2880,7 @@ diagnoseButton.onclick = () => {
   report.hidden = false;
   diagnosticLog.value = '';
   diagnosticStatus.textContent = 'Probando un bloque sintético…';
-  const code = document.querySelector('#restore-worker').textContent;
+  const code = modelWorkerCode('restore-worker');
   const url = URL.createObjectURL(new Blob([code],{type:'text/javascript'}));
   let worker, timeout;
   const append = line => { diagnosticLog.value += line + '\n'; };
@@ -2847,14 +2969,14 @@ async function refreshColorSource(){
   redrawColors();
   if(!workingPhoto) return;
   try{
-    const bitmap=await createImageBitmap(workingPhoto);
+    const bitmap=await createImageBitmap(activeEditingBlob());
     if(version!==colorVersion){bitmap.close();return;}
     if(bitmap.width*bitmap.height>16000000 || Math.max(bitmap.width,bitmap.height)>8192){
       bitmap.close();
       throw Error('La foto supera los límites de tamaño del editor.');
     }
     colorBitmap=bitmap;
-    colorOriginal.src = originalUrl;
+    colorOriginal.src = savedCutoutActive && cutoutBlob ? outputUrl : originalUrl;
     const scale=editorPreviewScale(bitmap.width,bitmap.height);
     colorPreview.width=Math.max(1,Math.round(bitmap.width*scale));
     colorPreview.height=Math.max(1,Math.round(bitmap.height*scale));
@@ -2906,6 +3028,8 @@ function busy(value) {
   diagnoseButton.disabled = value;
   restoreButton.disabled = value || !workingPhoto;
   restoreCpu.disabled = restoreButton.disabled;
+  restoreButton.textContent = navigator.gpu ? 'Procesar con GPU' : 'Procesar en CPU';
+  restoreCpu.hidden = !navigator.gpu;
   syncHybridOption();
   restoreSave.disabled = value;
   useRestored.disabled = value;
@@ -2927,10 +3051,12 @@ function busy(value) {
 }
 picker.onchange = () => {
   setWorkingPhoto(picker.files[0], 'Original');
-  if (workingPhoto) openFraming(before, 'Primer paso: encuadrá la foto o continuá sin cambiar el encuadre.');
+  if (workingPhoto) selectWorkspaceTool('frame');
 };
 
 function setWorkingPhoto(file, label, fromEdit = false) {
+  savedCutoutActive = false;
+  workspaceStatus.textContent = '';
   workingPhoto = !fromEdit && file?.size > 20000000 ? undefined : file;
   clearRestoration();
   clearOutput();
@@ -2954,7 +3080,7 @@ cut.onclick = () => {
   const file = workingPhoto;
   if (!file || cut.disabled) return;
   clearOutput();
-  if (profile) {
+  if (deviceDiagnosed || !navigator.gpu) {
     busy(true);
     testModel(file);
   } else {
@@ -3004,7 +3130,7 @@ function runModel(backend, note = '', photo, portrait = false) {
   if (gpu) {
     try { localStorage.setItem(pendingGpuKey, '1'); } catch {}
   }
-  const code = document.querySelector('#model-worker').textContent;
+  const code = modelWorkerCode('model-worker');
   const url = URL.createObjectURL(new Blob([code], {type: 'text/javascript'}));
   let worker, timeout;
   const finish = ({ok, message, png}) => {
@@ -3037,7 +3163,8 @@ function runModel(backend, note = '', photo, portrait = false) {
 }
 try {
   const saved = JSON.parse(localStorage.getItem(storageKey));
-  if (saved) {
+  if (saved && (!saved.agent || saved.agent === navigator.userAgent)) {
+    deviceDiagnosed = true;
     status.textContent = 'Última prueba: ' + saved.status;
     updateProfile(saved.profile);
   }
@@ -3057,6 +3184,8 @@ function startDiagnostic(photo) {
   result.replaceChildren();
   status.textContent = 'Probando WebGPU…';
   function finish(message, report = {}) {
+    deviceDiagnosed = true;
+    try { localStorage.setItem(storageKey,JSON.stringify({status:message,profile,agent:navigator.userAgent})); } catch {}
     clearTimeout(timeout);
     worker?.terminate();
     URL.revokeObjectURL(url);
@@ -3083,7 +3212,6 @@ function startDiagnostic(photo) {
         status.textContent = 'Cargas completadas: ' + (Object.keys(latestReport).length - 1);
         return;
       }
-      try { localStorage.setItem(storageKey, JSON.stringify({status: data.status, profile})); } catch {}
       finish(data.status, data.report);
     };
     worker.onerror = () => { updateProfile(null); finish('El navegador no pudo ejecutar el diagnóstico.'); };
@@ -3093,5 +3221,276 @@ function startDiagnostic(photo) {
     finish('El navegador no pudo iniciar el diagnóstico.');
   }
 };
+
+async function loadVerifiedModel(url,expected) {
+  async function read(response) {
+    const bytes = await response.arrayBuffer();
+    const digest = new Uint8Array(await crypto.subtle.digest('SHA-256',bytes));
+    const hash = Array.from(digest,byte=>byte.toString(16).padStart(2,'0')).join('');
+    if (hash !== expected) throw Error('El modelo no coincide con la versión verificada.');
+    return bytes;
+  }
+  let cache;
+  try {
+    cache = await caches.open('agarsito-verified-models-v1');
+    const saved = await cache.match(url);
+    if (saved) return await read(saved);
+  } catch {
+    if (cache) await cache.delete(url).catch(()=>{});
+  }
+  const response = await fetch(url,{cache:'force-cache'});
+  if (!response.ok) throw Error('No se pudo descargar el modelo (HTTP '+response.status+').');
+  const bytes = await read(response);
+  if (cache) await cache.put(url,new Response(bytes)).catch(()=>{});
+  return bytes;
+}
+
+function modelWorkerCode(id) {
+  return loadVerifiedModel.toString()+'\n'+document.getElementById(id).textContent;
+}
+
+let workspaceTab = 'frame';
+let savedCutoutActive = false;
+const workspacePanels = new Map();
+const workspaceButtons = new Map();
+const editor = document.querySelector('main');
+const header = document.createElement('header');
+header.className = 'editor-header';
+const title = editor.querySelector('h1');
+title.textContent = 'Agarsito · Editor de fotos';
+picker.setAttribute('aria-label','Elegir foto');
+editor.querySelector('label[for="photo"]').remove();
+title.nextElementSibling.remove();
+const resumeEdit = document.createElement('button');
+resumeEdit.textContent = 'Recuperar avance';
+resumeEdit.hidden = true;
+header.append(title,picker,resumeEdit);
+
+const workspaceBody = document.createElement('div');
+workspaceBody.className = 'editor-body';
+const stage = document.createElement('div');
+stage.className = 'editor-stage';
+stage.setAttribute('role','region');
+stage.setAttribute('aria-label','Vista de edición');
+const emptyStage = document.createElement('p');
+emptyStage.className = 'editor-empty';
+emptyStage.textContent = 'Elegí una foto para comenzar.';
+stage.append(emptyStage);
+const tools = document.createElement('aside');
+tools.className = 'editor-tools';
+const tabs = document.createElement('nav');
+tabs.className = 'editor-tabs';
+tabs.setAttribute('aria-label','Herramientas de edición');
+const panels = document.createElement('div');
+panels.className = 'editor-panel-area';
+tools.append(tabs,panels);
+workspaceBody.append(stage,tools);
+
+const footer = document.createElement('footer');
+footer.className = 'editor-footer';
+const actions = document.createElement('div');
+const saveWorkspace = document.createElement('button');
+saveWorkspace.textContent = 'Guardar avance';
+const exportWorkspace = document.createElement('button');
+exportWorkspace.textContent = 'Descargar';
+const workspaceStatus = document.createElement('p');
+workspaceStatus.setAttribute('role','status');
+actions.append(saveWorkspace,exportWorkspace);
+footer.append(actions,workspaceStatus);
+
+const fineControls = fine.closest('p');
+const portraitHelp = cutPortrait.nextElementSibling;
+const diagnosticTitle = button.previousElementSibling.previousElementSibling;
+const diagnosticHelp = button.previousElementSibling;
+const diagnosticResult = result.nextElementSibling;
+const oldPreviews = editor.querySelector('.previews');
+const cutoutView = after.closest('figure');
+const originalView = before.closest('figure');
+const compositeView = composite.closest('figure');
+const workspaceViews = [originalView,cutoutView,compositeView,meshView,framePreview,restorePreview,colorOriginal,colorPreview];
+for (const view of workspaceViews) {
+  view.classList.add('stage-view');
+  stage.append(view);
+}
+
+const workspaceDefinitions = [
+  ['frame','Encuadre',[frameOriginal,frameCutout,frameComposite,framing]],
+  ['cut','Recorte',[fineControls,cut,cutCpu,cutPortrait,portraitHelp,photoStatus,maskTools,download]],
+  ['background','Fondo y borde',[openOriginalEdge,composition]],
+  ['color','Color',[colorTools]],
+  ['restore','Restaurar',[document.querySelector('#restore')]],
+  ['mesh','Malla',[meshTools]],
+  ['diagnostic','Diagnóstico',[diagnosticTitle,diagnosticHelp,button,benchmarkCpu,status,result,diagnosticResult]]
+];
+for (const [key,label,nodes] of workspaceDefinitions) {
+  const trigger = document.createElement('button');
+  trigger.type = 'button';
+  trigger.textContent = label;
+  trigger.setAttribute('aria-controls','editor-panel-'+key);
+  trigger.onclick = () => selectWorkspaceTool(key);
+  const panel = document.createElement('section');
+  panel.id = 'editor-panel-'+key;
+  panel.className = 'editor-panel';
+  panel.setAttribute('aria-label',label);
+  panel.append(...nodes);
+  tabs.append(trigger);
+  panels.append(panel);
+  workspacePanels.set(key,panel);
+  workspaceButtons.set(key,trigger);
+}
+const restoreDiagnostics = document.createElement('details');
+const restoreDiagnosticLabel = document.createElement('summary');
+restoreDiagnosticLabel.textContent = 'Diagnóstico del modelo';
+diagnoseButton.before(restoreDiagnostics);
+restoreDiagnostics.append(restoreDiagnosticLabel,diagnoseButton,report);
+for (const action of [saveFrame,download,saveComposite,saveMesh,restoreSave,useComposite,useMesh,useRestored,useColor,saveColor]) {
+  action.classList.add('editor-legacy');
+}
+for (const workerScript of diagnosticResult.querySelectorAll('script')) editor.append(workerScript);
+editor.prepend(header,workspaceBody,footer);
+editor.classList.add('agarsito-editor');
+oldPreviews.remove();
+
+function activeEditingBlob() {
+  return savedCutoutActive && cutoutBlob ? cutoutBlob : workingPhoto;
+}
+function selectWorkspaceTool(key) {
+  workspaceTab = key;
+  for (const [name,panel] of workspacePanels) {
+    panel.hidden = name !== key;
+    workspaceButtons.get(name).setAttribute('aria-pressed',String(name === key));
+  }
+  panels.scrollTop = 0;
+  if (key === 'cut' && eraseMode) requestAnimationFrame(showEraseMarks);
+  if (key === 'background' && marking) requestAnimationFrame(drawStrokes);
+  if (key === 'frame' && workingPhoto && !frameImage && !editorBusy) {
+    openFraming(savedCutoutActive && cutoutBlob ? after : before,'Elegí la proporción y ajustá el encuadre.');
+  }
+  syncWorkspaceView();
+}
+
+function syncWorkspaceView() {
+  const base = savedCutoutActive && cutoutBlob ? cutoutView : originalView;
+  const view = {
+    frame:!framing.hidden && frameImage ? framePreview : base,
+    cut:cutoutBlob ? cutoutView : base,
+    background:!compositeView.hidden ? compositeView : cutoutBlob ? cutoutView : base,
+    color:colorBitmap ? (colorEnabled() ? colorPreview : colorOriginal) : base,
+    restore:!restoreResult.hidden ? restorePreview : base,
+    mesh:!meshView.hidden ? meshView : !compositeView.hidden && composedResult ? compositeView : cutoutBlob ? cutoutView : base,
+    diagnostic:base
+  }[workspaceTab];
+  for (const item of workspaceViews) item.classList.toggle('is-active',item === view);
+  emptyStage.hidden = !!workingPhoto;
+  saveWorkspace.disabled = exportWorkspace.disabled = editorBusy || !workingPhoto;
+  resumeEdit.disabled = editorBusy;
+  if (!workingPhoto && photoStatus.textContent) workspaceStatus.textContent = photoStatus.textContent;
+}
+const viewObserver = new MutationObserver(syncWorkspaceView);
+for (const node of [...workspaceViews,framing,restoreResult,restoreButton,photoStatus]) {
+  viewObserver.observe(node,{attributes:true,attributeFilter:['hidden','src','disabled'],childList:node === photoStatus});
+}
+new ResizeObserver(([entry]) => {
+  stage.style.setProperty('--stage-height',entry.contentRect.height+'px');
+  if (marking) drawStrokes();
+  if (eraseMode) showEraseMarks();
+}).observe(stage);
+
+const editDatabase = new Promise((resolve,reject) => {
+  const request = indexedDB.open('agarsito-local-edits',1);
+  request.onupgradeneeded = () => request.result.createObjectStore('drafts');
+  request.onsuccess = () => resolve(request.result);
+  request.onerror = () => reject(request.error);
+  request.onblocked = () => reject(Error('Cerrá las otras pestañas del editor e intentá de nuevo.'));
+});
+async function editCheckpoint(value) {
+  const db = await editDatabase;
+  return new Promise((resolve,reject) => {
+    const transaction = db.transaction('drafts',value ? 'readwrite' : 'readonly');
+    const store = transaction.objectStore('drafts');
+    const request = value ? store.put(value,'latest') : store.get('latest');
+    transaction.oncomplete = () => resolve(request.result);
+    transaction.onabort = () => reject(transaction.error || Error('No se pudo acceder al avance.'));
+  });
+}
+editCheckpoint().then(draft => { resumeEdit.hidden = !draft; }).catch(() => {});
+resumeEdit.onclick = async () => {
+  if (editorBusy) return;
+  try {
+    const draft = await editCheckpoint();
+    if (!draft || editorBusy) return;
+    setWorkingPhoto(draft.photo,'Avance recuperado',true);
+    if (draft.cutout) showCutout(draft.cutout);
+    savedCutoutActive = !!draft.cutoutActive;
+    refreshColorSource();
+    selectWorkspaceTool(draft.cutoutActive ? 'cut' : 'frame');
+    workspaceStatus.textContent = 'Avance recuperado de este navegador.';
+  } catch (error) { workspaceStatus.textContent = 'No se pudo recuperar el avance. '+error.message; }
+};
+
+async function workspaceOutput() {
+  if (workspaceTab === 'frame' && frameImage && !framing.hidden) {
+    const box = currentFrame();
+    const displayed = await framedPng(frameImage,box);
+    if (frameImage === after && cutoutBlob && before.naturalWidth === after.naturalWidth && before.naturalHeight === after.naturalHeight) {
+      return {photo:await framedPng(before,box),cutout:displayed,cutoutActive:true};
+    }
+    return {photo:displayed};
+  }
+  if (workspaceTab === 'color' && colorBitmap && colorEnabled()) {
+    const canvas = new OffscreenCanvas(colorBitmap.width,colorBitmap.height);
+    paintColors(canvas);
+    const photo = await canvas.convertToBlob({type:'image/png'});
+    return savedCutoutActive ? {photo,cutout:photo,cutoutActive:true} : {photo};
+  }
+  if (workspaceTab === 'restore' && restoredBitmap) {
+    const strength = Number(restoreStrength.value)/100;
+    if (!strength) return {photo:workingPhoto,cutout:cutoutBlob,cutoutActive:savedCutoutActive};
+    const output = enlargedRestoration ? restoredBitmap : restoreOriginal;
+    const canvas = new OffscreenCanvas(output.width,output.height);
+    paintRestoration(canvas,strength);
+    const photo = await canvas.convertToBlob({type:'image/png'});
+    return savedCutoutActive ? {photo,cutout:photo,cutoutActive:true} : {photo};
+  }
+  if (workspaceTab === 'mesh' && meshResult) return {photo:meshResult};
+  if (workspaceTab === 'background' && composedResult) return {photo:composedResult};
+  const cutoutActive = !!cutoutBlob && (savedCutoutActive || ['cut','background'].includes(workspaceTab));
+  return {photo:workingPhoto,cutout:cutoutBlob,cutoutActive};
+}
+
+saveWorkspace.onclick = async () => {
+  if (editorBusy || !workingPhoto) return;
+  busy(true);
+  workspaceStatus.textContent = 'Guardando avance…';
+  try {
+    const draft = await workspaceOutput();
+    await editCheckpoint(draft);
+    if (draft.photo !== workingPhoto || draft.cutout !== cutoutBlob) {
+      setWorkingPhoto(draft.photo,'Edición guardada',true);
+      if (draft.cutout) showCutout(draft.cutout);
+    }
+    savedCutoutActive = draft.cutoutActive;
+    refreshColorSource();
+    resumeEdit.hidden = false;
+    workspaceStatus.textContent = 'Avance guardado en este navegador.';
+  } catch (error) {
+    workspaceStatus.textContent = 'No se pudo guardar el avance. '+error.message;
+  } finally {
+    busy(false);
+    syncWorkspaceView();
+  }
+};
+exportWorkspace.onclick = async () => {
+  if (editorBusy || !workingPhoto) return;
+  busy(true);
+  try {
+    const draft = await workspaceOutput();
+    const blob = draft.cutoutActive ? draft.cutout : draft.photo;
+    const extension = {'image/jpeg':'jpg','image/png':'png','image/webp':'webp','image/avif':'avif'}[blob.type];
+    downloadEdit(blob,blob.name || 'foto-editada'+(extension ? '.'+extension : ''));
+  } catch (error) { workspaceStatus.textContent = 'No se pudo descargar. '+error.message; }
+  finally { busy(false); syncWorkspaceView(); }
+};
+selectWorkspaceTool('frame');
 </script>
 </html>
