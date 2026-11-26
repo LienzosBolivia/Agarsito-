@@ -33,6 +33,7 @@ body {margin:0;background:#edf0eb;color:#182521}
 main.agarsito-editor {width:min(1440px,100%);max-width:none;height:100dvh;margin:0 auto;padding:clamp(10px,2vw,24px);box-sizing:border-box;display:grid;grid-template-rows:auto minmax(0,1fr) auto;gap:12px}
 .agarsito-editor [hidden] {display:none!important}
 .editor-header,.editor-footer {display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.editor-storage-notice {flex:0 0 100%;font-size:.75rem;color:#435950;margin:0}
 .editor-header h1 {font-size:clamp(1.3rem,3vw,2.1rem);margin:0;letter-spacing:-.045em}
 .editor-header input[type=file] {margin:0;max-width:min(54vw,300px);font-size:.78rem}
 .editor-header input::file-selector-button {font:inherit;color:#1f4638;background:#fff;border:1px solid #c7d5cb;border-radius:8px;padding:.55rem .7rem}
@@ -2339,13 +2340,18 @@ function clearFrameFill() {
 function showFramePreview() {
   if (!frameImage) return;
   const box = currentFrame();
-  const scale = Math.min(1, 512 / Math.max(box.width, box.height));
+  const viewport=stage.getBoundingClientRect();
+  const displayScale=viewport.width && viewport.height
+    ? Math.min(viewport.width/box.width,viewport.height/box.height)*(window.devicePixelRatio || 1)
+    : 1024/Math.max(box.width,box.height);
+  const scale=Math.min(editorPreviewScale(box.width,box.height),displayScale);
   framePreview.width = Math.max(1, Math.round(box.width * scale));
   framePreview.height = Math.max(1, Math.round(box.height * scale));
   const geometry = JSON.stringify(box);
   if (frameGeometry !== geometry) clearFrameFill();
   frameGeometry = geometry;
   const ctx = framePreview.getContext('2d');
+  ctx.imageSmoothingQuality='high';
   if (frameFill) {
     ctx.drawImage(frameFill.bitmap,0,0,framePreview.width,framePreview.height);
   } else {
@@ -2358,7 +2364,7 @@ function showFramePreview() {
   completeFrame.disabled = editorBusy || !known.width || !known.height;
   frameX.disabled = frameY.disabled = editorBusy;
   for (const slider of [frameX,frameY,frameZoom,frameExpand]) document.querySelector('#'+slider.id+'-value').textContent = slider.value+' %';
-  frameStatus.textContent = box.width + ' × ' + box.height + ' px' + (frameFill ? ' · margen completado con IA' : hasMargin ? ' · margen transparente' : '') + '.';
+  frameStatus.textContent = 'Foto: '+frameImage.naturalWidth+' × '+frameImage.naturalHeight+' px · Encuadre: '+box.width+' × '+box.height+' px' + (frameFill ? ' · margen completado con IA' : hasMargin ? ' · margen transparente' : '') + '.';
 }
 async function openFraming(source, label) {
   const request = ++frameRequest;
@@ -2379,6 +2385,7 @@ async function openFraming(source, label) {
     framing.hidden = false;
     showFramePreview();
     if (workspaceTab === 'frame') syncWorkspaceView();
+    queueAutosave();
   } catch {
     return;
   }
@@ -2390,7 +2397,8 @@ function closeFraming() {
   framing.hidden = true;
   framePreview.width = framePreview.height = 1;
 }
-for (const control of [format, orientation, frameX, frameY, frameZoom, frameExpand]) control.oninput = showFramePreview;
+const frameControls=[format,orientation,frameX,frameY,frameZoom,frameExpand];
+for (const control of frameControls) control.oninput=showFramePreview;
 frameOriginal.onclick = () => openFraming(before, 'Ajustá el encuadre de la foto activa.');
 frameCutout.onclick = () => openFraming(after, 'Encuadrá la silueta antes de elegir el fondo.');
 frameComposite.onclick = () => openFraming(composite, 'Foto con fondo');
@@ -2669,6 +2677,13 @@ function clearMesh() {
   saveMesh.removeAttribute('href');
   meshStatus.textContent = '';
 }
+function showMesh(png) {
+  meshResult = png;
+  meshUrl = URL.createObjectURL(meshResult);
+  meshPreview.src = meshUrl;
+  meshView.hidden = useMesh.hidden = false;
+  saveMesh.href = meshUrl;
+}
 catalogMesh.oninput = () => {
   clearMesh();
   refreshMeshControls();
@@ -2692,11 +2707,7 @@ meshButton.onclick = async () => {
     ctx.imageSmoothingQuality = 'high';
     ctx.drawImage(photo, 0, 0);
     ctx.drawImage(overlay, 0, 0, photo.width, photo.height);
-    meshResult = await canvas.convertToBlob({type: 'image/png'});
-    meshUrl = URL.createObjectURL(meshResult);
-    meshPreview.src = meshUrl;
-    meshView.hidden = useMesh.hidden = false;
-    saveMesh.href = meshUrl;
+    showMesh(await canvas.convertToBlob({type:'image/png'}));
     meshStatus.textContent = 'Malla aplicada: ' + photo.width + ' × ' + photo.height + ' px.';
   } catch (error) {
     clearMesh();
@@ -2818,6 +2829,7 @@ function clearComposite() {
   composeStatus.textContent = '';
 }
 background.onchange = () => {
+  draftBackground=background.files[0];
   if (background.files[0]) catalogBackground.value = '';
   clearComposite();
   busy(false);
@@ -2853,6 +2865,26 @@ openOriginalEdge.onclick = () => {
 generateHair.onclick = () => {
   if (!generateHair.disabled) composeBackground(strokes, true);
 };
+function showComposition(image,cleanImage) {
+  if (compositeUrl) URL.revokeObjectURL(compositeUrl);
+  clearMesh();
+  compositeBlob = cleanImage;
+  composedResult = image;
+  refreshMeshControls();
+  useComposite.hidden = false;
+  useComposite.textContent = standaloneEdge ? 'Usar foto reconstruida para seguir editando' : 'Usar foto con fondo para seguir editando';
+  saveComposite.download = standaloneEdge ? 'foto-borde-reconstruido.png' : 'foto-con-fondo.png';
+  saveComposite.textContent = standaloneEdge ? 'Descargar foto reconstruida' : 'Descargar foto con fondo';
+  composite.closest('figure').querySelector('figcaption').textContent = standaloneEdge ? 'Foto reconstruida' : 'Foto con el fondo elegido';
+  compositeUrl = URL.createObjectURL(image);
+  hairTools.hidden = false;
+  if (frameImage === composite) closeFraming();
+  composite.src = compositeUrl;
+  frameComposite.hidden = false;
+  composite.closest('figure').hidden = false;
+  saveComposite.href = compositeUrl;
+  saveComposite.hidden = false;
+}
 async function composeBackground(selectedStrokes, generate = false, currentComposition) {
   composing = true;
   marking = false;
@@ -2873,29 +2905,13 @@ async function composeBackground(selectedStrokes, generate = false, currentCompo
       composeStatus.textContent = error;
       return;
     }
-    if (compositeUrl) URL.revokeObjectURL(compositeUrl);
-    clearMesh();
-    compositeBlob = cleanImage;
-    composedResult = image;
-    refreshMeshControls();
-    useComposite.hidden = false;
-    useComposite.textContent = standaloneEdge ? 'Usar foto reconstruida para seguir editando' : 'Usar foto con fondo para seguir editando';
-    saveComposite.download = standaloneEdge ? 'foto-borde-reconstruido.png' : 'foto-con-fondo.png';
-    saveComposite.textContent = standaloneEdge ? 'Descargar foto reconstruida' : 'Descargar foto con fondo';
-    composite.closest('figure').querySelector('figcaption').textContent = standaloneEdge ? 'Foto reconstruida' : 'Foto con el fondo elegido';
-    compositeUrl = URL.createObjectURL(image);
-    hairTools.hidden = false;
-    if (frameImage === composite) closeFraming();
-    composite.src = compositeUrl;
-    frameComposite.hidden = false;
-    composite.closest('figure').hidden = false;
-    saveComposite.href = compositeUrl;
-    saveComposite.hidden = false;
+    showComposition(image,cleanImage);
+    saveLatestWork();
     composeStatus.textContent = generated ? 'Borde reconstruido con MI-GAN.' : generate ? 'La IA no produjo un cambio visible en el borde marcado. Para restos opacos, usá Quitar restos del fondo.' : integrated ? 'Unión del cabello suavizada sobre la composición actual.' : selectedStrokes.length ? 'Marcá una zona donde el cabello toque el fondo.' : 'Fondo aplicado. Ya podés marcar el cabello.';
   };
   try {
     const number = standaloneEdge ? '' : catalogBackground.value.trim();
-    const backdrop = standaloneEdge ? undefined : number ? await catalogAsset('fondos', number) : background.files[0];
+    const backdrop = standaloneEdge ? undefined : number ? await catalogAsset('fondos', number) : (background.files[0] || draftBackground);
     worker = new Worker(url);
     worker.onmessage = ({data}) => {
       if (data.progress) composeStatus.textContent = data.progress;
@@ -2945,7 +2961,7 @@ const restoreStrength = document.querySelector('#restore-strength');
 const restoreValue = document.querySelector('#restore-value');
 const restorePreview = document.querySelector('#restore-preview');
 const restoreSave = document.querySelector('#save-restore');
-let restoredBitmap, restoreOriginal, restoreReference, restoreFile, correction, nativeRestoration, enlargedRestoration;
+let restoredBitmap, restoreOriginal, restoreReference, restoreFile, correction, nativeRestoration, enlargedRestoration, restoreDraftData;
 
 function clearRestoration() {
   restoredBitmap?.close();
@@ -2953,6 +2969,7 @@ function clearRestoration() {
   restoreReference?.close();
   restoredBitmap = restoreOriginal = restoreReference = restoreFile = correction = undefined;
   nativeRestoration = enlargedRestoration = false;
+  restoreDraftData=undefined;
   restoreResult.hidden = true;
   restorePreview.width = restorePreview.height = 1;
   restoreStatus.textContent = '';
@@ -3031,6 +3048,26 @@ function saveCalibration(next) {
 }
 restoreButton.onclick = () => startRestoration(false);
 restoreCpu.onclick = () => startRestoration(true);
+async function showRestoration(data,photo,variant,strength) {
+  restoreOriginal = await createImageBitmap(photo);
+  restoredBitmap = await createImageBitmap(data.png);
+  enlargedRestoration = !!data.super2;
+  nativeRestoration = !!data.nativeFocus || enlargedRestoration;
+  if (!nativeRestoration) {
+    restoreReference = await createImageBitmap(data.reference);
+    correction = makeCorrectionField(restoreReference, restoredBitmap, data.width, data.height, variant);
+  }
+  restoreFile = photo;
+  const previewSource = enlargedRestoration ? restoredBitmap : restoreOriginal;
+  const scale = editorPreviewScale(previewSource.width, previewSource.height);
+  restorePreview.width = Math.max(1, Math.round(previewSource.width * scale));
+  restorePreview.height = Math.max(1, Math.round(previewSource.height * scale));
+  restoreStrength.value = strength ?? (enlargedRestoration ? '100' : '50');
+  restoreStrength.oninput();
+  restoreResult.hidden = false;
+  const {png,reference,width,height,super2,nativeFocus}=data;
+  restoreDraftData={data:{png,reference,width,height,super2,nativeFocus},photo,variant};
+}
 function startRestoration(useCpu, fallbackMessage = '') {
   if (restoreButton.disabled) return;
   useCpu ||= !navigator.gpu;
@@ -3078,22 +3115,7 @@ function startRestoration(useCpu, fallbackMessage = '') {
     if (data.calibrated) saveCalibration(data.calibrated);
     try {
       if (!data.png) throw Error(data.error);
-      restoreOriginal = await createImageBitmap(photo);
-      restoredBitmap = await createImageBitmap(data.png);
-      enlargedRestoration = !!data.super2;
-      nativeRestoration = !!data.nativeFocus || enlargedRestoration;
-      if (!nativeRestoration) {
-        restoreReference = await createImageBitmap(data.reference);
-        correction = makeCorrectionField(restoreReference, restoredBitmap, data.width, data.height, variant);
-      }
-      restoreFile = photo;
-      const previewSource = enlargedRestoration ? restoredBitmap : restoreOriginal;
-      const scale = editorPreviewScale(previewSource.width, previewSource.height);
-      restorePreview.width = Math.max(1, Math.round(previewSource.width * scale));
-      restorePreview.height = Math.max(1, Math.round(previewSource.height * scale));
-      restoreStrength.value = enlargedRestoration ? '100' : '50';
-      restoreStrength.oninput();
-      restoreResult.hidden = false;
+      await showRestoration(data,photo,variant);
       restoreStatus.textContent = enlargedRestoration ? 'Superresolución IA ×2 · salida: ' + restoredBitmap.width + ' × ' + restoredBitmap.height + ' px · ' + data.route + ' · ' + (data.processingMs / 1000).toFixed(1) + ' s de procesamiento. ' + (data.timing ? data.timing.blocks + ' bloques de ' + data.core + ' px · entrada GPU: ' + (data.uploadByTile ? 'por bloques' : 'foto completa') + ' · hilos lógicos informados: ' + (data.cpuThreads ?? 'sin dato') + ' · preparación y envío: ' + Math.round(data.timing.uploadMs) + ' ms · llamada al modelo: ' + Math.round(data.timing.runMs) + ' ms · composición y sincronización: ' + Math.round(data.timing.finishMs) + ' ms · PNG: ' + Math.round(data.timing.pngMs) + ' ms · descansos: ' + Math.round(data.timing.restMs) + ' ms.' : '') : data.duration !== undefined ? 'Nitidez en ' + data.route + ' · ' + data.duration + ' ms · entrada: ' + data.width + ' × ' + data.height + ' px.' : 'Modelo ejecutado en ' + data.route + ' · primer bloque: ' + data.firstTileMs + ' ms · bloque: ' + data.core + ' px · entrada de IA: ' + data.width + ' × ' + data.height + ' px.';
       if (data.hybrid) {
         if (!enlargedRestoration) restoreStatus.textContent = 'Restauración · ' + (data.processingMs/1000).toFixed(1) + ' s · bloques de ' + data.core + ' px.';
@@ -3308,7 +3330,9 @@ useComposite.onclick=()=>{
 };
 
 function busy(value) {
+  const completed=editorBusy && !value;
   editorBusy = value;
+  if (completed) saveLatestWork();
   openOriginalEdge.hidden = !workingPhoto;
   openOriginalEdge.disabled = value;
   applyFrame.disabled = frameOriginal.disabled = frameCutout.disabled = frameComposite.disabled = value;
@@ -3338,15 +3362,24 @@ function busy(value) {
   fine.disabled = value;
   background.disabled = catalogBackground.disabled = value;
   refreshMeshControls();
-  composeButton.disabled = value || !cutoutBlob || (!catalogBackground.value.trim() && (!background.files[0] || background.files[0].size > 20000000));
+  composeButton.disabled = value || !cutoutBlob || (!catalogBackground.value.trim() && (!(background.files[0] || draftBackground) || (background.files[0] || draftBackground).size > 20000000));
   picker.disabled = value;
   cut.disabled = value || !workingPhoto;
   cutCpu.disabled = cut.disabled;
   cutPortrait.disabled = cut.disabled;
 }
 picker.onchange = () => {
-  setWorkingPhoto(picker.files[0], 'Original');
-  if (workingPhoto) selectWorkspaceTool('frame');
+  const file=picker.files[0];
+  if (!file) return;
+  if (file.size>20000000) {
+    workspaceStatus.textContent='La foto supera el límite de 20 MB.';
+    return;
+  }
+  draftBackground=undefined;
+  background.value='';
+  setWorkingPhoto(file,file.name || 'Foto original');
+  selectWorkspaceTool('frame');
+  saveLatestWork();
 };
 
 function setWorkingPhoto(file, label, fromEdit = false) {
@@ -3545,6 +3578,7 @@ function modelWorkerCode(id) {
 }
 
 let workspaceTab = 'frame';
+let draftBackground;
 let savedCutoutActive = false;
 const workspacePanels = new Map();
 const workspaceButtons = new Map();
@@ -3662,6 +3696,7 @@ function selectWorkspaceTool(key) {
     openFraming(savedCutoutActive && cutoutBlob ? after : before,'Elegí la proporción y ajustá el encuadre.');
   }
   syncWorkspaceView();
+  queueAutosave();
 }
 
 function syncWorkspaceView() {
@@ -3687,19 +3722,21 @@ for (const node of [...workspaceViews,framing,restoreResult,restoreButton,photoS
 }
 new ResizeObserver(([entry]) => {
   stage.style.setProperty('--stage-height',entry.contentRect.height+'px');
+  if (frameImage && workspaceTab==='frame') showFramePreview();
   if (marking) drawStrokes();
   if (eraseMode) showEraseMarks();
 }).observe(stage);
 
+let openEditDatabase;
 const editDatabase = new Promise((resolve,reject) => {
   const request = indexedDB.open('agarsito-local-edits',1);
   request.onupgradeneeded = () => request.result.createObjectStore('drafts');
-  request.onsuccess = () => resolve(request.result);
+  request.onsuccess = () => { openEditDatabase=request.result; resolve(openEditDatabase); };
   request.onerror = () => reject(request.error);
   request.onblocked = () => reject(Error('Cerrá las otras pestañas del editor e intentá de nuevo.'));
 });
 async function editCheckpoint(value) {
-  const db = await editDatabase;
+  const db = openEditDatabase || await editDatabase;
   return new Promise((resolve,reject) => {
     const transaction = db.transaction('drafts',value ? 'readwrite' : 'readonly');
     const store = transaction.objectStore('drafts');
@@ -3708,19 +3745,152 @@ async function editCheckpoint(value) {
     transaction.onabort = () => reject(transaction.error || Error('No se pudo acceder al avance.'));
   });
 }
-editCheckpoint().then(draft => { resumeEdit.hidden = !draft; }).catch(() => {});
-resumeEdit.onclick = async () => {
-  if (editorBusy) return;
+let restoringDraft=false, autosaveTimer;
+const storageManager=navigator.storage;
+let protectedStorage=false;
+const persistentButton=document.createElement('button');
+persistentButton.textContent='Proteger guardado';
+const storageNotice=document.createElement('p');
+storageNotice.className='editor-storage-notice';
+storageNotice.setAttribute('role','status');
+storageNotice.hidden=true;
+header.append(persistentButton,storageNotice);
+
+function storageProblem(error) {
+  storageNotice.textContent=error?.name==='QuotaExceededError'
+    ? 'Falta espacio para guardar el avance. Liberá almacenamiento o descargá una copia.'
+    : 'El navegador bloqueó el guardado. Probá en Safari o Chrome en modo normal, o descargá una copia.';
+  storageNotice.hidden=false;
+}
+storageManager?.persisted?.().then(persistent=>{
+  protectedStorage=persistent;
+  persistentButton.hidden=persistent;
+}).catch(()=>{});
+persistentButton.onclick=async()=>{
   try {
-    const draft = await editCheckpoint();
-    if (!draft || editorBusy) return;
+    protectedStorage=!!(await storageManager?.persist?.());
+    persistentButton.hidden=protectedStorage;
+    storageNotice.textContent=protectedStorage
+      ? 'El navegador activó el almacenamiento persistente.'
+      : 'El navegador no concedió protección adicional. El guardado local sigue disponible cuando IndexedDB funciona.';
+    storageNotice.hidden=false;
+    if (workingPhoto) saveLatestWork();
+  } catch(error) { storageProblem(error); }
+};
+
+function latestWork() {
+  const frameSources=[before,after,composite];
+  return {
+    version:2,photo:workingPhoto,cutout:cutoutBlob,cutoutActive:savedCutoutActive,tab:workspaceTab,
+    previousCutout,composedResult,compositeBlob,meshResult,standaloneEdge,
+    frame:frameImage ? {source:frameSources.indexOf(frameImage),values:frameControls.map(control=>control.value),fill:frameFill?.image} : undefined,
+    colors:colorSliders.map(slider=>slider.value),showColor:compareColor.checked,
+    restoration:restoreDraftData ? {...restoreDraftData,strength:restoreStrength.value} : undefined,
+    catalogBackground:catalogBackground.value,catalogMesh:catalogMesh.value,background:background.files[0] || draftBackground,
+    strokes,marking,eraseStrokes,eraseMode
+  };
+}
+
+function saveLatestWork() {
+  clearTimeout(autosaveTimer);
+  if (!workingPhoto || restoringDraft || editorBusy) return;
+  editCheckpoint(latestWork()).then(()=>{
+    resumeEdit.hidden=false;
+    if (storageNotice.dataset.failed) {
+      storageNotice.hidden=true;
+      delete storageNotice.dataset.failed;
+    }
+  }).catch(error=>{
+    storageNotice.dataset.failed='1';
+    storageProblem(error);
+  });
+}
+function queueAutosave() {
+  if (restoringDraft || !workingPhoto) return;
+  clearTimeout(autosaveTimer);
+  autosaveTimer=setTimeout(saveLatestWork,180);
+}
+document.addEventListener('visibilitychange',()=>{
+  if (document.visibilityState==='hidden') saveLatestWork();
+});
+window.addEventListener('pagehide',saveLatestWork);
+editor.addEventListener('input',queueAutosave);
+editor.addEventListener('change',saveLatestWork);
+for (const canvas of [guideCanvas,eraseGuide]) canvas.addEventListener('lostpointercapture',saveLatestWork);
+
+async function recoverWork(draft) {
+  if (!draft?.photo || editorBusy || restoringDraft) return;
+  restoringDraft=true;
+  try {
     setWorkingPhoto(draft.photo,'Avance recuperado',true);
+    busy(true);
     if (draft.cutout) showCutout(draft.cutout);
-    savedCutoutActive = !!draft.cutoutActive;
-    refreshColorSource();
-    selectWorkspaceTool(draft.cutoutActive ? 'cut' : 'frame');
-    workspaceStatus.textContent = 'Avance recuperado de este navegador.';
-  } catch (error) { workspaceStatus.textContent = 'No se pudo recuperar el avance. '+error.message; }
+    savedCutoutActive=!!draft.cutoutActive;
+    previousCutout=draft.previousCutout;
+    if (draft.version===2) {
+      draftBackground=draft.background;
+      catalogBackground.value=draft.catalogBackground || '';
+      catalogMesh.value=draft.catalogMesh || '';
+      standaloneEdge=!!draft.standaloneEdge;
+      if (draft.composedResult || standaloneEdge) {
+        composition.hidden=false;
+        if (draft.composedResult) showComposition(draft.composedResult,draft.compositeBlob);
+        else {
+          composite.src=savedCutoutActive ? outputUrl : originalUrl;
+          compositeView.hidden=false;
+          hairTools.hidden=false;
+        }
+      }
+      if (draft.meshResult) showMesh(draft.meshResult);
+      strokes=draft.strokes || [];
+      marking=!!draft.marking;
+      refreshHairControls();
+      if (draft.eraseMode && cutoutBlob) {
+        eraseStrokes=draft.eraseStrokes || [];
+        setEraseMode(true);
+      }
+      if (draft.frame) {
+        const source=[before,after,composite][draft.frame.source];
+        if (source?.getAttribute('src')) {
+          await openFraming(source,'Encuadre recuperado');
+          if (frameImage) {
+            frameControls.forEach((control,i)=>{if (draft.frame.values[i]!=null) control.value=draft.frame.values[i];});
+            showFramePreview();
+            if (draft.frame.fill) {
+              frameFill={image:draft.frame.fill,bitmap:await createImageBitmap(draft.frame.fill)};
+              showFramePreview();
+            }
+          }
+        }
+      }
+      if (draft.restoration) {
+        const {data,photo,variant,strength}=draft.restoration;
+        restoreMode.value=variant;
+        await showRestoration(data,photo,variant,strength);
+      }
+    }
+    await refreshColorSource();
+    if (draft.colors) colorSliders.forEach((slider,i)=>{slider.value=draft.colors[i] || '0';});
+    if (typeof draft.showColor==='boolean') compareColor.checked=draft.showColor;
+    redrawColors();
+    selectWorkspaceTool(workspacePanels.has(draft.tab) ? draft.tab : draft.cutoutActive ? 'cut' : 'frame');
+    workspaceStatus.textContent='Avance recuperado de este navegador.';
+  } catch(error) {
+    storageNotice.textContent='Se recuperó la foto. Parte de los ajustes no pudo abrirse.';
+    storageNotice.hidden=false;
+  } finally {
+    busy(false);
+    restoringDraft=false;
+    syncWorkspaceView();
+  }
+}
+editCheckpoint().then(draft=>{
+  resumeEdit.hidden=!draft;
+  if (!workingPhoto && draft) return recoverWork(draft);
+}).catch(storageProblem);
+resumeEdit.onclick=async()=>{
+  try { await recoverWork(await editCheckpoint()); }
+  catch(error) { storageProblem(error); }
 };
 
 async function workspaceOutput() {
