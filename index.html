@@ -60,7 +60,10 @@ main.agarsito-editor {width:min(1440px,100%);max-width:none;height:100dvh;margin
 .editor-panel details {font-size:.9rem;margin:.5rem 0}
 .editor-panel summary {cursor:pointer;color:#234b3b}
 .editor-footer {min-height:36px}
-.editor-footer div {display:flex;gap:5px}
+.editor-footer div {display:flex;flex-wrap:wrap;gap:5px}
+.agarsito-editor[data-sliders-locked] input[type=range] {pointer-events:none;opacity:.48}
+.editor-footer #lock-sliders {background:#dce9df;color:#214336}
+.editor-footer #lock-sliders[aria-pressed=true] {background:#244e3e;color:#fff}
 .editor-footer p {font-size:.77rem;color:#435950;margin:0;max-width:100%;overflow-wrap:anywhere}
 .editor-footer button:last-child,.editor-header button {background:#dce9df;color:#214336}
 .agarsito-editor button:disabled {opacity:.5;cursor:default}
@@ -3622,9 +3625,13 @@ const saveWorkspace = document.createElement('button');
 saveWorkspace.textContent = 'Guardar avance';
 const exportWorkspace = document.createElement('button');
 exportWorkspace.textContent = 'Descargar';
+const lockSliders=document.createElement('button');
+lockSliders.type='button';
+lockSliders.id='lock-sliders';
+lockSliders.setAttribute('aria-label','Bloquear deslizadores');
 const workspaceStatus = document.createElement('p');
 workspaceStatus.setAttribute('role','status');
-actions.append(saveWorkspace,exportWorkspace);
+actions.append(saveWorkspace,exportWorkspace,lockSliders);
 footer.append(actions,workspaceStatus);
 
 const fineControls = fine.closest('p');
@@ -3678,6 +3685,23 @@ for (const action of [saveFrame,download,saveComposite,saveMesh,restoreSave,useC
 for (const workerScript of diagnosticResult.querySelectorAll('script')) editor.append(workerScript);
 editor.prepend(header,workspaceBody,footer);
 editor.classList.add('agarsito-editor');
+const sliderLockKey='agarsito-slider-lock-v1';
+const editorSliders=editor.querySelectorAll('input[type="range"]');
+function setSliderLock(locked) {
+  if (locked && [...editorSliders].includes(document.activeElement)) lockSliders.focus();
+  editor.toggleAttribute('data-sliders-locked',locked);
+  lockSliders.setAttribute('aria-pressed',String(locked));
+  lockSliders.textContent=locked ? 'Barras bloqueadas' : 'Bloquear barras';
+  for (const slider of editorSliders) slider.toggleAttribute('inert',locked);
+}
+let slidersLocked=false;
+try { slidersLocked=localStorage.getItem(sliderLockKey)==='1'; } catch {}
+setSliderLock(slidersLocked);
+lockSliders.onclick=()=>{
+  slidersLocked=!slidersLocked;
+  setSliderLock(slidersLocked);
+  try { localStorage.setItem(sliderLockKey,slidersLocked ? '1' : '0'); } catch {}
+};
 oldPreviews.remove();
 
 function activeEditingBlob() {
