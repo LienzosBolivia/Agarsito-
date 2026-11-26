@@ -143,7 +143,8 @@ main.agarsito-editor {width:min(1440px,100%);max-width:none;height:100dvh;margin
 <p>La mejora se aplica sobre la foto original para conservar su textura. La intensidad también afecta el rostro.</p>
 <label for="restore-mode">Modelo</label>
 <select id="restore-mode">
-<option value="super2">Superresolución IA ×2 (más píxeles)</option>
+<option value="fsrcnn">FSRCNN ×2 (liviano)</option>
+<option value="super2" selected>Superresolución IA ×2 (más píxeles)</option>
 <option value="focus">Recuperar enfoque sin alisar piel</option>
 <option value="fast">Nitidez rápida en GPU</option>
 <option value="light">Mejora suave de píxeles</option>
@@ -766,9 +767,90 @@ async function waitForRestorationResume() {
     await new Promise(resolve => { resumeProcessing = resolve; });
   }
 }
+function fsrcnnLuma(r,g,b) {
+  return 0.299*r+0.587*g+0.114*b;
+}
+
+async function runFsrcnn(image,adapter,modelUrl,started) {
+  const {width,height}=image;
+  const backend=adapter ? 'webgpu' : 'wasm';
+  const route='FSRCNN ×2 · '+(adapter ? 'WebGPU' : 'CPU/WASM');
+  const runtime='https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
+  self.postMessage({phase:'Preparando '+route+'…'});
+  const model=await loadVerifiedModel(modelUrl,'422da1d606efa65c9a2db14d9dc3f641fd4cdd8a71a32ba1204e3dfb7d458bb4');
+  const ort=await import(runtime+(adapter ? 'ort.webgpu.min.mjs' : 'ort.wasm.min.mjs'));
+  ort.env.wasm.wasmPaths=runtime;
+  ort.env.wasm.numThreads=1;
+  if (adapter) ort.env.webgpu.adapter=adapter;
+  const session=await ort.InferenceSession.create(model,{
+    executionProviders:adapter ? [{name:'webgpu',preferredLayout:'NCHW'}] : ['wasm'],
+    ...(adapter ? {extra:{session:{disable_cpu_ep_fallback:'1'}}} : {})
+  });
+  const halo=6;
+  const limit=adapter ? Math.min(adapter.limits.maxStorageBufferBindingSize,adapter.limits.maxBufferSize) : Infinity;
+  const core=[192,128,96,64,32].find(side=>(side+2*halo)**2*56*4<=limit);
+  let completed=0;
+  try {
+    if (!core) throw Error('La GPU no admite el tamaño mínimo de FSRCNN.');
+    const source=new OffscreenCanvas(width,height).getContext('2d',{willReadFrequently:true});
+    const result=new OffscreenCanvas(width*2,height*2).getContext('2d',{willReadFrequently:true});
+    source.drawImage(image,0,0);
+    result.imageSmoothingQuality='high';
+    result.drawImage(image,0,0,width*2,height*2);
+    for (let y=0;y<height;y+=core) {
+      for (let x=0;x<width;x+=core) {
+        await waitForRestorationResume();
+        const cw=Math.min(core,width-x), ch=Math.min(core,height-y);
+        const left=Math.max(0,x-halo), top=Math.max(0,y-halo);
+        const w=Math.min(width,x+cw+halo)-left, h=Math.min(height,y+ch+halo)-top;
+        const rgba=source.getImageData(left,top,w,h).data;
+        const plane=w*h;
+        const luma=new Float32Array(plane);
+        for (let i=0;i<plane;i++) luma[i]=fsrcnnLuma(rgba[4*i],rgba[4*i+1],rgba[4*i+2])/255;
+        const input=new ort.Tensor('float32',luma,[1,1,h,w]);
+        let predictions;
+        try {
+          predictions=await session.run({luma:input});
+          const prediction=predictions.phases;
+          const data=prediction.location==='cpu' ? prediction.data : await prediction.getData();
+          if (prediction.dims.join(',')!==[1,4,h,w].join(',') || !data.every(Number.isFinite)) {
+            throw Error('FSRCNN devolvió un bloque inválido.');
+          }
+          const tile=result.getImageData(x*2,y*2,cw*2,ch*2);
+          for (let dy=0;dy<ch*2;dy++) {
+            for (let dx=0;dx<cw*2;dx++) {
+              const phase=(dy%2)*2+dx%2;
+              const lumaIndex=(y-top+(dy>>1))*w+x-left+(dx>>1);
+              const i=(dy*tile.width+dx)*4;
+              if (!tile.data[i+3]) continue;
+              const r=tile.data[i],g=tile.data[i+1],b=tile.data[i+2];
+              const delta=data[phase*plane+lumaIndex]*255-fsrcnnLuma(r,g,b);
+              const bounded=Math.max(-Math.min(r,g,b),Math.min(255-Math.max(r,g,b),delta));
+              tile.data[i]=r+bounded;
+              tile.data[i+1]=g+bounded;
+              tile.data[i+2]=b+bounded;
+            }
+          }
+          result.putImageData(tile,x*2,y*2);
+        } finally {
+          input.dispose();
+          for (const tensor of Object.values(predictions || {})) tensor.dispose();
+        }
+        completed+=cw*ch;
+        self.postMessage({progress:Math.round(100*completed/(width*height)),backend,route,core});
+        await new Promise(resolve=>setTimeout(resolve,0));
+      }
+    }
+    const png=await result.canvas.convertToBlob({type:'image/png'});
+    self.postMessage({png,super2:true,route,width,height,processingMs:Math.round(performance.now()-started)});
+  } finally {
+    await session.release();
+  }
+}
+
 self.onmessage = async ({data}) => {
   if (data.hybridCpuTask) return runHybridCpu(data);
-  const {photo,variant,useCpu,probeMiB,diagnostic,control,hybrid,calibration = {}} = data;
+  const {photo,variant,useCpu,probeMiB,diagnostic,control,hybrid,fsrcnnUrl,calibration = {}} = data;
   if (control) {
     paused = control === 'pause';
     if (!paused) {
@@ -786,14 +868,16 @@ self.onmessage = async ({data}) => {
     const bindingLimit = adapter ? Math.min(adapter.limits.maxStorageBufferBindingSize, adapter.limits.maxBufferSize) : Infinity;
     const nativeFocus = variant === 'focus' && !diagnostic;
     const super2 = variant === 'super2' && !diagnostic;
+    const fsrcnn = variant === 'fsrcnn' && !diagnostic;
     const quick = (variant === 'fast' || nativeFocus) && !diagnostic;
     const combine = hybrid && !useCpu && !quick && !diagnostic;
     const plan = restorationPlan(probeMiB, 4866418, bindingLimit);
     if (!diagnostic) image = await createImageBitmap(photo);
     if (image && (image.width * image.height > 16000000 || Math.max(image.width,image.height) > 8192)) throw Error('La foto supera el tamaño admitido.');
-    if (super2 && (image.width*image.height > 4000000 || Math.max(image.width,image.height) > 4096)) {
+    if ((super2 || fsrcnn) && (image.width*image.height > 4000000 || Math.max(image.width,image.height) > 4096)) {
       throw Error('Para ampliar ×2, la foto debe tener como máximo 4 megapíxeles y 4096 px por lado. Podés encuadrarla primero.');
     }
+    if (fsrcnn) return await runFsrcnn(image,adapter,fsrcnnUrl,processingStarted);
     const scale = (nativeFocus || super2) ? 1 : Math.min(1, (quick ? Math.min(1600, Math.floor(Math.sqrt(Math.min(bindingLimit / 4, (probeMiB || 24) * 1048576 * 0.7 / 12)))) : plan.maxSide) / (image ? Math.max(image.width, image.height) : 48));
     const width = Math.max(1, Math.round((image?.width || 48) * scale));
     const height = Math.max(1, Math.round((image?.height || 48) * scale));
@@ -3080,7 +3164,7 @@ function startRestoration(useCpu, fallbackMessage = '') {
   const photo = activeEditingBlob();
   const variant = restoreMode.value;
   const hybrid = !useCpu && !restoreHybridOption.hidden && restoreHybrid.checked;
-  const pausable = variant === 'super2' || hybrid;
+  const pausable = ['super2','fsrcnn'].includes(variant) || hybrid;
   const code = modelWorkerCode('restore-worker');
   const url = URL.createObjectURL(new Blob([code], {type: 'text/javascript'}));
   let worker, timer, finished = false;
@@ -3142,7 +3226,7 @@ function startRestoration(useCpu, fallbackMessage = '') {
       }
       if (data.phase) restoreStatus.textContent = data.phase;
       else if (data.progress === undefined) finish(data);
-      else restoreStatus.textContent = 'Procesando en ' + (data.route || (data.backend === 'webgpu' ? 'WebGPU' : 'CPU/WASM')) + (data.backend === 'webgpu' ? ' · presupuesto estimado: ' + data.budget.toFixed(1) + ' MiB de referencia' : '') + ' · bloque: ' + data.core + ' px · ' + data.progress + ' %' + (data.gpuBlocks === undefined ? '' : ' · GPU: ' + data.gpuBlocks + ' · CPU: ' + data.cpuBlocks);
+      else restoreStatus.textContent = 'Procesando en ' + (data.route || (data.backend === 'webgpu' ? 'WebGPU' : 'CPU/WASM')) + (data.backend === 'webgpu' && Number.isFinite(data.budget) ? ' · presupuesto estimado: ' + data.budget.toFixed(1) + ' MiB de referencia' : '') + ' · bloque: ' + data.core + ' px · ' + data.progress + ' %' + (data.gpuBlocks === undefined ? '' : ' · GPU: ' + data.gpuBlocks + ' · CPU: ' + data.cpuBlocks);
     };
     worker.onerror = () => finish({error: 'El navegador interrumpió la mejora.',cpuFallback:!useCpu});
     restartTimer();
@@ -3156,7 +3240,8 @@ function startRestoration(useCpu, fallbackMessage = '') {
       document.addEventListener('visibilitychange', syncPause);
       syncPause();
     }
-    worker.postMessage({photo,variant,useCpu,hybrid,calibration:readCalibration(),probeMiB:profile?.probeMiB});
+    worker.postMessage({photo,variant,useCpu,hybrid,calibration:readCalibration(),probeMiB:profile?.probeMiB,
+      fsrcnnUrl:new URL('models/fsrcnn-x2.onnx',document.baseURI).href});
   } catch (error) { finish({error: error.message}); }
 };
 async function finishRestoration(continueEditing) {
