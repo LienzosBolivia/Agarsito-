@@ -1443,19 +1443,61 @@ function alongFrameEdge(edge,position,depth) {
     : [edge.x+edge.direction*depth,edge.y+position];
 }
 
-function frameEdgeGuide(source,edge,stride) {
-  const depth = Math.min(stride+2,edge.inside-1);
+function readFrameEdge(source,edge,depth) {
   const [ox,oy] = alongFrameEdge(edge,0,edge.direction>0 ? -depth : 0);
   const w = edge.horizontal ? edge.length : depth+1;
   const h = edge.horizontal ? depth+1 : edge.length;
   const ctx = new OffscreenCanvas(w,h).getContext('2d',{willReadFrequently:true});
   ctx.drawImage(source,-ox,-oy);
   const {data} = ctx.getImageData(0,0,w,h);
-  function index(position,inset) {
+  return {data,index(position,inset) {
     const along = Math.round(Math.max(0,Math.min(edge.length-1,position)));
     const cross = edge.direction>0 ? depth-inset : inset;
     return (edge.horizontal ? cross*w+along : along*w+cross)*4;
+  }};
+}
+
+function cleanFrameBoundary(source,known) {
+  const clean={...known};
+  const luminance=(data,i)=>0.2126*data[i]+0.7152*data[i+1]+0.0722*data[i+2];
+  for (const edge of frameEdges(source.width,source.height,known)) {
+    if (edge.length<24 || edge.inside<24) continue;
+    const search=Math.min(10,Math.max(3,Math.round(edge.inside*0.008)));
+    const {data,index}=readFrameEdge(source,edge,search+7);
+    const step=Math.max(1,Math.floor(edge.length/320));
+    const skip=Math.floor(edge.length*0.04);
+    let trim=0;
+    for (let inset=0;inset<search;inset++) {
+      let dark=0, shadow=0, eligible=0;
+      for (let s=skip;s<edge.length-skip;s+=step) {
+        const pixel=index(s,inset), near=index(s,inset+3), far=index(s,inset+7);
+        if (data[near+3]<220 || data[far+3]<220) continue;
+        const current=luminance(data,pixel);
+        const reference=Math.min(luminance(data,near),luminance(data,far));
+        if (reference<12) continue;
+        eligible++;
+        if (data[pixel+3]<110 || (current<28 && reference-current>=8)) dark++;
+        if (current<reference*0.81 && reference-current>=9) shadow++;
+      }
+      const enough=eligible>=Math.max(8,(edge.length-2*skip)/step*0.40);
+      if (enough && (dark/eligible>=0.73 || shadow/eligible>=0.87)) trim=inset+1;
+    }
+    if (!trim) continue;
+    // Treat an artificial edge stripe as part of the outpaint mask.
+    if (edge.horizontal) {
+      clean.height-=trim;
+      if (edge.direction<0) clean.y+=trim;
+    } else {
+      clean.width-=trim;
+      if (edge.direction<0) clean.x+=trim;
+    }
   }
+  return clean;
+}
+
+function frameEdgeGuide(source,edge,stride) {
+  const depth = Math.min(stride+2,edge.inside-1);
+  const {data,index}=readFrameEdge(source,edge,depth);
   const step = 12;
   const slopes = [];
   for (let anchor=0;anchor<edge.length+step;anchor+=step) {
@@ -1519,6 +1561,7 @@ async function extendFrame(photo, known) {
       throw Error('Reducí el lienzo a un máximo de 16 megapíxeles y 8192 px por lado.');
     }
     if (!known || known.width <= 0 || known.height <= 0) throw Error('El encuadre debe incluir parte de la foto.');
+    const sourceRegion = cleanFrameBoundary(bitmap,known);
     const scale = Math.min(1,512/Math.max(width,height));
     const w = Math.max(1,Math.round(width*scale)), h = Math.max(1,Math.round(height*scale));
     const plane = w*h;
@@ -1527,9 +1570,9 @@ async function extendFrame(photo, known) {
     const rgba = sample.getImageData(0,0,w,h).data;
     const rgb = new Uint8Array(plane*3);
     const mask = new Uint8Array(plane);
-    const left = Math.ceil(known.x*w/width), top = Math.ceil(known.y*h/height);
-    const right = Math.floor((known.x+known.width)*w/width);
-    const bottom = Math.floor((known.y+known.height)*h/height);
+    const left = Math.ceil(sourceRegion.x*w/width), top = Math.ceil(sourceRegion.y*h/height);
+    const right = Math.floor((sourceRegion.x+sourceRegion.width)*w/width);
+    const bottom = Math.floor((sourceRegion.y+sourceRegion.height)*h/height);
     if (left >= right || top >= bottom) throw Error('El encuadre necesita más área de la foto como referencia.');
     for (let y=top;y<bottom;y++) {
       for (let x=left;x<right;x++) {
@@ -1573,10 +1616,11 @@ async function extendFrame(photo, known) {
     const ctx = new OffscreenCanvas(width,height).getContext('2d');
     ctx.imageSmoothingQuality = 'high';
     ctx.drawImage(sample.canvas,0,0,width,height);
-    blendExtendedFrame(ctx,bitmap,known);
-    // Restore the source rectangle at 1:1, including any transparent pixels it contains.
-    ctx.clearRect(known.x,known.y,known.width,known.height);
-    ctx.drawImage(bitmap,0,0);
+    blendExtendedFrame(ctx,bitmap,sourceRegion);
+    // Copy the protected pixels at 1:1 without putting the removed stripe back.
+    const {x,y,width:wSource,height:hSource}=sourceRegion;
+    ctx.clearRect(x,y,wSource,hSource);
+    ctx.drawImage(bitmap,x,y,wSource,hSource,x,y,wSource,hSource);
     return await ctx.canvas.convertToBlob({type:'image/png'});
   } finally {
     bitmap.close();
