@@ -1428,6 +1428,88 @@ async function openMiganSession() {
   return {ort,session};
 }
 
+function frameEdges(width,height,{x,y,width:w,height:h}) {
+  return [
+    {x,y,length:w,inside:h,margin:y,horizontal:true,direction:-1},
+    {x,y:y+h-1,length:w,inside:h,margin:height-y-h,horizontal:true,direction:1},
+    {x,y,length:h,inside:w,margin:x,horizontal:false,direction:-1},
+    {x:x+w-1,y,length:h,inside:w,margin:width-x-w,horizontal:false,direction:1}
+  ].filter(edge=>edge.margin>0);
+}
+
+function alongFrameEdge(edge,position,depth) {
+  return edge.horizontal
+    ? [edge.x+position,edge.y+edge.direction*depth]
+    : [edge.x+edge.direction*depth,edge.y+position];
+}
+
+function frameEdgeGuide(source,edge,stride) {
+  const depth = Math.min(stride+2,edge.inside-1);
+  const [ox,oy] = alongFrameEdge(edge,0,edge.direction>0 ? -depth : 0);
+  const w = edge.horizontal ? edge.length : depth+1;
+  const h = edge.horizontal ? depth+1 : edge.length;
+  const ctx = new OffscreenCanvas(w,h).getContext('2d',{willReadFrequently:true});
+  ctx.drawImage(source,-ox,-oy);
+  const {data} = ctx.getImageData(0,0,w,h);
+  function index(position,inset) {
+    const along = Math.round(Math.max(0,Math.min(edge.length-1,position)));
+    const cross = edge.direction>0 ? depth-inset : inset;
+    return (edge.horizontal ? cross*w+along : along*w+cross)*4;
+  }
+  const step = 12;
+  const slopes = [];
+  for (let anchor=0;anchor<edge.length+step;anchor+=step) {
+    let bestShift=0, bestError=Infinity;
+    if (depth>2) {
+      for (let shift=-5;shift<=5;shift++) {
+        let error=0.6*shift*shift, compared=0;
+        for (let s=anchor-step;s<=anchor+step;s+=2) {
+          if (s<0 || s>=edge.length || s-shift<0 || s-shift>=edge.length) continue;
+          const near=index(s,1), far=index(s-shift,depth);
+          if (data[near+3]<240 || data[far+3]<240) continue;
+          compared++;
+          for (let c=0;c<3;c++) error+=Math.min(45,Math.abs(data[near+c]-data[far+c]));
+        }
+        if (compared>=4 && error/compared<bestError) {
+          bestError=error/compared;
+          bestShift=shift;
+        }
+      }
+    }
+    slopes.push(bestShift/Math.max(1,depth-1));
+  }
+  return (position,distance)=>{
+    const anchor=Math.floor(position/step), fraction=(position%step)/step;
+    const slope=slopes[anchor]*(1-fraction)+slopes[anchor+1]*fraction;
+    const i=index(position-slope*distance,0);
+    return data.subarray(i,i+4);
+  };
+}
+
+function blendExtendedFrame(ctx,bitmap,known) {
+  const {width,height}=bitmap;
+  const limit=Math.max(6,Math.min(40,Math.round(Math.max(width,height)*0.022)));
+  for (const edge of frameEdges(width,height,known)) {
+    const depth=Math.min(limit,edge.margin);
+    const guide=frameEdgeGuide(bitmap,edge,Math.max(7,Math.round(limit*0.55)));
+    const [x,y]=alongFrameEdge(edge,0,edge.direction<0 ? depth : 1);
+    const w=edge.horizontal ? edge.length : depth;
+    const h=edge.horizontal ? depth : edge.length;
+    const strip=ctx.getImageData(x,y,w,h);
+    for (let s=0;s<edge.length;s++) {
+      for (let d=1;d<=depth;d++) {
+        const color=guide(s,d-1);
+        const [px,py]=alongFrameEdge(edge,s,d);
+        const index=((py-y)*w+px-x)*4;
+        const t=(d-1)/Math.max(1,depth-1);
+        const weight=(1-t*t*(3-2*t))*color[3]/255;
+        for (let c=0;c<3;c++) strip.data[index+c]+=(color[c]-strip.data[index+c])*weight;
+      }
+    }
+    ctx.putImageData(strip,x,y);
+  }
+}
+
 async function extendFrame(photo, known) {
   const bitmap = await createImageBitmap(photo);
   let session, imageTensor, maskTensor, outputs;
@@ -1456,6 +1538,23 @@ async function extendFrame(photo, known) {
         for (let c=0;c<3;c++) rgb[c*plane+i]=rgba[i*4+c];
       }
     }
+    const scaledKnown={x:left,y:top,width:right-left,height:bottom-top};
+    for (const edge of frameEdges(w,h,scaledKnown)) {
+      // Give the model a short continuation of garment edges as conditioning.
+      const depth=Math.min(4,Math.floor(edge.margin/4));
+      if (!depth) continue;
+      const guide=frameEdgeGuide(sample.canvas,edge,8);
+      for (let s=0;s<edge.length;s++) {
+        for (let d=1;d<=depth;d++) {
+          const color=guide(s,d);
+          if (color[3]<240) continue;
+          const [px,py]=alongFrameEdge(edge,s,d);
+          const i=py*w+px;
+          mask[i]=255;
+          for (let c=0;c<3;c++) rgb[c*plane+i]=color[c];
+        }
+      }
+    }
     self.postMessage({progress:'Preparando MI-GAN para ampliar el encuadre…'});
     const runtime = await openMiganSession();
     session = runtime.session;
@@ -1474,6 +1573,7 @@ async function extendFrame(photo, known) {
     const ctx = new OffscreenCanvas(width,height).getContext('2d');
     ctx.imageSmoothingQuality = 'high';
     ctx.drawImage(sample.canvas,0,0,width,height);
+    blendExtendedFrame(ctx,bitmap,known);
     // Restore the source rectangle at 1:1, including any transparent pixels it contains.
     ctx.clearRect(known.x,known.y,known.width,known.height);
     ctx.drawImage(bitmap,0,0);
@@ -2286,7 +2386,7 @@ completeFrame.onclick = async () => {
     }
     frameFill?.bitmap.close();
     frameFill = {image,bitmap};
-    completeFrameStatus.textContent = 'Margen completado. Podés guardar el avance o descargarlo.';
+    completeFrameStatus.textContent = 'Margen integrado con la foto. Podés guardar el avance o descargarlo.';
     showFramePreview();
   } catch (error) {
     completeFrameStatus.textContent = error.message;
