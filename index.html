@@ -1007,8 +1007,63 @@ async function runFsrcnn(image,adapter,modelUrl,started,large) {
   }
 }
 
+async function applyMeshAtOriginalSize({photo,overlay}) {
+  const image=await createImageBitmap(photo);
+  let mesh,encoder,finished=false;
+  try {
+    const {width,height}=image;
+    if(width*height>64000000 || Math.max(width,height)>16384){
+      throw Error('La malla admite hasta 64 megapíxeles y 16.384 píxeles por lado.');
+    }
+    mesh=await createImageBitmap(overlay);
+    const large=width*height>16000000 || Math.max(width,height)>8192;
+    function draw(widthOut,heightOut) {
+      const ctx=new OffscreenCanvas(widthOut,heightOut).getContext('2d');
+      ctx.imageSmoothingQuality='high';
+      ctx.drawImage(image,0,0,widthOut,heightOut);
+      ctx.drawImage(mesh,0,0,widthOut,heightOut);
+      return ctx.canvas.convertToBlob({type:'image/png'});
+    }
+    if(!large) return {png:await draw(width,height),width,height};
+    encoder=createBandPng(width,height);
+    const bandHeight=64,tileWidth=Math.min(4096,width);
+    const canvas=new OffscreenCanvas(tileWidth,bandHeight);
+    const ctx=canvas.getContext('2d',{willReadFrequently:true});
+    ctx.imageSmoothingQuality='high';
+    for(let top=0;top<height;top+=bandHeight){
+      const rows=Math.min(bandHeight,height-top);
+      const band=new Uint8Array(width*rows*4);
+      for(let left=0;left<width;left+=tileWidth){
+        const cols=Math.min(tileWidth,width-left);
+        ctx.clearRect(0,0,tileWidth,bandHeight);
+        ctx.drawImage(image,left,top,cols,rows,0,0,cols,rows);
+        ctx.drawImage(mesh,-left,-top,width,height);
+        const {data}=ctx.getImageData(0,0,cols,rows);
+        const step=cols*4;
+        for(let row=0;row<rows;row++) band.set(data.subarray(row*step,(row+1)*step),(row*width+left)*4);
+      }
+      await encoder.write(band,rows);
+      self.postMessage({progress:Math.round(100*(top+rows)/height)});
+    }
+    const {png}=await encoder.finish();
+    finished=true;
+    const scale=Math.min(1,1600/Math.max(width,height));
+    const preview=await draw(Math.max(1,Math.round(width*scale)),Math.max(1,Math.round(height*scale)));
+    return {png,preview,width,height};
+  } finally {
+    if(!finished) await encoder?.abort();
+    mesh?.close();
+    image.close();
+  }
+}
+
 self.onmessage = async ({data}) => {
   if (data.hybridCpuTask) return runHybridCpu(data);
+  if (data.meshJob) {
+    try { self.postMessage(await applyMeshAtOriginalSize(data.meshJob)); }
+    catch(error) { self.postMessage({error:error.message}); }
+    return;
+  }
   if (data.bandExport) {
     try { self.postMessage({png:await exportRestorationBands(data.bandExport)}); }
     catch (error) { self.postMessage({error:error.message}); }
@@ -3279,7 +3334,7 @@ const meshView = document.querySelector('#mesh-view');
 const meshPreview = document.querySelector('#mesh-preview');
 const useMesh = document.querySelector('#use-mesh');
 const saveMesh = document.querySelector('#save-mesh');
-let meshResult, meshUrl;
+let meshResult,meshUrl,meshPreviewBlob,meshPreviewUrl;
 let catalog;
 
 async function catalogAsset(group, number) {
@@ -3311,16 +3366,19 @@ function refreshMeshControls() {
 }
 function clearMesh() {
   if (meshUrl) URL.revokeObjectURL(meshUrl);
-  meshUrl = meshResult = undefined;
+  if(meshPreviewUrl) URL.revokeObjectURL(meshPreviewUrl);
+  meshUrl=meshResult=meshPreviewBlob=meshPreviewUrl=undefined;
   meshPreview.removeAttribute('src');
   meshView.hidden = useMesh.hidden = saveMesh.hidden = true;
   saveMesh.removeAttribute('href');
   meshStatus.textContent = '';
 }
-function showMesh(png) {
-  meshResult = png;
-  meshUrl = URL.createObjectURL(meshResult);
-  meshPreview.src = meshUrl;
+function showMesh(png,preview) {
+  meshResult=png;
+  meshPreviewBlob=preview;
+  meshUrl=URL.createObjectURL(png);
+  meshPreviewUrl=preview ? URL.createObjectURL(preview) : undefined;
+  meshPreview.src=meshPreviewUrl || meshUrl;
   meshView.hidden = useMesh.hidden = false;
   saveMesh.href = meshUrl;
 }
@@ -3335,26 +3393,36 @@ meshButton.onclick = async () => {
   clearMesh();
   busy(true);
   meshStatus.textContent = 'Aplicando malla a resolución completa…';
-  let photo, overlay;
+  let worker,url,timeout;
   try {
-    photo = await createImageBitmap(source.blob);
-    if (photo.width * photo.height > 16000000 || Math.max(photo.width, photo.height) > 8192) {
-      throw Error('La foto supera los límites de tamaño del editor.');
-    }
-    overlay = await createImageBitmap(await catalogAsset('mallas', number));
-    const canvas = new OffscreenCanvas(photo.width, photo.height);
-    const ctx = canvas.getContext('2d', {alpha: true});
-    ctx.imageSmoothingQuality = 'high';
-    ctx.drawImage(photo, 0, 0);
-    ctx.drawImage(overlay, 0, 0, photo.width, photo.height);
-    showMesh(await canvas.convertToBlob({type:'image/png'}));
-    meshStatus.textContent = 'Malla aplicada: ' + photo.width + ' × ' + photo.height + ' px.';
-  } catch (error) {
+    const overlay=await catalogAsset('mallas',number);
+    url=URL.createObjectURL(new Blob([modelWorkerCode('restore-worker')],{type:'text/javascript'}));
+    worker=new Worker(url,{type:'module'});
+    const {png,preview,width,height}=await new Promise((resolve,reject)=>{
+      const watch=()=>{
+        clearTimeout(timeout);
+        timeout=setTimeout(()=>reject(Error('La malla dejó de avanzar. Mantené la pestaña abierta e intentá de nuevo.')),120000);
+      };
+      worker.onmessage=({data})=>{
+        if(Number.isFinite(data.progress)){
+          meshStatus.textContent='Aplicando malla por franjas · '+data.progress+' %';
+          watch();
+        } else if(data.png) resolve(data);
+        else reject(Error(data.error || 'No se pudo aplicar la malla.'));
+      };
+      worker.onerror=()=>reject(Error('El navegador interrumpió la aplicación de la malla.'));
+      watch();
+      worker.postMessage({meshJob:{photo:source.blob,overlay}});
+    });
+    showMesh(png,preview);
+    meshStatus.textContent='Malla aplicada: '+width+' × '+height+' px.';
+  } catch(error) {
     clearMesh();
-    meshStatus.textContent = error.message || 'No se pudo aplicar la malla.';
+    meshStatus.textContent=error.message || 'No se pudo aplicar la malla.';
   } finally {
-    photo?.close();
-    overlay?.close();
+    clearTimeout(timeout);
+    worker?.terminate();
+    if(url) URL.revokeObjectURL(url);
     busy(false);
   }
 };
@@ -4814,7 +4882,7 @@ function latestWork() {
   const frameSources=[before,after,composite];
   return {
     version:2,photo:workingPhoto,cutout:cutoutBlob,cutoutActive:savedCutoutActive,tab:workspaceTab,
-    previousCutout,composedResult,compositeBlob,meshResult,standaloneEdge,
+    previousCutout,composedResult,compositeBlob,meshResult,meshPreviewBlob,standaloneEdge,
     frame:frameImage ? {source:frameSources.indexOf(frameImage),values:frameControls.map(control=>control.value),fill:frameFill?.image} : undefined,
     colors:colorSliders.map(slider=>slider.value),showColor:compareColor.checked,backgroundColorIsolated:!!backgroundColorEdit,
     restoration:restoreDraftData ? {...restoreDraftData,showImproved:compareRestoration.checked,strength:restoreStrength.value} : undefined,
@@ -4873,7 +4941,7 @@ async function recoverWork(draft) {
           hairTools.hidden=false;
         }
       }
-      if (draft.meshResult) showMesh(draft.meshResult);
+      if (draft.meshResult) showMesh(draft.meshResult,draft.meshPreviewBlob);
       strokes=draft.strokes || [];
       marking=!!draft.marking;
       refreshHairControls();
