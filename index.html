@@ -1466,6 +1466,7 @@ self.onmessage = async ({data}) => {
 <label for="catalog-background">Fondo del catálogo N.º</label>
 <input id="catalog-background" inputmode="numeric" placeholder="1–26">
 <button id="compose" disabled>Aplicar fondo</button>
+<p id="background-source" role="status"></p>
 <p id="compose-status" role="status"></p>
 <figure id="composition-view" hidden><figcaption>Foto con el fondo elegido</figcaption><div id="composition-stage"><img id="composite" alt="Retrato con el fondo elegido"><canvas id="hair-guide" aria-label="Área para marcar el borde del cabello" hidden></canvas></div></figure>
 <div id="hair-tools" hidden>
@@ -2105,6 +2106,7 @@ self.onmessage = async ({data: {cutout, background, strokes, original, generate,
       throw new Error('El fondo supera los 16 megapíxeles o los 8192 píxeles por lado.');
     }
     const {width, height} = subject;
+    if (width*height>16000000 || Math.max(width,height)>8192) throw Error('La foto supera el tamaño admitido para colocar un fondo.');
     const canvas = new OffscreenCanvas(width, height);
     const ctx = canvas.getContext('2d', {alpha: false});
     ctx.fillStyle = '#fff';
@@ -2881,6 +2883,7 @@ function showCutout(png) {
   download.href = outputUrl;
   download.hidden = false;
   refreshMeshControls();
+  refreshComposeControls();
 }
 eraseApply.onclick = async () => {
   if (eraseApply.disabled || !cutoutBlob) return;
@@ -3097,11 +3100,66 @@ clearHair.onclick = () => {
 window.addEventListener('resize', drawStrokes);
 const composeButton = document.querySelector('#compose');
 const composeStatus = document.querySelector('#compose-status');
+const backgroundSource = document.querySelector('#background-source');
+const transparencyByPhoto = new WeakMap();
+
+async function photoHasTransparency(photo) {
+  const bitmap=await createImageBitmap(photo);
+  try {
+    if (bitmap.width*bitmap.height>16000000 || Math.max(bitmap.width,bitmap.height)>8192) {
+      throw Error('La foto supera el tamaño admitido para colocar un fondo.');
+    }
+    const maxRows=Math.min(64,bitmap.height);
+    const canvas=new OffscreenCanvas(bitmap.width,maxRows);
+    const ctx=canvas.getContext('2d',{willReadFrequently:true});
+    for(let y=0;y<bitmap.height;y+=maxRows) {
+      const rows=Math.min(maxRows,bitmap.height-y);
+      ctx.clearRect(0,0,bitmap.width,rows);
+      ctx.drawImage(bitmap,0,y,bitmap.width,rows,0,0,bitmap.width,rows);
+      const {data}=ctx.getImageData(0,0,bitmap.width,rows);
+      for(let i=3;i<data.length;i+=4) if (data[i]<250) return true;
+    }
+    return false;
+  } finally {
+    bitmap.close();
+  }
+}
+
+function backgroundSubject() {
+  return cutoutBlob || (transparencyByPhoto.get(workingPhoto)?.transparent ? workingPhoto : undefined);
+}
+
+function refreshComposeControls() {
+  const file=background.files[0] || draftBackground;
+  const selected=catalogBackground.value.trim() || (file && file.size<=20000000);
+  composeButton.disabled=editorBusy || !backgroundSubject() || !selected;
+  const alpha=transparencyByPhoto.get(workingPhoto);
+  if (cutoutBlob || !workingPhoto) backgroundSource.textContent='';
+  else if (alpha?.transparent) backgroundSource.textContent='La foto ya tiene transparencia. Podés aplicar el fondo directamente.';
+  else if (alpha?.pending) backgroundSource.textContent='Comprobando si la foto tiene transparencia…';
+  else if (alpha?.error) backgroundSource.textContent=alpha.error;
+  else if (alpha) backgroundSource.textContent='Esta foto es opaca. Para reemplazar el fondo, primero quitá el fondo en Recorte.';
+  else backgroundSource.textContent='';
+}
+
+function inspectBackgroundPhoto() {
+  const photo=workingPhoto;
+  if (!photo || cutoutBlob || transparencyByPhoto.has(photo)) return;
+  const status={pending:true};
+  transparencyByPhoto.set(photo,status);
+  refreshComposeControls();
+  photoHasTransparency(photo).then(transparent=>{status.transparent=transparent;})
+    .catch(error=>{status.error=error.message || 'No se pudo comprobar la transparencia de esta foto.';})
+    .finally(()=>{
+      status.pending=false;
+      if (photo===workingPhoto) refreshComposeControls();
+    });
+}
 const composite = document.querySelector('#composite');
 const saveComposite = document.querySelector('#save-composite');
 
 function clearComposite() {
-  if (standaloneEdge) composition.hidden = !cutoutBlob;
+  if (standaloneEdge) composition.hidden = !workingPhoto && !cutoutBlob;
   standaloneEdge = false;
   clearMesh();
   if (frameImage === composite) closeFraming();
@@ -3212,7 +3270,7 @@ async function composeBackground(selectedStrokes, generate = false, currentCompo
     };
     worker.onerror = () => finish({error: 'El navegador interrumpió la composición.'});
     timeout = setTimeout(() => finish({error: 'La composición superó el tiempo límite.'}), generate ? 150000 : 45000);
-    worker.postMessage({cutout: cutoutBlob, background: backdrop, catalogBackground: !!number, strokes: selectedStrokes, original: currentComposition ? undefined : workingPhoto, generate, currentComposition, standalonePhoto: standaloneEdge ? activeEditingBlob() : undefined});
+    worker.postMessage({cutout: backgroundSubject(), background: backdrop, catalogBackground: !!number, strokes: selectedStrokes, original: currentComposition ? undefined : workingPhoto, generate, currentComposition, standalonePhoto: standaloneEdge ? activeEditingBlob() : undefined});
   } catch (error) {
     finish({error: error.message});
   }
@@ -3226,7 +3284,7 @@ function clearOutput() {
   eraseStatus.textContent = '';
   setEraseMode(false);
   cutoutBlob = undefined;
-  composition.hidden = true;
+  composition.hidden = !workingPhoto;
   clearComposite();
   if (outputUrl) URL.revokeObjectURL(outputUrl);
   outputUrl = undefined;
@@ -3696,7 +3754,7 @@ function busy(value) {
   fine.disabled = value;
   background.disabled = catalogBackground.disabled = value;
   refreshMeshControls();
-  composeButton.disabled = value || !cutoutBlob || (!catalogBackground.value.trim() && (!(background.files[0] || draftBackground) || (background.files[0] || draftBackground).size > 20000000));
+  refreshComposeControls();
   picker.disabled = value;
   cut.disabled = value || !workingPhoto;
   cutCpu.disabled = cut.disabled;
@@ -3737,6 +3795,7 @@ function setWorkingPhoto(file, label, fromEdit = false) {
   frameOriginal.hidden = !workingPhoto;
   busy(false);
   refreshColorSource();
+  if (workspaceTab==='background') inspectBackgroundPhoto();
 }
 cut.onclick = () => {
   const file = workingPhoto;
@@ -4046,7 +4105,10 @@ function selectWorkspaceTool(key) {
   }
   panels.scrollTop = 0;
   if (key === 'cut' && eraseMode) requestAnimationFrame(showEraseMarks);
-  if (key === 'background' && marking) requestAnimationFrame(drawStrokes);
+  if (key === 'background') {
+    inspectBackgroundPhoto();
+    if (marking) requestAnimationFrame(drawStrokes);
+  }
   if (key === 'frame' && workingPhoto && !frameImage && !editorBusy) {
     openFraming(savedCutoutActive && cutoutBlob ? after : before,'Elegí la proporción y ajustá el encuadre.');
   }
