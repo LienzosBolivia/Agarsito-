@@ -119,6 +119,7 @@ main.agarsito-editor {width:min(1440px,100%);max-width:none;height:100dvh;margin
 <button id="cut" disabled>Quitar fondo</button>
 <button id="cut-cpu" disabled>Probar en CPU</button>
 <button id="cut-portrait" disabled>Recorte de retrato (MODNet)</button>
+<button id="cut-birefnet" disabled>Probar BiRefNet Lite</button>
 <p>MODNet analiza retratos en el dispositivo. Al elegirlo se descarga el modelo de 25 MiB.</p>
 <p id="photo-status" role="status"></p>
 <div class="previews">
@@ -2163,8 +2164,15 @@ self.onmessage = async ({data: {cutout, background, strokes, original, generate,
 };
 </script>
 <script id="model-worker" type="text/plain">
-self.onmessage = async ({data: {backend, photo, fineEdges, portrait}}) => {
-const runtimeBase = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
+self.onmessage = async ({data: {backend, photo, fineEdges, portrait, birefnet}}) => {
+const isGpu=backend==='webgpu';
+const birefnetSide=isGpu ? 768 : 512;
+const birefnetBase='https://huggingface.co/clevr-tools/birefnet-lite-web/resolve/f01535dcce4c28a8688ee631ca15719b779b3f86/';
+const birefnetHash=isGpu
+  ? '120ac2a3a0830a7156b5a3074d07000e0220def3b9ca68d55626b6c90a5e9b61'
+  : '20e3fb3e7bbb75e0b4f152759413a6ab19a599a1c2e1db7ce7741792eaf639fb';
+const version=birefnet ? '1.31.1' : '1.22.0';
+const runtimeBase='https://cdn.jsdelivr.net/npm/onnxruntime-web@'+version+'/dist/';
 const modelURL = 'https://huggingface.co/nfa04/u2netp-onnx/resolve/main/u2netp.onnx';
 // Equivalencia para MaxPool 2×2, stride 2 y sin padding explícito.
 const webgpuEdits = [[17,4,"aa9a9702"],[347,110,"0a620a0338303412033830351a094d6178506f6f6c5f3422074d6178506f6f6c2a150a0c6b65726e656c5f736861706540024002a001072a100a077374726964657340024002a001072a190a086175746f5f706164220a53414d455f5550504552a00103"],[618,110,"0a620a0338303812033830391a094d6178506f6f6c5f3722074d6178506f6f6c2a150a0c6b65726e656c5f736861706540024002a001072a100a077374726964657340024002a001072a190a086175746f5f706164220a53414d455f5550504552a00103"],[889,111,"0a630a0338313212033831331a0a4d6178506f6f6c5f313022074d6178506f6f6c2a150a0c6b65726e656c5f736861706540024002a001072a100a077374726964657340024002a001072a190a086175746f5f706164220a53414d455f5550504552a00103"],[1163,111,"0a630a0338313612033831371a0a4d6178506f6f6c5f313322074d6178506f6f6c2a150a0c6b65726e656c5f736861706540024002a001072a100a077374726964657340024002a001072a190a086175746f5f706164220a53414d455f5550504552a00103"],[1437,111,"0a630a0338323012033832311a0a4d6178506f6f6c5f313622074d6178506f6f6c2a150a0c6b65726e656c5f736861706540024002a001072a100a077374726964657340024002a001072a190a086175746f5f706164220a53414d455f5550504552a00103"],[8336,112,"0a640a0339343712033934381a0b4d6178506f6f6c5f31333522074d6178506f6f6c2a150a0c6b65726e656c5f736861706540024002a001072a100a077374726964657340024002a001072a190a086175746f5f706164220a53414d455f5550504552a00103"],[8778,112,"0a640a0339353412033935351a0b4d6178506f6f6c5f31343022074d6178506f6f6c2a150a0c6b65726e656c5f736861706540024002a001072a100a077374726964657340024002a001072a190a086175746f5f706164220a53414d455f5550504552a00103"],[9055,112,"0a640a0339353812033935391a0b4d6178506f6f6c5f31343322074d6178506f6f6c2a150a0c6b65726e656c5f736861706540024002a001072a100a077374726964657340024002a001072a190a086175746f5f706164220a53414d455f5550504552a00103"],[9332,112,"0a640a0339363212033936331a0b4d6178506f6f6c5f31343622074d6178506f6f6c2a150a0c6b65726e656c5f736861706540024002a001072a100a077374726964657340024002a001072a190a086175746f5f706164220a53414d455f5550504552a00103"],[9609,112,"0a640a0339363612033936371a0b4d6178506f6f6c5f31343922074d6178506f6f6c2a150a0c6b65726e656c5f736861706540024002a001072a100a077374726964657340024002a001072a190a086175746f5f706164220a53414d455f5550504552a00103"],[15465,114,"0a660a04313037301204313037311a0b4d6178506f6f6c5f32343622074d6178506f6f6c2a150a0c6b65726e656c5f736861706540024002a001072a100a077374726964657340024002a001072a190a086175746f5f706164220a53414d455f5550504552a00103"],[15913,114,"0a660a04313037371204313037381a0b4d6178506f6f6c5f32353122074d6178506f6f6c2a150a0c6b65726e656c5f736861706540024002a001072a100a077374726964657340024002a001072a190a086175746f5f706164220a53414d455f5550504552a00103"],[16194,114,"0a660a04313038311204313038321a0b4d6178506f6f6c5f32353422074d6178506f6f6c2a150a0c6b65726e656c5f736861706540024002a001072a100a077374726964657340024002a001072a190a086175746f5f706164220a53414d455f5550504552a00103"],[16475,114,"0a660a04313038351204313038361a0b4d6178506f6f6c5f32353722074d6178506f6f6c2a150a0c6b65726e656c5f736861706540024002a001072a100a077374726964657340024002a001072a190a086175746f5f706164220a53414d455f5550504552a00103"],[21092,114,"0a660a04313136361204313136371a0b4d6178506f6f6c5f33333222074d6178506f6f6c2a150a0c6b65726e656c5f736861706540024002a001072a100a077374726964657340024002a001072a190a086175746f5f706164220a53414d455f5550504552a00103"],[21540,114,"0a660a04313137331204313137341a0b4d6178506f6f6c5f33333722074d6178506f6f6c2a150a0c6b65726e656c5f736861706540024002a001072a100a077374726964657340024002a001072a190a086175746f5f706164220a53414d455f5550504552a00103"],[21821,114,"0a660a04313137371204313137381a0b4d6178506f6f6c5f33343022074d6178506f6f6c2a150a0c6b65726e656c5f736861706540024002a001072a100a077374726964657340024002a001072a190a086175746f5f706164220a53414d455f5550504552a00103"],[25133,114,"0a660a04313233351204313233361a0b4d6178506f6f6c5f33393322074d6178506f6f6c2a150a0c6b65726e656c5f736861706540024002a001072a100a077374726964657340024002a001072a190a086175746f5f706164220a53414d455f5550504552a00103"],[26776,114,"0a660a04313236341204313236351a0b4d6178506f6f6c5f34313422074d6178506f6f6c2a150a0c6b65726e656c5f736861706540024002a001072a100a077374726964657340024002a001072a190a086175746f5f706164220a53414d455f5550504552a00103"],[32558,114,"0a660a04313336371204313336381a0b4d6178506f6f6c5f34393922074d6178506f6f6c2a150a0c6b65726e656c5f736861706540024002a001072a100a077374726964657340024002a001072a190a086175746f5f706164220a53414d455f5550504552a00103"],[32839,114,"0a660a04313337311204313337321a0b4d6178506f6f6c5f35303222074d6178506f6f6c2a150a0c6b65726e656c5f736861706540024002a001072a100a077374726964657340024002a001072a190a086175746f5f706164220a53414d455f5550504552a00103"],[37623,114,"0a660a04313435351204313435361a0b4d6178506f6f6c5f35373922074d6178506f6f6c2a150a0c6b65726e656c5f736861706540024002a001072a100a077374726964657340024002a001072a190a086175746f5f706164220a53414d455f5550504552a00103"],[37904,114,"0a660a04313435391204313436301a0b4d6178506f6f6c5f35383222074d6178506f6f6c2a150a0c6b65726e656c5f736861706540024002a001072a100a077374726964657340024002a001072a190a086175746f5f706164220a53414d455f5550504552a00103"],[38185,114,"0a660a04313436331204313436341a0b4d6178506f6f6c5f35383522074d6178506f6f6c2a150a0c6b65726e656c5f736861706540024002a001072a100a077374726964657340024002a001072a190a086175746f5f706164220a53414d455f5550504552a00103"],[44274,114,"0a660a04313537301204313537311a0b4d6178506f6f6c5f36383422074d6178506f6f6c2a150a0c6b65726e656c5f736861706540024002a001072a100a077374726964657340024002a001072a190a086175746f5f706164220a53414d455f5550504552a00103"],[44555,114,"0a660a04313537341204313537351a0b4d6178506f6f6c5f36383722074d6178506f6f6c2a150a0c6b65726e656c5f736861706540024002a001072a100a077374726964657340024002a001072a190a086175746f5f706164220a53414d455f5550504552a00103"],[44836,114,"0a660a04313537381204313537391a0b4d6178506f6f6c5f36393022074d6178506f6f6c2a150a0c6b65726e656c5f736861706540024002a001072a100a077374726964657340024002a001072a190a086175746f5f706164220a53414d455f5550504552a00103"],[45117,114,"0a660a04313538321204313538331a0b4d6178506f6f6c5f36393322074d6178506f6f6c2a150a0c6b65726e656c5f736861706540024002a001072a100a077374726964657340024002a001072a190a086175746f5f706164220a53414d455f5550504552a00103"],[52508,114,"0a660a04313731321204313731331a0b4d6178506f6f6c5f38313422074d6178506f6f6c2a150a0c6b65726e656c5f736861706540024002a001072a100a077374726964657340024002a001072a190a086175746f5f706164220a53414d455f5550504552a00103"],[52789,114,"0a660a04313731361204313731371a0b4d6178506f6f6c5f38313722074d6178506f6f6c2a150a0c6b65726e656c5f736861706540024002a001072a100a077374726964657340024002a001072a190a086175746f5f706164220a53414d455f5550504552a00103"],[53070,114,"0a660a04313732301204313732311a0b4d6178506f6f6c5f38323022074d6178506f6f6c2a150a0c6b65726e656c5f736861706540024002a001072a100a077374726964657340024002a001072a190a086175746f5f706164220a53414d455f5550504552a00103"],[53351,114,"0a660a04313732341204313732351a0b4d6178506f6f6c5f38323322074d6178506f6f6c2a150a0c6b65726e656c5f736861706540024002a001072a100a077374726964657340024002a001072a190a086175746f5f706164220a53414d455f5550504552a00103"],[53632,114,"0a660a04313732381204313732391a0b4d6178506f6f6c5f38323622074d6178506f6f6c2a150a0c6b65726e656c5f736861706540024002a001072a100a077374726964657340024002a001072a190a086175746f5f706164220a53414d455f5550504552a00103"]];
@@ -2374,22 +2382,29 @@ try {
     }
   }
   const preparation = performance.now();
+  const adapter=birefnet && isGpu ? await navigator.gpu?.requestAdapter() : undefined;
+  if (birefnet && isGpu && !adapter) throw Error('Este navegador no ofrece un adaptador WebGPU.');
+  if (birefnet) self.postMessage({phase:'Preparando BiRefNet Lite '+birefnetSide+' · descarga inicial de aproximadamente 100 MB…'});
   const ort = await import(runtimeBase + (backend === 'webgpu' ? 'ort.webgpu.min.mjs' : 'ort.wasm.min.mjs'));
   ort.env.wasm.wasmPaths = runtimeBase;
   ort.env.wasm.numThreads = 1;
+  if (adapter) ort.env.webgpu.adapter=adapter;
   const portraitURL = 'https://huggingface.co/Xenova/modnet/resolve/fa2fa546052fba4c08921230a26cc69a333fca12/onnx/model.onnx';
   const expectedHash = portrait ? '07c308cf0fc7e6e8b2065a12ed7fc07e1de8febb7dc7839d7b7f15dd66584df9' : '309c8469258dda742793dce0ebea8e6dd393174f89934733ecc8b14c76f4ddd8';
-  const bytes = await loadVerifiedModel(portrait ? portraitURL : modelURL,expectedHash);
+  const bytes=birefnet
+    ? await loadVerifiedModel(birefnetBase+'birefnet_lite_'+birefnetSide+'_fp16w.onnx',birefnetHash)
+    : await loadVerifiedModel(portrait ? portraitURL : modelURL,expectedHash);
+  if (birefnet) self.postMessage({phase:'Iniciando BiRefNet Lite '+birefnetSide+' en '+(isGpu ? 'WebGPU' : 'CPU/WASM')+'…'});
   const downloadMiB = bytes.byteLength / 1048576;
-  const model = !portrait && backend === 'webgpu' ? adaptWebGpuModel(bytes) : bytes;
-  if (!portrait && backend === 'webgpu' && await sha256(model) !== 'a606d95ea45914f7856169e7941492acedc0a709e0d15355c78f30ed82b4fc44') {
+  const model = !birefnet && !portrait && isGpu ? adaptWebGpuModel(bytes) : bytes;
+  if (!birefnet && !portrait && isGpu && await sha256(model) !== 'a606d95ea45914f7856169e7941492acedc0a709e0d15355c78f30ed82b4fc44') {
     throw new Error('El modelo adaptado no pasó la verificación.');
   }
   session = await ort.InferenceSession.create(model, {
     executionProviders: [backend],
-    ...(backend === 'webgpu' ? {extra: {session: {disable_cpu_ep_fallback: '1'}}} : {})
+    ...(!birefnet && isGpu ? {extra:{session:{disable_cpu_ep_fallback:'1'}}} : {})
   });
-  const side = portrait ? 512 : 320;
+  const side = birefnet ? birefnetSide : portrait ? 512 : 320;
   const pixels = new Float32Array(3 * side * side);
   if (bitmap) {
     const sample = new OffscreenCanvas(side, side).getContext('2d', {willReadFrequently: true});
@@ -2399,7 +2414,7 @@ try {
     if (fineEdges) guide = rgba;
     const means = [0.485, 0.456, 0.406];
     const deviations = [0.229, 0.224, 0.225];
-    let maximum = 1;
+    let maximum = birefnet ? 255 : 1;
     for (let i = 0; i < rgba.length; i += 4) {
       maximum = Math.max(maximum, rgba[i], rgba[i + 1], rgba[i + 2]);
     }
@@ -2418,6 +2433,7 @@ try {
   const names = [session.outputNames[0]];
   const preparationMs = performance.now() - preparation;
   const start = performance.now();
+  if (birefnet) self.postMessage({phase:'BiRefNet está separando la foto del fondo…'});
   outputs = await session.run(feeds, names);
   const elapsed = performance.now() - start;
   let warmTime = '';
@@ -2428,7 +2444,11 @@ try {
     outputs = await session.run(feeds, names);
     warmTime = ' Segunda inferencia (misma sesión): ' + Math.round(performance.now() - warmStart) + ' ms.';
   }
-  const mask = outputs[session.outputNames[0]].data;
+  const output=outputs[session.outputNames[0]];
+  if (birefnet && output.dims.join(',')!==[1,1,side,side].join(',')) {
+    throw Error('BiRefNet devolvió dimensiones de máscara inesperadas.');
+  }
+  const mask=output.location==='cpu' ? output.data : await output.getData();
   if (mask.length !== side * side || !mask.every(Number.isFinite)) {
     throw new Error('La máscara ONNX no pasó la validación.');
   }
@@ -2444,7 +2464,8 @@ try {
     if (hasBanding(mask, side, high - low)) {
       throw new Error('La máscara presenta franjas repetidas. Se descartó el recorte.');
     }
-    const prior = Float32Array.from(mask, value => portrait ? Math.max(0, Math.min(1, value)) : (value - low) / (high - low));
+    const prior=Float32Array.from(mask,value=>birefnet ? 1/(1+Math.exp(-value))
+      : portrait ? Math.max(0,Math.min(1,value)) : (value-low)/(high-low));
     const alphaCanvas = new OffscreenCanvas(side, side);
     const alphaContext = alphaCanvas.getContext('2d');
     const alpha = alphaContext.createImageData(side, side);
@@ -2464,6 +2485,7 @@ try {
     bitmap.close();
     bitmap = undefined;
     if (fineEdges) {
+      if (birefnet) self.postMessage({phase:'Afinando el borde sobre la foto original…'});
       refineEdges(context, guide, prior, side, canvas.width, canvas.height);
     } else {
       context.globalCompositeOperation = 'destination-in';
@@ -2472,7 +2494,7 @@ try {
     }
     png = await canvas.convertToBlob({type: 'image/png'});
   }
-  self.postMessage({ok: true, png, message: (portrait ? 'MODNet: inferencia completada en ' : 'Inferencia completada en ') + (backend === 'webgpu' ? 'WebGPU' : 'CPU/WASM') + ' en ' + Math.round(elapsed) + ' ms (primera ejecución). Preparación: ' + Math.round(preparationMs) + ' ms.' + warmTime + ' Archivo ONNX verificado: ' + downloadMiB.toFixed(2) + ' MiB.'});
+  self.postMessage({ok: true, png, message: (birefnet ? 'BiRefNet Lite '+side+': recorte completado en ' : portrait ? 'MODNet: inferencia completada en ' : 'Inferencia completada en ') + (backend === 'webgpu' ? 'WebGPU' : 'CPU/WASM') + ' en ' + Math.round(elapsed) + ' ms (primera ejecución). Preparación: ' + Math.round(preparationMs) + ' ms.' + warmTime + ' Archivo ONNX verificado: ' + downloadMiB.toFixed(2) + ' MiB.'});
 } catch (error) {
   self.postMessage({message: 'No se completó la prueba del modelo. ' + error.message});
 } finally {
@@ -2576,6 +2598,7 @@ const picker = document.querySelector('#photo');
 const cut = document.querySelector('#cut');
 const cutCpu = document.querySelector('#cut-cpu');
 const cutPortrait = document.querySelector('#cut-portrait');
+const cutBirefnet=document.querySelector('#cut-birefnet');
 const photoStatus = document.querySelector('#photo-status');
 const before = document.querySelector('#before');
 const after = document.querySelector('#after');
@@ -3758,7 +3781,7 @@ function busy(value) {
   picker.disabled = value;
   cut.disabled = value || !workingPhoto;
   cutCpu.disabled = cut.disabled;
-  cutPortrait.disabled = cut.disabled;
+  cutPortrait.disabled = cutBirefnet.disabled = cut.disabled;
 }
 picker.onchange = () => {
   const file=picker.files[0];
@@ -3820,6 +3843,17 @@ cutPortrait.onclick = () => {
   busy(true);
   runModel('wasm', '', workingPhoto, true);
 };
+cutBirefnet.onclick=()=>{
+  if (cutBirefnet.disabled) return;
+  let interrupted=false;
+  try {
+    interrupted=localStorage.getItem(pendingBirefnetGpuKey)==='1';
+    localStorage.removeItem(pendingBirefnetGpuKey);
+  } catch {}
+  busy(true);
+  runModel(navigator.gpu && !interrupted ? 'webgpu' : 'wasm',
+    interrupted ? 'La prueba GPU anterior se interrumpió. ' : '',workingPhoto,false,true);
+};
 function updateProfile(next) {
   profile = next;
   budget.textContent = profile
@@ -3827,6 +3861,7 @@ function updateProfile(next) {
     : 'Sin un presupuesto inicial de GPU para este diagnóstico.';
 }
 const pendingGpuKey = 'agarsito-u2netp-webgpu-adapted-pending';
+const pendingBirefnetGpuKey='agarsito-birefnet-webgpu-pending';
 
 function testModel(photo) {
   let interrupted = false;
@@ -3843,13 +3878,14 @@ function testModel(photo) {
   }
 }
 
-function runModel(backend, note = '', photo, portrait = false) {
+function runModel(backend, note = '', photo, portrait = false, birefnet = false) {
   const feedback = photo ? photoStatus : decision;
   const gpu = backend === 'webgpu';
   const name = gpu ? 'WebGPU' : 'CPU/WASM';
-  feedback.textContent = note + 'Cargando ' + (portrait ? 'MODNet' : 'U²-Net pequeño') + ' en ' + name + '…';
+  const pendingKey=birefnet ? pendingBirefnetGpuKey : pendingGpuKey;
+  feedback.textContent = note + 'Cargando ' + (birefnet ? 'BiRefNet Lite' : portrait ? 'MODNet' : 'U²-Net pequeño') + ' en ' + name + '…';
   if (gpu) {
-    try { localStorage.setItem(pendingGpuKey, '1'); } catch {}
+    try { localStorage.setItem(pendingKey, '1'); } catch {}
   }
   const code = modelWorkerCode('model-worker');
   const url = URL.createObjectURL(new Blob([code], {type: 'text/javascript'}));
@@ -3859,25 +3895,29 @@ function runModel(backend, note = '', photo, portrait = false) {
     worker?.terminate();
     URL.revokeObjectURL(url);
     if (gpu) {
-      try { localStorage.removeItem(pendingGpuKey); } catch {}
+      try { localStorage.removeItem(pendingKey); } catch {}
       if (!ok) {
-        runModel('wasm', 'WebGPU falló: ' + message + ' ', photo);
+        runModel('wasm', 'WebGPU falló: ' + message + ' ', photo,portrait,birefnet);
         return;
       }
     }
     feedback.textContent = note + message;
     if (png) {
-      if (portrait) clearOutput();
+      if (portrait || birefnet) clearOutput();
       showCutout(png);
     }
     busy(false);
   };
   try {
     worker = new Worker(url, {type: 'module'});
-    worker.onmessage = ({data}) => finish(data);
-    worker.onerror = () => finish({message: 'El navegador interrumpió el worker.'});
-    timeout = setTimeout(() => finish({message: 'La prueba superó el tiempo límite.'}), gpu ? 45000 : 90000);
-    worker.postMessage({backend, photo, fineEdges: fine.checked, portrait});
+    worker.onmessage = ({data}) => {
+      if (data.phase) feedback.textContent=note+data.phase;
+      else finish(data);
+    };
+    worker.onerror = () => finish({message:'El navegador interrumpió el worker.'});
+    const limit=birefnet ? (gpu ? 180000 : 300000) : (gpu ? 45000 : 90000);
+    timeout=setTimeout(()=>finish({message:'La prueba superó el tiempo límite.'}),limit);
+    worker.postMessage({backend,photo,fineEdges:fine.checked,portrait,birefnet});
   } catch (error) {
     finish({message: error.message});
   }
@@ -4025,7 +4065,7 @@ actions.append(saveWorkspace,exportWorkspace,lockSliders);
 footer.append(actions,workspaceStatus);
 
 const fineControls = fine.closest('p');
-const portraitHelp = cutPortrait.nextElementSibling;
+const portraitHelp = cutBirefnet.nextElementSibling;
 const diagnosticTitle = button.previousElementSibling.previousElementSibling;
 const diagnosticHelp = button.previousElementSibling;
 const diagnosticResult = result.nextElementSibling;
@@ -4041,7 +4081,7 @@ for (const view of workspaceViews) {
 
 const workspaceDefinitions = [
   ['frame','Encuadre',[frameOriginal,frameCutout,frameComposite,framing]],
-  ['cut','Recorte',[fineControls,cut,cutCpu,cutPortrait,portraitHelp,photoStatus,maskTools,download]],
+  ['cut','Recorte',[fineControls,cut,cutCpu,cutPortrait,cutBirefnet,portraitHelp,photoStatus,maskTools,download]],
   ['background','Fondo y borde',[openOriginalEdge,composition]],
   ['color','Color',[colorTools]],
   ['restore','Restaurar',[document.querySelector('#restore')]],
