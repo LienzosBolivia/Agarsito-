@@ -1795,7 +1795,7 @@ function frameEdgeGuide(source,edge,stride) {
 
 function blendExtendedFrame(ctx,bitmap,known) {
   const {width,height}=bitmap;
-  const limit=Math.max(6,Math.min(40,Math.round(Math.max(width,height)*0.022)));
+  const limit=Math.max(4,Math.min(14,Math.round(Math.min(width,height)*0.008)));
   for (const edge of frameEdges(width,height,known)) {
     const depth=Math.min(limit,edge.margin);
     const guide=frameEdgeGuide(bitmap,edge,Math.max(7,Math.round(limit*0.55)));
@@ -1817,83 +1817,119 @@ function blendExtendedFrame(ctx,bitmap,known) {
   }
 }
 
-async function extendFrame(photo, known) {
-  const bitmap = await createImageBitmap(photo);
-  let session, imageTensor, maskTensor, outputs;
-  try {
-    const {width,height} = bitmap;
-    if (width*height > 16000000 || Math.max(width,height) > 8192) {
-      throw Error('Reducí el lienzo a un máximo de 16 megapíxeles y 8192 px por lado.');
-    }
-    if (!known || known.width <= 0 || known.height <= 0) throw Error('El encuadre debe incluir parte de la foto.');
-    const sourceRegion = cleanFrameBoundary(bitmap,known);
-    const scale = Math.min(1,512/Math.max(width,height));
-    const w = Math.max(1,Math.round(width*scale)), h = Math.max(1,Math.round(height*scale));
-    const plane = w*h;
-    const sample = new OffscreenCanvas(w,h).getContext('2d',{willReadFrequently:true});
-    sample.drawImage(bitmap,0,0,w,h);
-    const rgba = sample.getImageData(0,0,w,h).data;
-    const rgb = new Uint8Array(plane*3);
-    const mask = new Uint8Array(plane);
-    const left = Math.ceil(sourceRegion.x*w/width), top = Math.ceil(sourceRegion.y*h/height);
-    const right = Math.floor((sourceRegion.x+sourceRegion.width)*w/width);
-    const bottom = Math.floor((sourceRegion.y+sourceRegion.height)*h/height);
-    if (left >= right || top >= bottom) throw Error('El encuadre necesita más área de la foto como referencia.');
-    for (let y=top;y<bottom;y++) {
-      for (let x=left;x<right;x++) {
-        const i = y*w+x;
-        mask[i]=255;
-        for (let c=0;c<3;c++) rgb[c*plane+i]=rgba[i*4+c];
-      }
-    }
-    const scaledKnown={x:left,y:top,width:right-left,height:bottom-top};
-    for (const edge of frameEdges(w,h,scaledKnown)) {
-      // Give the model a short continuation of garment edges as conditioning.
-      const depth=Math.min(4,Math.floor(edge.margin/4));
-      if (!depth) continue;
-      const guide=frameEdgeGuide(sample.canvas,edge,8);
-      for (let s=0;s<edge.length;s++) {
-        for (let d=1;d<=depth;d++) {
-          const color=guide(s,d);
-          if (color[3]<240) continue;
-          const [px,py]=alongFrameEdge(edge,s,d);
-          const i=py*w+px;
-          mask[i]=255;
-          for (let c=0;c<3;c++) rgb[c*plane+i]=color[c];
-        }
-      }
-    }
-    self.postMessage({progress:'Preparando MI-GAN para ampliar el encuadre…'});
-    const runtime = await openMiganSession();
-    session = runtime.session;
-    imageTensor = new runtime.ort.Tensor('uint8',rgb,[1,3,h,w]);
-    maskTensor = new runtime.ort.Tensor('uint8',mask,[1,1,h,w]);
-    self.postMessage({progress:'Generando el fondo y la parte visible del cuerpo en el margen…'});
-    outputs = await session.run({image:imageTensor,mask:maskTensor});
-    const result = outputs.result;
-    if (!result || result.dims.join(',') !== [1,3,h,w].join(',')) throw Error('El modelo devolvió un tamaño inesperado.');
-    const generated = sample.createImageData(w,h);
-    for (let i=0;i<plane;i++) {
-      for (let c=0;c<3;c++) generated.data[i*4+c]=result.data[c*plane+i];
-      generated.data[i*4+3]=255;
-    }
-    sample.putImageData(generated,0,0);
-    const ctx = new OffscreenCanvas(width,height).getContext('2d');
-    ctx.imageSmoothingQuality = 'high';
-    ctx.drawImage(sample.canvas,0,0,width,height);
-    blendExtendedFrame(ctx,bitmap,sourceRegion);
-    // Copy the protected pixels at 1:1 without putting the removed stripe back.
-    const {x,y,width:wSource,height:hSource}=sourceRegion;
-    ctx.clearRect(x,y,wSource,hSource);
-    ctx.drawImage(bitmap,x,y,wSource,hSource,x,y,wSource,hSource);
-    return await ctx.canvas.convertToBlob({type:'image/png'});
-  } finally {
-    bitmap.close();
-    imageTensor?.dispose();
-    maskTensor?.dispose();
-    for (const output of Object.values(outputs || {})) output.dispose();
-    await session?.release();
+function frameMargins(width,height,known) {
+  const {x,y,width:w,height:h}=known;
+  return [
+    {horizontal:false,x:0,y,w:x,h},
+    {horizontal:false,x:x+w,y,w:width-x-w,h},
+    {horizontal:true,x:0,y:0,w:width,h:y},
+    {horizontal:true,x:0,y:y+h,w:width,h:height-y-h}
+  ].filter(area=>area.w>0&&area.h>0);
+}
+
+function extendThinMargin(ctx,bitmap,known,margin) {
+  const edge=frameEdges(bitmap.width,bitmap.height,known).find(edge=>edge.horizontal===margin.horizontal &&
+    (edge.horizontal ? edge.direction===(margin.y===0 ? -1 : 1) : edge.direction===(margin.x===0 ? -1 : 1)));
+  if(!edge) return;
+  const guide=frameEdgeGuide(bitmap,edge,10);
+  const {x,y,w,h}=margin;
+  const patch=ctx.createImageData(w,h);
+  for(let row=0;row<h;row++)for(let col=0;col<w;col++){
+    const along=edge.horizontal ? x+col-edge.x : y+row-edge.y;
+    const depth=edge.horizontal ? Math.abs(y+row-edge.y) : Math.abs(x+col-edge.x);
+    const pos=Math.max(0,Math.min(edge.length-1,along));
+    patch.data.set(guide(pos,depth-1),(row*w+col)*4);
   }
+  ctx.putImageData(patch,x,y);
+}
+
+function pasteFramePatch(ctx,patch,area,from,overlap,horizontal) {
+  const tile=new OffscreenCanvas(area.w,area.h).getContext('2d',{willReadFrequently:true});
+  tile.imageSmoothingQuality='high';
+  tile.drawImage(patch,from.x,from.y,from.w,from.h,0,0,area.w,area.h);
+  if(overlap){
+    const {data}=tile.getImageData(0,0,area.w,area.h);
+    const prior=ctx.getImageData(area.x,area.y,area.w,area.h).data;
+    for(let y=0;y<area.h;y++)for(let x=0;x<area.w;x++){
+      const along=horizontal?x:y;
+      if(along>=overlap) continue;
+      const t=along/overlap;
+      const mix=t*t*(3-2*t);
+      const i=(y*area.w+x)*4;
+      for(let c=0;c<4;c++) data[i+c]=prior[i+c]+(data[i+c]-prior[i+c])*mix;
+    }
+    tile.putImageData(new ImageData(data,area.w,area.h),0,0);
+  }
+  ctx.drawImage(tile.canvas,area.x,area.y);
+}
+
+async function extendFrame({photo,known,forceCpu=false}) {
+  const bitmap=await createImageBitmap(photo);
+  try {
+    const {width,height}=bitmap;
+    if(width*height>16000000 || Math.max(width,height)>8192) throw Error('Reducí el lienzo a un máximo de 16 megapíxeles y 8192 px por lado.');
+    if(!known || known.width<=0 || known.height<=0) throw Error('El encuadre debe incluir parte de la foto.');
+    const sourceRegion=cleanFrameBoundary(bitmap,known);
+    const margins=frameMargins(width,height,sourceRegion);
+    const threshold=Math.min(18,Math.max(6,Math.round(Math.min(width,height)*0.012)));
+    const jobs=[];
+    const thin=margins.filter(m=>(m.horizontal?m.h:m.w)<=threshold);
+    for(const margin of margins){
+      if(thin.includes(margin)) continue;
+      const length=margin.horizontal?margin.w:margin.h;
+      const depth=margin.horizontal?margin.h:margin.w;
+      const step=Math.max(384,depth,Math.ceil(length/6));
+      for(let pos=0;pos<length;pos+=step){
+        const overlap=Math.min(pos,32);
+        const size=Math.min(length,pos+step)-pos+overlap;
+        const area=margin.horizontal
+          ? {...margin,x:margin.x+pos-overlap,w:size}
+          : {...margin,y:margin.y+pos-overlap,h:size};
+        jobs.push({area,overlap});
+      }
+    }
+    const canvas=new OffscreenCanvas(width,height);
+    const ctx=canvas.getContext('2d',{willReadFrequently:true});
+    const drawThin=()=>{
+      ctx.clearRect(0,0,width,height);
+      for(const margin of thin) extendThinMargin(ctx,bitmap,sourceRegion,margin);
+    };
+    const finish=async()=>{
+      self.postMessage({progress:'Guardando el encuadre ampliado…',stage:'cpu'});
+      const {x,y,width:w,height:h}=sourceRegion;
+      ctx.drawImage(bitmap,x,y,w,h,x,y,w,h);
+      return canvas.convertToBlob({type:'image/png'});
+    };
+    if(!jobs.length){
+      self.postMessage({progress:'Extendiendo los bordes estrechos a resolución original…'});
+      drawThin();
+      return finish();
+    }
+    const {image}=await runRepairModel('lama',undefined,forceCpu,async(ort,session)=>{
+      drawThin();
+      for(const [index,{area,overlap}] of jobs.entries()){
+        self.postMessage({progress:'LaMa · ampliando margen '+(index+1)+' de '+jobs.length+'…'});
+        const padding=Math.max(112,Math.min(480,Math.round((area.horizontal?area.h:area.w)*1.15)));
+        const crop=lamaContext(area,width,height,padding);
+        const sample=drawLamaSample(bitmap,crop);
+        const {ctx:sampleCtx,x,y,w,h,sx,sy}=sample;
+        const mask=new Float32Array(512*512).fill(1);
+        for(let row=0;row<h;row++) for(let col=0;col<w;col++){
+          const px=crop.x+(col+0.5)/sx,py=crop.y+(row+0.5)/sy;
+          const inside=px>=sourceRegion.x && px<sourceRegion.x+sourceRegion.width &&
+            py>=sourceRegion.y && py<sourceRegion.y+sourceRegion.height;
+          if(inside) mask[(row+y)*512+col+x]=0;
+        }
+        const patch=await runLamaPatch(ort,session,sampleCtx,mask);
+        pasteFramePatch(ctx,patch,area,{x:x+(area.x-crop.x)*sx,y:y+(area.y-crop.y)*sy,w:area.w*sx,h:area.h*sy},
+          overlap,area.horizontal);
+      }
+      self.postMessage({progress:'Integrando la unión con la foto original…',stage:'cpu'});
+      blendExtendedFrame(ctx,bitmap,sourceRegion);
+      return finish();
+    });
+    return image;
+  } finally { bitmap.close(); }
 }
 
 async function regenerateEdge(ctx, edge, subject, width, height) {
@@ -2146,63 +2182,45 @@ async function repairDetail(ctx,bitmap,area,strokes,ort,session) {
   }
 }
 
-function lamaContext(area,width,height) {
-  const size=Math.max(area.w,area.h);
-  const pad=Math.max(48,Math.ceil(size*0.35));
+function lamaContext(area,width,height,pad=Math.max(48,Math.ceil(Math.max(area.w,area.h)*0.35))) {
   const x=Math.max(0,area.x-pad),y=Math.max(0,area.y-pad);
   return {x,y,w:Math.min(width,area.x+area.w+pad)-x,h:Math.min(height,area.y+area.h+pad)-y};
 }
 
-async function repairWithLama(ctx,bitmap,area,strokes,ort,session) {
-  const {width,height}=bitmap;
-  const crop=lamaContext(area,width,height);
-  const side=512,plane=side*side,scale=side/Math.max(crop.w,crop.h);
+function drawLamaSample(bitmap,crop) {
+  const side=512,scale=side/Math.max(crop.w,crop.h);
   const w=Math.max(1,Math.round(crop.w*scale)),h=Math.max(1,Math.round(crop.h*scale));
   const x=Math.floor((side-w)/2),y=Math.floor((side-h)/2);
-  const sx=w/crop.w,sy=h/crop.h;
-  const canvas=new OffscreenCanvas(side,side);
-  const sample=canvas.getContext('2d',{willReadFrequently:true});
-  sample.fillStyle='#808080';
-  sample.fillRect(0,0,side,side);
-  sample.imageSmoothingQuality='high';
-  sample.drawImage(bitmap,crop.x,crop.y,crop.w,crop.h,x,y,w,h);
-  const input=sample.getImageData(0,0,side,side).data;
-  const brush=new OffscreenCanvas(side,side).getContext('2d',{willReadFrequently:true});
-  paintRepairMask(brush,width,height,strokes,sx,sy,x-crop.x*sx,y-crop.y*sy);
-  const marks=brush.getImageData(0,0,side,side).data;
-  const mask=new Float32Array(plane), rgb=new Float32Array(plane*3);
-  for(let row=0;row<side;row++)for(let col=0;col<side;col++){
-    const i=row*side+col;
-    for(let dy=-1;dy<=1 && !mask[i];dy++){
-      if(row+dy<0 || row+dy>=side) continue;
-      for(let dx=-1;dx<=1;dx++){
-        if(col+dx>=0 && col+dx<side && marks[((row+dy)*side+col+dx)*4+3]>0){mask[i]=1;break;}
-      }
-    }
-    if(!mask[i]) for(let c=0;c<3;c++) rgb[c*plane+i]=input[i*4+c]/255;
-  }
+  const ctx=new OffscreenCanvas(side,side).getContext('2d',{willReadFrequently:true});
+  ctx.fillStyle='#808080';
+  ctx.fillRect(0,0,side,side);
+  ctx.imageSmoothingQuality='high';
+  ctx.drawImage(bitmap,crop.x,crop.y,crop.w,crop.h,x,y,w,h);
+  return {ctx,x,y,w,h,sx:w/crop.w,sy:h/crop.h};
+}
+
+async function runLamaPatch(ort,session,ctx,mask) {
+  const side=512,plane=side*side;
+  const input=ctx.getImageData(0,0,side,side).data;
+  const rgb=new Float32Array(plane*3);
+  for(let i=0;i<plane;i++) if(!mask[i]) for(let c=0;c<3;c++) rgb[c*plane+i]=input[i*4+c]/255;
   const image=new ort.Tensor('float32',rgb,[1,3,side,side]);
   const selection=new ort.Tensor('float32',mask,[1,1,side,side]);
   let outputs;
   try {
-    self.postMessage({progress:'LaMa está regenerando lo que hay detrás de la selección…'});
     outputs=await session.run({image,mask:selection});
     const output=outputs.output;
     const values=output.location==='cpu' ? output.data : await output.getData();
     if(output.dims.join(',')!==[1,3,side,side].join(',') || !values.every(Number.isFinite)){
       throw Error('LaMa devolvió una imagen inválida.');
     }
-    const result=sample.createImageData(side,side);
+    const result=ctx.createImageData(side,side);
     for(let i=0;i<plane;i++){
       for(let c=0;c<3;c++) result.data[i*4+c]=values[c*plane+i];
       result.data[i*4+3]=255;
     }
-    sample.putImageData(result,0,0);
-    const patch=new OffscreenCanvas(Math.max(1,Math.round(area.w*sx)),Math.max(1,Math.round(area.h*sy))).getContext('2d');
-    patch.imageSmoothingQuality='high';
-    patch.drawImage(canvas,x+(area.x-crop.x)*sx,y+(area.y-crop.y)*sy,area.w*sx,area.h*sy,
-      0,0,patch.canvas.width,patch.canvas.height);
-    applyBrushPatch(ctx,patch.canvas,area,strokes,3);
+    ctx.putImageData(result,0,0);
+    return ctx.canvas;
   } finally {
     image.dispose();
     selection.dispose();
@@ -2210,7 +2228,65 @@ async function repairWithLama(ctx,bitmap,area,strokes,ort,session) {
   }
 }
 
-async function repairSelection({photo,strokes,mode,fsrcnnUrl}) {
+async function repairWithLama(ctx,bitmap,area,strokes,ort,session) {
+  const {width,height}=bitmap;
+  const crop=lamaContext(area,width,height);
+  const {ctx:sample,x,y,w,h,sx,sy}=drawLamaSample(bitmap,crop);
+  const side=512;
+  const brush=new OffscreenCanvas(side,side).getContext('2d',{willReadFrequently:true});
+  paintRepairMask(brush,width,height,strokes,sx,sy,x-crop.x*sx,y-crop.y*sy);
+  const marks=brush.getImageData(0,0,side,side).data;
+  const mask=new Float32Array(side*side).fill(1);
+  for(let row=y;row<y+h;row++) for(let col=x;col<x+w;col++){
+    const i=row*side+col;
+    mask[i]=0;
+    for(let dy=-1;dy<=1 && !mask[i];dy++){
+      if(row+dy<0 || row+dy>=side) continue;
+      for(let dx=-1;dx<=1;dx++){
+        if(col+dx>=0 && col+dx<side && marks[((row+dy)*side+col+dx)*4+3]>0){mask[i]=1;break;}
+      }
+    }
+  }
+  self.postMessage({progress:'LaMa está regenerando la zona marcada…'});
+  const canvas=await runLamaPatch(ort,session,sample,mask);
+  const patch=new OffscreenCanvas(Math.max(1,Math.round(area.w*sx)),Math.max(1,Math.round(area.h*sy))).getContext('2d');
+  patch.imageSmoothingQuality='high';
+  patch.drawImage(canvas,x+(area.x-crop.x)*sx,y+(area.y-crop.y)*sy,area.w*sx,area.h*sy,
+    0,0,patch.canvas.width,patch.canvas.height);
+  applyBrushPatch(ctx,patch.canvas,area,strokes,3);
+}
+
+async function runRepairModel(mode,fsrcnnUrl,forceCpu,action) {
+  const lama=mode==='lama';
+  const runtime='https://cdn.jsdelivr.net/npm/onnxruntime-web@'+(lama?'1.31.1':'1.22.0')+'/dist/';
+  const label=lama ? 'LaMa' : 'FSRCNN';
+  self.postMessage({progress:'Buscando '+label+' en el navegador…',stage:'download'});
+  const report=progress=>self.postMessage({progress:label+' · '+progress,stage:'download'});
+  const model=lama
+    ? await loadVerifiedModel('https://huggingface.co/HiggityPiggity/lama-onnx-fp16/resolve/feb119a90ac45e7648aa5976559d481a5e9a4a48/lama_fp16w.onnx',
+        'e631637d760e3fa708c059ebc304c66a4867f00ad0891cf4fc0849966a42ecab',report)
+    : await loadVerifiedModel(fsrcnnUrl,'422da1d606efa65c9a2db14d9dc3f641fd4cdd8a71a32ba1204e3dfb7d458bb4',report);
+  self.postMessage({progress:'Comprobando el motor para '+label+'…',stage:'gpu'});
+  const adapter=forceCpu ? null : await navigator.gpu?.requestAdapter().catch(()=>null);
+  const backend=adapter?'webgpu':'wasm';
+  const stage=adapter?'gpu':'cpu';
+  let session;
+  try {
+    self.postMessage({progress:'Iniciando '+label+' en '+(adapter?'WebGPU':'CPU/WASM')+'…',stage});
+    const ort=await import(runtime+(adapter?'ort.webgpu.min.mjs':'ort.wasm.min.mjs'));
+    ort.env.wasm.wasmPaths=runtime;
+    ort.env.wasm.numThreads=1;
+    if(adapter) ort.env.webgpu.adapter=adapter;
+    session=await ort.InferenceSession.create(model,{executionProviders:[backend]});
+    const image=await action(ort,session);
+    return {image,backend};
+  } catch(error) {
+    if(adapter) error.retryCpu=true;
+    throw error;
+  } finally { await session?.release(); }
+}
+
+async function repairSelection({photo,strokes,mode,fsrcnnUrl,forceCpu=false}) {
   const bitmap=await createImageBitmap(photo);
   try {
     const {width,height}=bitmap;
@@ -2219,33 +2295,13 @@ async function repairSelection({photo,strokes,mode,fsrcnnUrl}) {
     if(area.w<=0 || area.h<=0) throw Error('Marcá un área de la foto.');
     const canvas=new OffscreenCanvas(width,height);
     const ctx=canvas.getContext('2d',{willReadFrequently:true});
-    const lama=mode==='lama';
-    const runtime='https://cdn.jsdelivr.net/npm/onnxruntime-web@'+(lama?'1.31.1':'1.22.0')+'/dist/';
-    self.postMessage({progress:lama?'Preparando LaMa · unos 106 MB la primera vez…':'Preparando reconstrucción de detalle con FSRCNN…'});
-    const model=lama
-      ? await loadVerifiedModel('https://huggingface.co/HiggityPiggity/lama-onnx-fp16/resolve/feb119a90ac45e7648aa5976559d481a5e9a4a48/lama_fp16w.onnx',
-          'e631637d760e3fa708c059ebc304c66a4867f00ad0891cf4fc0849966a42ecab')
-      : await loadVerifiedModel(fsrcnnUrl,'422da1d606efa65c9a2db14d9dc3f641fd4cdd8a71a32ba1204e3dfb7d458bb4');
-    const adapter=await navigator.gpu?.requestAdapter().catch(()=>null);
-    const backends=adapter ? ['webgpu','wasm'] : ['wasm'];
-    for(const backend of backends){
-      let session;
-      try {
-        const ort=await import(runtime+(backend==='webgpu'?'ort.webgpu.min.mjs':'ort.wasm.min.mjs'));
-        ort.env.wasm.wasmPaths=runtime;
-        ort.env.wasm.numThreads=1;
-        if(backend==='webgpu') ort.env.webgpu.adapter=adapter;
-        session=await ort.InferenceSession.create(model,{executionProviders:[backend]});
-        ctx.clearRect(0,0,width,height);
-        ctx.drawImage(bitmap,0,0);
-        if(lama) await repairWithLama(ctx,bitmap,area,strokes,ort,session);
-        else await repairDetail(ctx,bitmap,area,strokes,ort,session);
-        return {image:await canvas.convertToBlob({type:'image/png'}),backend};
-      } catch(error) {
-        if(backend==='wasm') throw error;
-        self.postMessage({progress:'WebGPU no pudo terminar. Continuando en CPU/WASM…'});
-      } finally { await session?.release(); }
-    }
+    return await runRepairModel(mode,fsrcnnUrl,forceCpu,async(ort,session)=>{
+      ctx.drawImage(bitmap,0,0);
+      if(mode==='lama') await repairWithLama(ctx,bitmap,area,strokes,ort,session);
+      else await repairDetail(ctx,bitmap,area,strokes,ort,session);
+      self.postMessage({progress:'Guardando el resultado del pincel…',stage:'cpu'});
+      return canvas.convertToBlob({type:'image/png'});
+    });
   } finally {
     bitmap.close();
   }
@@ -2259,7 +2315,7 @@ self.onmessage = async ({data: {cutout, background, strokes, original, generate,
       return;
     }
     if (frameExtension) {
-      self.postMessage({image:await extendFrame(frameExtension.photo,frameExtension.known)});
+      self.postMessage({image:await extendFrame(frameExtension)});
       return;
     }
     if (standalonePhoto) {
@@ -2328,7 +2384,7 @@ self.onmessage = async ({data: {cutout, background, strokes, original, generate,
     subject = undefined;
     await publish({integrated: !!integrated, generated});
   } catch (error) {
-    self.postMessage({error: error.message});
+    self.postMessage({error:error.message,retryCpu:error.retryCpu===true});
   } finally {
     subject?.close();
     backdrop?.close();
@@ -2899,6 +2955,63 @@ async function framedPng(source, box) {
   canvas.getContext('2d').drawImage(source,-box.x,-box.y);
   return await canvas.convertToBlob({type:'image/png'});
 }
+async function runRepairJob(key,args,status) {
+  const run=(forceCpu,fallback)=>new Promise((resolve,reject)=>{
+    const url=URL.createObjectURL(new Blob([modelWorkerCode('compose-worker')],{type:'text/javascript'}));
+    let worker,timeout,heartbeat,done=false,stage='start',lastMessage='',updated=performance.now();
+    function finish(error,result) {
+      if(done) return;
+      done=true;
+      clearTimeout(timeout);
+      clearInterval(heartbeat);
+      worker?.terminate();
+      URL.revokeObjectURL(url);
+      if(error) reject(error);
+      else resolve(result);
+    }
+    function update(message,nextStage) {
+      stage=nextStage || stage;
+      lastMessage=fallback+message;
+      status.textContent=lastMessage;
+      updated=performance.now();
+      clearTimeout(timeout);
+      const duration=stage==='gpu' ? 35000 : stage==='cpu' ? 150000 : 55000;
+      timeout=setTimeout(()=>{
+        const error=Error(lastMessage+' El navegador dejó de responder en esta etapa.');
+        error.retryCpu=stage==='gpu';
+        finish(error);
+      },duration);
+    }
+    try {
+      update('Abriendo el motor de imagen…');
+      heartbeat=setInterval(()=>{
+        const seconds=Math.floor((performance.now()-updated)/1000);
+        if(seconds>=2) status.textContent=lastMessage+' · '+seconds+' s';
+      },1000);
+      worker=new Worker(url,{type:'module'});
+      worker.onmessage=({data})=>{
+        if(data.progress) {update(data.progress,data.stage);return;}
+        if(data.image) {finish(null,data);return;}
+        const error=Error(data.error || 'El modelo no devolvió una imagen.');
+        error.retryCpu=data.retryCpu===true;
+        finish(error);
+      };
+      worker.onerror=event=>{
+        const error=Error('El navegador interrumpió el modelo.'+(event.message?' '+event.message:''));
+        error.retryCpu=stage==='gpu';
+        finish(error);
+      };
+      worker.onmessageerror=()=>finish(Error('El navegador no pudo leer la respuesta del modelo.'));
+      worker.postMessage({[key]:{...args,forceCpu}});
+    } catch(error) {finish(error);}
+  });
+  try { return await run(false,''); }
+  catch(error) {
+    if(!error.retryCpu) throw error;
+    return run(true,'WebGPU interrumpida. ');
+  }
+}
+
 completeFrame.onclick = async () => {
   if (!frameImage || completeFrame.disabled) return;
   const source = frameImage, request = frameRequest, box = currentFrame();
@@ -2908,21 +3021,9 @@ completeFrame.onclick = async () => {
   }
   busy(true);
   completeFrameStatus.textContent = 'Preparando el margen y la foto original…';
-  let worker, url, timeout;
   try {
-    const photo = await framedPng(source,box);
-    url = URL.createObjectURL(new Blob([modelWorkerCode('compose-worker')],{type:'text/javascript'}));
-    worker = new Worker(url);
-    const image = await new Promise((resolve,reject) => {
-      worker.onmessage = ({data}) => {
-        if (data.progress) completeFrameStatus.textContent = data.progress;
-        else if (data.image) resolve(data.image);
-        else reject(Error(data.error || 'El modelo no devolvió una imagen.'));
-      };
-      worker.onerror = () => reject(Error('El navegador interrumpió el modelo.'));
-      timeout = setTimeout(() => reject(Error('La generación superó el tiempo límite.')),180000);
-      worker.postMessage({frameExtension:{photo,known:sourceInFrame(source,box)}});
-    });
+    const photo=await framedPng(source,box);
+    const {image}=await runRepairJob('frameExtension',{photo,known:sourceInFrame(source,box)},completeFrameStatus);
     const bitmap = await createImageBitmap(image);
     if (request !== frameRequest || source !== frameImage || JSON.stringify(currentFrame()) !== JSON.stringify(box)) {
       bitmap.close();
@@ -2935,9 +3036,6 @@ completeFrame.onclick = async () => {
   } catch (error) {
     completeFrameStatus.textContent = error.message;
   } finally {
-    clearTimeout(timeout);
-    worker?.terminate();
-    if (url) URL.revokeObjectURL(url);
     busy(false);
   }
 };
@@ -3449,21 +3547,9 @@ async function applySelectionRepair(mode) {
   busy(true);
   refreshHairControls();
   composeStatus.textContent='Preparando el área marcada…';
-  const url=URL.createObjectURL(new Blob([modelWorkerCode('compose-worker')],{type:'text/javascript'}));
-  let worker,timeout;
   try {
-    worker=new Worker(url,{type:'module'});
-    const {image,backend}=await new Promise((resolve,reject)=>{
-      worker.onmessage=({data})=>{
-        if(data.progress) composeStatus.textContent=data.progress;
-        else if(data.image) resolve(data);
-        else reject(Error(data.error || 'El modelo no devolvió una imagen.'));
-      };
-      worker.onerror=()=>reject(Error('El navegador interrumpió el modelo.'));
-      timeout=setTimeout(()=>reject(Error('La edición superó el tiempo límite.')),300000);
-      worker.postMessage({repair:{photo,strokes:selection,mode,
-        fsrcnnUrl:new URL('models/fsrcnn-x2.onnx',document.baseURI).href}});
-    });
+    const {image,backend}=await runRepairJob('repair',{photo,strokes:selection,mode,
+      fsrcnnUrl:new URL('models/fsrcnn-x2.onnx',document.baseURI).href},composeStatus);
     strokes=[];
     showComposition(image,image);
     composeStatus.textContent=(mode==='lama' ? 'Área rellenada con LaMa' : 'Detalle reconstruido con FSRCNN')+
@@ -3472,9 +3558,6 @@ async function applySelectionRepair(mode) {
     composeStatus.textContent=error.message;
     marking=true;
   } finally {
-    clearTimeout(timeout);
-    worker?.terminate();
-    URL.revokeObjectURL(url);
     composing=false;
     busy(false);
     refreshHairControls();
@@ -4206,9 +4289,43 @@ function startDiagnostic(photo) {
   }
 };
 
-async function loadVerifiedModel(url,expected) {
-  async function read(response) {
-    const bytes = await response.arrayBuffer();
+async function loadVerifiedModel(url,expected,report) {
+  async function read(response,downloading=false) {
+    let bytes;
+    if(downloading && report && response.body){
+      const declared=Number(response.headers.get('Content-Length'));
+      const total=Number.isFinite(declared) && declared>0 ? declared : 0;
+      const reader=response.body.getReader();
+      const chunks=[];
+      let buffer=total && total<256*1048576 ? new Uint8Array(total) : undefined;
+      let received=0,lastUpdate=0;
+      try {
+        while(true){
+          const {done,value}=await reader.read();
+          if(done) break;
+          if(buffer && received+value.length<=buffer.length) buffer.set(value,received);
+          else {
+            if(buffer) { chunks.push(buffer.subarray(0,received)); buffer=undefined; }
+            chunks.push(value);
+          }
+          received+=value.length;
+          const now=performance.now();
+          if(now-lastUpdate>350){
+            const amount=(received/1048576).toFixed(1)+' MB';
+            report(total && received<=total ? 'Descargando '+Math.floor(100*received/total)+' % · '+amount : 'Descargando · '+amount);
+            lastUpdate=now;
+          }
+        }
+      } finally {reader.releaseLock();}
+      if(buffer) bytes=received===buffer.length ? buffer.buffer : buffer.slice(0,received).buffer;
+      else {
+        const joined=new Uint8Array(received);
+        let offset=0;
+        for(const chunk of chunks){joined.set(chunk,offset);offset+=chunk.length;}
+        bytes=joined.buffer;
+      }
+    } else bytes=await response.arrayBuffer();
+    report?.('Verificando el archivo…');
     const digest = new Uint8Array(await crypto.subtle.digest('SHA-256',bytes));
     const hash = Array.from(digest,byte=>byte.toString(16).padStart(2,'0')).join('');
     if (hash !== expected) throw Error('El modelo no coincide con la versión verificada.');
@@ -4218,14 +4335,16 @@ async function loadVerifiedModel(url,expected) {
   try {
     cache = await caches.open('agarsito-verified-models-v1');
     const saved = await cache.match(url);
-    if (saved) return await read(saved);
+    if (saved) {report?.('Modelo encontrado en la caché…');return await read(saved);}
   } catch {
     if (cache) await cache.delete(url).catch(()=>{});
   }
+  report?.('Conectando para descargar el modelo…');
   const response = await fetch(url,{cache:'force-cache'});
   if (!response.ok) throw Error('No se pudo descargar el modelo (HTTP '+response.status+').');
-  const bytes = await read(response);
-  if (cache) await cache.put(url,new Response(bytes)).catch(()=>{});
+  const bytes = await read(response,true);
+  if (cache && report) cache.put(url,new Response(bytes)).catch(()=>{});
+  else if (cache) await cache.put(url,new Response(bytes)).catch(()=>{});
   return bytes;
 }
 
