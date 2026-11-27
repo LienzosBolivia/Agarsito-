@@ -126,6 +126,12 @@ main.agarsito-editor {width:min(1440px,100%);max-width:none;height:100dvh;margin
 <figure hidden><figcaption>Original</figcaption><img id="before" alt="Foto original"></figure>
 <figure hidden><figcaption>Fondo transparente</figcaption><div id="cutout-stage"><img id="after" alt="Foto recortada"><canvas id="erase-guide" aria-label="Marca restos del fondo" hidden></canvas></div></figure>
 </div>
+<section id="background-color-controls" hidden>
+<button id="isolate-background-color" type="button">Aislar persona y editar fondo</button>
+<button id="rejoin-background-color" type="button" hidden>Volver a unir persona y fondo</button>
+<button id="cancel-background-color" type="button" hidden>Cancelar ajuste del fondo</button>
+<p id="background-color-status" role="status"></p>
+</section>
 <section id="mask-tools" hidden>
 <h2>Corregir el recorte</h2>
 <button id="erase-toggle" aria-pressed="false">Quitar restos del fondo</button>
@@ -1468,6 +1474,7 @@ self.onmessage = async ({data}) => {
 
 <section id="color-tools" hidden>
 <h2>Ajustar color</h2>
+<p id="color-target"></p>
 <label for="edit-light">Iluminación <output id="value-light">0</output></label>
 <input id="edit-light" type="range" min="-100" max="100" value="0">
 <label for="edit-temp">Temperatura <output id="value-temp">0</output></label>
@@ -3168,6 +3175,7 @@ eraseToggle.onclick = () => {
   setEraseMode(!eraseMode);
 };
 function showCutout(png) {
+  clearBackgroundColorEdit();
   clearMesh();
   closeFraming();
   frameCutout.hidden = false;
@@ -3182,6 +3190,7 @@ function showCutout(png) {
   download.hidden = false;
   refreshMeshControls();
   refreshComposeControls();
+  backgroundColorControls();
 }
 eraseApply.onclick = async () => {
   if (eraseApply.disabled || !cutoutBlob) return;
@@ -3608,6 +3617,7 @@ async function composeBackground(selectedStrokes, generate = false, currentCompo
 }
 
 function clearOutput() {
+  clearBackgroundColorEdit();
   closeFraming();
   frameCutout.hidden = true;
   previousCutout = undefined;
@@ -3952,6 +3962,131 @@ const colorSize = document.querySelector('#color-size');
 const compareColor = document.querySelector('#compare-color');
 const colorEnabled = () => compareColor.checked && colorSliders.some(slider=>Number(slider.value));
 
+let backgroundColorEdit;
+const isolateBackground=document.querySelector('#isolate-background-color');
+const rejoinSubject=document.querySelector('#rejoin-background-color');
+const cancelBackgroundColor=document.querySelector('#cancel-background-color');
+const backgroundColorStatus=document.querySelector('#background-color-status');
+const colorTarget=document.querySelector('#color-target');
+const backgroundColorPreview=document.createElement('canvas');
+backgroundColorPreview.setAttribute('aria-label','Vista de los colores del fondo aislado');
+
+function backgroundColorControls() {
+  document.querySelector('#background-color-controls').hidden=!cutoutBlob;
+  isolateBackground.hidden=!cutoutBlob || !!backgroundColorEdit;
+  rejoinSubject.hidden=cancelBackgroundColor.hidden=!backgroundColorEdit;
+  isolateBackground.disabled=rejoinSubject.disabled=cancelBackgroundColor.disabled=editorBusy;
+  colorTarget.textContent=backgroundColorEdit ? 'Ajustando solo el fondo. Volvé a Recorte para reunir la foto.' : '';
+}
+
+function clearBackgroundColorEdit() {
+  backgroundColorEdit?.original.close();
+  backgroundColorEdit?.subject.close();
+  backgroundColorEdit=undefined;
+  backgroundColorPreview.width=backgroundColorPreview.height=1;
+  backgroundColorStatus.textContent='';
+  backgroundColorControls();
+}
+
+async function openBackgroundColorEdit() {
+  if(!workingPhoto || !cutoutBlob) return;
+  let original,subject;
+  try {
+    original=await createImageBitmap(workingPhoto);
+    subject=await createImageBitmap(cutoutBlob);
+    if(original.width!==subject.width || original.height!==subject.height){
+      throw Error('El recorte y la foto deben tener las mismas dimensiones.');
+    }
+    backgroundColorEdit={original,subject};
+    original=subject=undefined;
+    const source=backgroundColorEdit.original;
+    const scale=editorPreviewScale(source.width,source.height);
+    backgroundColorPreview.width=Math.max(1,Math.round(source.width*scale));
+    backgroundColorPreview.height=Math.max(1,Math.round(source.height*scale));
+    redrawColors();
+    backgroundColorControls();
+  } finally {
+    original?.close();
+    subject?.close();
+  }
+}
+
+function mixBackgroundColor(original,adjusted,subject,isolated) {
+  for(let i=0;i<original.length;i+=4){
+    const foreground=subject[i+3];
+    if(isolated){
+      for(let c=0;c<3;c++) original[i+c]=adjusted[i+c];
+      original[i+3]*=(255-foreground)/255;
+    } else if(foreground<250) {
+      const amount=(255-foreground)/255;
+      for(let c=0;c<3;c++) original[i+c]+=amount*(adjusted[i+c]-original[i+c]);
+    }
+  }
+}
+
+function paintBackgroundColor(canvas,isolated,values) {
+  const {original,subject}=backgroundColorEdit;
+  const {width,height}=canvas;
+  const ctx=canvas.getContext('2d',{willReadFrequently:true});
+  const mask=new OffscreenCanvas(width,Math.min(96,height)).getContext('2d',{willReadFrequently:true});
+  ctx.clearRect(0,0,width,height);
+  ctx.imageSmoothingQuality='high';
+  ctx.drawImage(original,0,0,width,height);
+  mask.imageSmoothingQuality='high';
+  for(let y=0;y<height;y+=96){
+    const rows=Math.min(96,height-y);
+    mask.clearRect(0,0,width,rows);
+    mask.drawImage(subject,0,-y,width,height);
+    const matte=mask.getImageData(0,0,width,rows).data;
+    const pixels=ctx.getImageData(0,y,width,rows);
+    const adjusted=new Uint8ClampedArray(pixels.data);
+    colorPixels(adjusted,...values);
+    mixBackgroundColor(pixels.data,adjusted,matte,isolated);
+    ctx.putImageData(pixels,0,y);
+  }
+}
+
+async function backgroundColorResult() {
+  const values=colorSliders.map(slider=>Number(slider.value));
+  if(!values.some(Boolean)) return workingPhoto;
+  const {width,height}=backgroundColorEdit.original;
+  const canvas=new OffscreenCanvas(width,height);
+  paintBackgroundColor(canvas,false,values);
+  return canvas.convertToBlob({type:'image/png'});
+}
+
+isolateBackground.onclick=async()=>{
+  if(editorBusy || !cutoutBlob) return;
+  busy(true);
+  try {
+    colorSliders.forEach(slider=>{slider.value='0';});
+    compareColor.checked=true;
+    await openBackgroundColorEdit();
+    backgroundColorStatus.textContent='Persona aislada. Ajustá el fondo en Color y después pulsá Volver a unir.';
+    selectWorkspaceTool('color');
+  } catch(error) {backgroundColorStatus.textContent=error.message;}
+  finally {busy(false);}
+};
+
+rejoinSubject.onclick=async()=>{
+  if(editorBusy || !backgroundColorEdit) return;
+  busy(true);
+  try {
+    const photo=await backgroundColorResult();
+    setWorkingPhoto(photo,'Foto reunida',true);
+    workspaceStatus.textContent='Persona reunida con el fondo ajustado.';
+  } catch(error) {backgroundColorStatus.textContent=error.message;}
+  finally {busy(false);}
+};
+
+cancelBackgroundColor.onclick=()=>{
+  if(editorBusy || !backgroundColorEdit) return;
+  clearBackgroundColorEdit();
+  refreshColorSource();
+  syncWorkspaceView();
+  queueAutosave();
+};
+
 function editorPreviewScale(width,height) {
   return Math.min(1, 2048/Math.max(width,height), Math.sqrt(2500000/(width*height)));
 }
@@ -3980,6 +4115,11 @@ function paintColors(canvas) {
 }
 function redrawColors(){
   colorSliders.forEach((slider,i)=>{document.querySelector('#value-'+colorKeys[i]).textContent=slider.value;});
+  if (backgroundColorEdit) {
+    const values=compareColor.checked ? colorSliders.map(slider=>Number(slider.value)) : [0,0,0];
+    paintBackgroundColor(backgroundColorPreview,true,values);
+    return;
+  }
   if (!colorBitmap) return;
   const adjusted = colorEnabled();
   colorOriginal.hidden = adjusted;
@@ -4087,6 +4227,7 @@ function busy(value) {
   refreshMeshControls();
   refreshComposeControls();
   refreshHairControls();
+  backgroundColorControls();
   picker.disabled = value;
   cut.disabled = value || !workingPhoto;
   cutCpu.disabled = cut.disabled;
@@ -4457,7 +4598,7 @@ const oldPreviews = editor.querySelector('.previews');
 const cutoutView = after.closest('figure');
 const originalView = before.closest('figure');
 const compositeView = composite.closest('figure');
-const workspaceViews = [originalView,cutoutView,compositeView,meshView,framePreview,restorePreview,restoreBeforePreview,colorOriginal,colorPreview];
+const workspaceViews = [originalView,cutoutView,compositeView,meshView,framePreview,restorePreview,restoreBeforePreview,colorOriginal,colorPreview,backgroundColorPreview];
 for (const view of workspaceViews) {
   view.classList.add('stage-view');
   stage.append(view);
@@ -4465,7 +4606,7 @@ for (const view of workspaceViews) {
 
 const workspaceDefinitions = [
   ['frame','Encuadre',[frameOriginal,frameCutout,frameComposite,framing]],
-  ['cut','Recorte',[fineControls,cut,cutCpu,cutPortrait,cutBirefnet,portraitHelp,photoStatus,maskTools,download]],
+  ['cut','Recorte',[fineControls,cut,cutCpu,cutPortrait,cutBirefnet,portraitHelp,photoStatus,document.querySelector('#background-color-controls'),maskTools,download]],
   ['background','Fondo y borde',[openOriginalEdge,composition]],
   ['color','Color',[colorTools]],
   ['restore','Restaurar',[document.querySelector('#restore')]],
@@ -4544,9 +4685,9 @@ function syncWorkspaceView() {
   const base = savedCutoutActive && cutoutBlob ? cutoutView : originalView;
   const view = {
     frame:!framing.hidden && frameImage ? framePreview : base,
-    cut:cutoutBlob ? cutoutView : base,
+    cut:backgroundColorEdit ? backgroundColorPreview : cutoutBlob ? cutoutView : base,
     background:!compositeView.hidden ? compositeView : cutoutBlob ? cutoutView : base,
-    color:colorBitmap ? (colorEnabled() ? colorPreview : colorOriginal) : base,
+    color:backgroundColorEdit ? backgroundColorPreview : colorBitmap ? (colorEnabled() ? colorPreview : colorOriginal) : base,
     restore:!restoreResult.hidden ? (compareRestoration.checked ? restorePreview : restoreBeforePreview) : base,
     mesh:!meshView.hidden ? meshView : !compositeView.hidden && composedResult ? compositeView : cutoutBlob ? cutoutView : base,
     diagnostic:base
@@ -4625,7 +4766,7 @@ function latestWork() {
     version:2,photo:workingPhoto,cutout:cutoutBlob,cutoutActive:savedCutoutActive,tab:workspaceTab,
     previousCutout,composedResult,compositeBlob,meshResult,standaloneEdge,
     frame:frameImage ? {source:frameSources.indexOf(frameImage),values:frameControls.map(control=>control.value),fill:frameFill?.image} : undefined,
-    colors:colorSliders.map(slider=>slider.value),showColor:compareColor.checked,
+    colors:colorSliders.map(slider=>slider.value),showColor:compareColor.checked,backgroundColorIsolated:!!backgroundColorEdit,
     restoration:restoreDraftData ? {...restoreDraftData,showImproved:compareRestoration.checked,strength:restoreStrength.value} : undefined,
     catalogBackground:catalogBackground.value,catalogMesh:catalogMesh.value,background:background.files[0] || draftBackground,
     strokes,marking,eraseStrokes,eraseMode
@@ -4711,6 +4852,10 @@ async function recoverWork(draft) {
       }
     }
     await refreshColorSource();
+    if (draft.backgroundColorIsolated && cutoutBlob) {
+      await openBackgroundColorEdit();
+      backgroundColorStatus.textContent='Persona aislada. Ajustá el fondo en Color y después pulsá Volver a unir.';
+    }
     if (draft.colors) colorSliders.forEach((slider,i)=>{slider.value=draft.colors[i] || '0';});
     if (typeof draft.showColor==='boolean') compareColor.checked=draft.showColor;
     redrawColors();
@@ -4735,6 +4880,9 @@ resumeEdit.onclick=async()=>{
 };
 
 async function workspaceOutput() {
+  if (backgroundColorEdit && (workspaceTab==='color' || workspaceTab==='cut')) {
+    return {photo:await backgroundColorResult()};
+  }
   if (workspaceTab === 'frame' && frameImage && !framing.hidden) {
     if (frameFill) return {photo:frameFill.image};
     const box = currentFrame();
