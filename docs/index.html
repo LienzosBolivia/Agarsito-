@@ -1760,19 +1760,20 @@ function cleanFrameBoundary(source,known) {
   return clean;
 }
 
-function frameEdgeGuide(source,edge,stride) {
-  const depth = Math.min(stride+2,edge.inside-1);
+function frameEdgeGuide(source,edge,stride,texture=0) {
+  const depth=Math.min(edge.inside-1,Math.max(stride+2,texture));
+  const slopeDepth=Math.min(stride+2,depth);
   const {data,index}=readFrameEdge(source,edge,depth);
   const step = 12;
   const slopes = [];
   for (let anchor=0;anchor<edge.length+step;anchor+=step) {
     let bestShift=0, bestError=Infinity;
-    if (depth>2) {
+    if (slopeDepth>2) {
       for (let shift=-5;shift<=5;shift++) {
         let error=0.6*shift*shift, compared=0;
         for (let s=anchor-step;s<=anchor+step;s+=2) {
           if (s<0 || s>=edge.length || s-shift<0 || s-shift>=edge.length) continue;
-          const near=index(s,1), far=index(s-shift,depth);
+          const near=index(s,1), far=index(s-shift,slopeDepth);
           if (data[near+3]<240 || data[far+3]<240) continue;
           compared++;
           for (let c=0;c<3;c++) error+=Math.min(45,Math.abs(data[near+c]-data[far+c]));
@@ -1783,12 +1784,12 @@ function frameEdgeGuide(source,edge,stride) {
         }
       }
     }
-    slopes.push(bestShift/Math.max(1,depth-1));
+    slopes.push(bestShift/Math.max(1,slopeDepth-1));
   }
-  return (position,distance)=>{
+  return (position,distance,inset=0)=>{
     const anchor=Math.floor(position/step), fraction=(position%step)/step;
     const slope=slopes[anchor]*(1-fraction)+slopes[anchor+1]*fraction;
-    const i=index(position-slope*distance,0);
+    const i=index(position-slope*distance,Math.min(depth,inset));
     return data.subarray(i,i+4);
   };
 }
@@ -1831,14 +1832,15 @@ function extendThinMargin(ctx,bitmap,known,margin) {
   const edge=frameEdges(bitmap.width,bitmap.height,known).find(edge=>edge.horizontal===margin.horizontal &&
     (edge.horizontal ? edge.direction===(margin.y===0 ? -1 : 1) : edge.direction===(margin.x===0 ? -1 : 1)));
   if(!edge) return;
-  const guide=frameEdgeGuide(bitmap,edge,10);
   const {x,y,w,h}=margin;
+  const guide=frameEdgeGuide(bitmap,edge,10,edge.horizontal ? h : w);
   const patch=ctx.createImageData(w,h);
   for(let row=0;row<h;row++)for(let col=0;col<w;col++){
     const along=edge.horizontal ? x+col-edge.x : y+row-edge.y;
     const depth=edge.horizontal ? Math.abs(y+row-edge.y) : Math.abs(x+col-edge.x);
     const pos=Math.max(0,Math.min(edge.length-1,along));
-    patch.data.set(guide(pos,depth-1),(row*w+col)*4);
+    // Reflect nearby texture at native resolution, with the first pixel matched to the source edge.
+    patch.data.set(guide(pos,depth-1,depth-1),(row*w+col)*4);
   }
   ctx.putImageData(patch,x,y);
 }
@@ -1871,9 +1873,10 @@ async function extendFrame({photo,known,forceCpu=false}) {
     if(!known || known.width<=0 || known.height<=0) throw Error('El encuadre debe incluir parte de la foto.');
     const sourceRegion=cleanFrameBoundary(bitmap,known);
     const margins=frameMargins(width,height,sourceRegion);
-    const threshold=Math.min(18,Math.max(6,Math.round(Math.min(width,height)*0.012)));
+    const verticalLimit=Math.min(18,Math.max(6,Math.round(sourceRegion.height*0.012)));
+    const lateralLimit=Math.min(64,Math.max(10,Math.round(sourceRegion.width*0.06)));
     const jobs=[];
-    const thin=margins.filter(m=>(m.horizontal?m.h:m.w)<=threshold);
+    const thin=margins.filter(m=>m.horizontal ? m.h<=verticalLimit : m.w<=lateralLimit);
     for(const margin of margins){
       if(thin.includes(margin)) continue;
       const length=margin.horizontal?margin.w:margin.h;
