@@ -91,6 +91,7 @@ main.agarsito-editor {width:min(1440px,100%);max-width:none;height:100dvh;margin
 <p id="frame-source"></p>
 <label for="print-format">Proporción de la medida</label>
 <select id="print-format">
+<option value="original">Mantener tamaño original</option>
 <option value="20,27">20 × 27 cm</option>
 <option value="16,22">16 × 22 cm</option>
 <option value="30,42">30 × 42 cm</option>
@@ -1801,22 +1802,56 @@ function frameEdgeGuide(source,edge,stride,texture=0) {
   };
 }
 
+function matchGeneratedEdgeColor(strip,edge,guide,w,h,x,y) {
+  const depth=edge.horizontal?h:w;
+  if(depth<2) return;
+  const step=16;
+  const offsets=[];
+  for(let anchor=0;anchor<edge.length+step;anchor+=step){
+    const sums=[0,0,0];
+    let samples=0;
+    for(let s=Math.max(0,anchor-step);s<Math.min(edge.length,anchor+step);s+=2){
+      const color=guide(s,0);
+      if(color[3]<250) continue;
+      for(let d=1;d<=Math.min(4,depth);d++){
+        const [px,py]=alongFrameEdge(edge,s,d);
+        const i=((py-y)*w+px-x)*4;
+        if(strip.data[i+3]<250) continue;
+        for(let c=0;c<3;c++) sums[c]+=color[c]-strip.data[i+c];
+        samples++;
+      }
+    }
+    offsets.push(sums.map(sum=>Math.max(-36,Math.min(36,sum/Math.max(1,samples)))));
+  }
+  for(let s=0;s<edge.length;s++){
+    const anchor=Math.floor(s/step),t=(s%step)/step;
+    const delta=offsets[anchor].map((d,c)=>d+(offsets[anchor+1][c]-d)*t);
+    for(let d=1;d<=depth;d++){
+      const [px,py]=alongFrameEdge(edge,s,d);
+      const i=((py-y)*w+px-x)*4;
+      const fade=1-(d-1)/depth;
+      for(let c=0;c<3;c++) strip.data[i+c]+=delta[c]*fade*fade;
+    }
+  }
+}
+
 function blendExtendedFrame(ctx,bitmap,known) {
   const {width,height}=bitmap;
   const limit=Math.max(4,Math.min(14,Math.round(Math.min(width,height)*0.008)));
   for (const edge of frameEdges(width,height,known)) {
-    const depth=Math.min(limit,edge.margin);
+    const depth=Math.min(Math.max(limit,56),edge.margin);
     const guide=frameEdgeGuide(bitmap,edge,Math.max(7,Math.round(limit*0.55)));
     const [x,y]=alongFrameEdge(edge,0,edge.direction<0 ? depth : 1);
     const w=edge.horizontal ? edge.length : depth;
     const h=edge.horizontal ? depth : edge.length;
     const strip=ctx.getImageData(x,y,w,h);
+    matchGeneratedEdgeColor(strip,edge,guide,w,h,x,y);
     for (let s=0;s<edge.length;s++) {
-      for (let d=1;d<=depth;d++) {
+      for (let d=1;d<=Math.min(limit,depth);d++) {
         const color=guide(s,d-1);
         const [px,py]=alongFrameEdge(edge,s,d);
         const index=((py-y)*w+px-x)*4;
-        const t=(d-1)/Math.max(1,depth-1);
+        const t=(d-1)/Math.max(1,Math.min(limit,depth)-1);
         const weight=(1-t*t*(3-2*t))*color[3]/255;
         for (let c=0;c<3;c++) strip.data[index+c]+=(color[c]-strip.data[index+c])*weight;
       }
@@ -1888,7 +1923,7 @@ async function extendFrame({photo,known,forceCpu=false}) {
       if(thin.includes(margin)) continue;
       const length=margin.horizontal?margin.w:margin.h;
       const depth=margin.horizontal?margin.h:margin.w;
-      const step=Math.max(384,depth,Math.ceil(length/6));
+      const step=Math.max(512,depth,Math.ceil(length/5));
       for(let pos=0;pos<length;pos+=step){
         const overlap=Math.min(pos,32);
         const size=Math.min(length,pos+step)-pos+overlap;
@@ -2877,8 +2912,9 @@ function cropBox(width, height, ratioWidth, ratioHeight, x, y, zoom = 1, expand 
   };
 }
 function currentFrame() {
-  let [w, h] = format.value.split(',').map(Number);
-  if (orientation.value === 'landscape') [w, h] = [h, w];
+  let [w,h]=format.value==='original'
+    ? [frameImage.naturalWidth,frameImage.naturalHeight] : format.value.split(',').map(Number);
+  if (format.value!=='original' && orientation.value==='landscape') [w,h]=[h,w];
   return cropBox(frameImage.naturalWidth, frameImage.naturalHeight, w, h, Number(frameX.value), Number(frameY.value), Number(frameZoom.value) / 100, Number(frameExpand.value) / 100);
 }
 function sourceInFrame(source, box) {
@@ -2921,6 +2957,7 @@ function showFramePreview() {
   completeFrame.hidden = !hasMargin;
   completeFrame.disabled = editorBusy || !known.width || !known.height;
   frameX.disabled = frameY.disabled = editorBusy;
+  orientation.disabled=editorBusy || format.value==='original';
   for (const slider of [frameX,frameY,frameZoom,frameExpand]) document.querySelector('#'+slider.id+'-value').textContent = slider.value+' %';
   frameStatus.textContent = 'Foto: '+frameImage.naturalWidth+' × '+frameImage.naturalHeight+' px · Encuadre: '+box.width+' × '+box.height+' px' + (frameFill ? ' · margen completado con IA' : hasMargin ? ' · margen transparente' : '') + '.';
 }
@@ -4200,7 +4237,8 @@ function busy(value) {
   openOriginalEdge.disabled = value;
   applyFrame.disabled = frameOriginal.disabled = frameCutout.disabled = frameComposite.disabled = value;
   saveFrame.disabled = value;
-  format.disabled = orientation.disabled = frameZoom.disabled = frameExpand.disabled = value;
+  format.disabled = frameZoom.disabled = frameExpand.disabled = value;
+  orientation.disabled=value || format.value==='original';
   completeFrame.disabled = value;
   if (value) frameX.disabled = frameY.disabled = true;
   else if (frameImage) showFramePreview();
@@ -4295,13 +4333,15 @@ cutPortrait.onclick = () => {
 };
 cutBirefnet.onclick=()=>{
   if (cutBirefnet.disabled) return;
-  let interrupted=false;
+  let interrupted=false, gpuUnavailable=birefnetCpuOnly;
   try {
     interrupted=localStorage.getItem(pendingBirefnetGpuKey)==='1';
+    gpuUnavailable ||= localStorage.getItem(birefnetFailureKey)===birefnetDeviceId;
     localStorage.removeItem(pendingBirefnetGpuKey);
   } catch {}
   busy(true);
-  runModel(navigator.gpu && !interrupted ? 'webgpu' : 'wasm',
+  runModel(navigator.gpu && !interrupted && !gpuUnavailable ? 'webgpu' : 'wasm',
+    gpuUnavailable ? 'BiRefNet usará CPU en este navegador. ' :
     interrupted ? 'La prueba GPU anterior se interrumpió. ' : '',workingPhoto,false,true);
 };
 function updateProfile(next) {
@@ -4312,6 +4352,9 @@ function updateProfile(next) {
 }
 const pendingGpuKey = 'agarsito-u2netp-webgpu-adapted-pending';
 const pendingBirefnetGpuKey='agarsito-birefnet-webgpu-pending';
+const birefnetFailureKey='agarsito-birefnet-webgpu-device-lost-v1';
+const birefnetDeviceId=navigator.userAgent || 'browser';
+let birefnetCpuOnly=false;
 
 function testModel(photo) {
   let interrupted = false;
@@ -4347,7 +4390,14 @@ function runModel(backend, note = '', photo, portrait = false, birefnet = false)
     if (gpu) {
       try { localStorage.removeItem(pendingKey); } catch {}
       if (!ok) {
-        runModel('wasm', 'WebGPU falló: ' + message + ' ', photo,portrait,birefnet);
+        const deviceLost=birefnet && /device[^.]{0,28}(?:is |was )?lost|out of memory|memoria insuficiente/i.test(message||'');
+        if(deviceLost){
+          birefnetCpuOnly=true;
+          try {localStorage.setItem(birefnetFailureKey,birefnetDeviceId);} catch {}
+        }
+        const fallback=birefnet ? (deviceLost ? 'Se perdió la conexión con la GPU. ' : 'BiRefNet no pudo terminar en WebGPU. ')
+          : 'WebGPU falló: '+message+' ';
+        runModel('wasm',fallback,photo,portrait,birefnet);
         return;
       }
     }
