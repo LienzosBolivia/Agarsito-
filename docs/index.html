@@ -85,7 +85,7 @@ main.agarsito-editor {width:min(1440px,100%);max-width:none;height:100dvh;margin
 <label for="photo">Elegí una foto</label>
 <input id="photo" type="file" accept="image/*">
 <button id="frame-original" hidden>Encuadrar foto</button>
-<button id="open-original-edge" type="button" hidden>Reconstruir borde con IA en foto activa</button>
+<button id="open-original-edge" type="button" hidden>Abrir pincel en foto activa</button>
 <section id="framing" hidden>
 <h2>Encuadre</h2>
 <p id="frame-source"></p>
@@ -942,10 +942,6 @@ function tileProbe(x,y,w,h) {
   };
 }
 
-function fsrcnnLuma(r,g,b) {
-  return 0.299*r+0.587*g+0.114*b;
-}
-
 async function runFsrcnn(image,adapter,modelUrl,started,large) {
   const {width,height}=image;
   const backend=adapter ? 'webgpu' : 'wasm';
@@ -987,38 +983,9 @@ async function runFsrcnn(image,adapter,modelUrl,started,large) {
         const left=Math.max(0,x-halo), top=Math.max(0,y-halo);
         const w=Math.min(width,x+cw+halo)-left, h=Math.min(height,y+ch+halo)-top;
         const rgba=source.getImageData(left,top,w,h).data;
-        const plane=w*h;
-        const luma=new Float32Array(plane);
-        for (let i=0;i<plane;i++) luma[i]=fsrcnnLuma(rgba[4*i],rgba[4*i+1],rgba[4*i+2])/255;
-        const input=new ort.Tensor('float32',luma,[1,1,h,w]);
-        let predictions;
-        try {
-          predictions=await session.run({luma:input});
-          const prediction=predictions.phases;
-          const data=prediction.location==='cpu' ? prediction.data : await prediction.getData();
-          if (prediction.dims.join(',')!==[1,4,h,w].join(',') || !data.every(Number.isFinite)) {
-            throw Error('FSRCNN devolvió un bloque inválido.');
-          }
-          const tile=result.getImageData(x*2,y*2,cw*2,ch*2);
-          for (let dy=0;dy<ch*2;dy++) {
-            for (let dx=0;dx<cw*2;dx++) {
-              const phase=(dy%2)*2+dx%2;
-              const lumaIndex=(y-top+(dy>>1))*w+x-left+(dx>>1);
-              const i=(dy*tile.width+dx)*4;
-              if (!tile.data[i+3]) continue;
-              const r=tile.data[i],g=tile.data[i+1],b=tile.data[i+2];
-              const delta=data[phase*plane+lumaIndex]*255-fsrcnnLuma(r,g,b);
-              const bounded=Math.max(-Math.min(r,g,b),Math.min(255-Math.max(r,g,b),delta));
-              tile.data[i]=r+bounded;
-              tile.data[i+1]=g+bounded;
-              tile.data[i+2]=b+bounded;
-            }
-          }
-          result.putImageData(tile,x*2,y*2);
-        } finally {
-          input.dispose();
-          for (const tensor of Object.values(predictions || {})) tensor.dispose();
-        }
+        const tile=result.getImageData(x*2,y*2,cw*2,ch*2);
+        await fsrcnnTile(ort,session,rgba,w,h,x-left,y-top,tile);
+        result.putImageData(tile,x*2,y*2);
         completed+=cw*ch;
         self.postMessage({progress:Math.round(100*completed/(width*height)),backend,route,core});
         await new Promise(resolve=>setTimeout(resolve,0));
@@ -1469,15 +1436,17 @@ self.onmessage = async ({data}) => {
 <button id="compose" disabled>Aplicar fondo</button>
 <p id="background-source" role="status"></p>
 <p id="compose-status" role="status"></p>
-<figure id="composition-view" hidden><figcaption>Foto con el fondo elegido</figcaption><div id="composition-stage"><img id="composite" alt="Retrato con el fondo elegido"><canvas id="hair-guide" aria-label="Área para marcar el borde del cabello" hidden></canvas></div></figure>
+<figure id="composition-view" hidden><figcaption>Foto con el fondo elegido</figcaption><div id="composition-stage"><img id="composite" alt="Retrato con el fondo elegido"><canvas id="hair-guide" aria-label="Área de selección con pincel" hidden></canvas></div></figure>
 <div id="hair-tools" hidden>
-<p>Trazá sobre el borde del cabello que querés integrar. El trazo solo indica dónde trabajar.</p>
-<button id="mark-hair" aria-pressed="false">Marcar cabello</button>
+<p>Marcá el área con el pincel y elegí qué hacer con la selección.</p>
+<button id="mark-hair" aria-pressed="false">Marcar área</button>
 <label for="hair-brush-size">Tamaño del pincel <output id="hair-brush-value">2 %</output></label>
 <input id="hair-brush-size" type="range" min="0.5" max="7" step="0.25" value="2">
 <button id="clear-hair" disabled>Borrar marcas</button>
 <button id="apply-hair" disabled>Integrar cabello</button>
 <button id="generate-hair" disabled>Reconstruir borde con IA</button>
+<button id="repair-detail" disabled>Reconstruir detalle · FSRCNN</button>
+<button id="repair-lama" disabled>Quitar y rellenar · LaMa</button>
 <p>MI-GAN se descarga al usar esta opción (28,1 MB). La foto se procesa en el dispositivo.</p>
 </div>
 <button id="use-composite" hidden>Usar foto con fondo para seguir editando</button>
@@ -2081,9 +2050,214 @@ function edgeBlendAmount(opacity, mark) {
   return 0.52 * Math.min(1, opacity / 22) * (1 - a) * (mark / 255);
 }
 
-self.onmessage = async ({data: {cutout, background, strokes, original, generate, currentComposition, mesh, catalogBackground, standalonePhoto, frameExtension}}) => {
+function brushBounds(width,height,strokes) {
+  let left=width,top=height,right=0,bottom=0;
+  for(const {points,size} of strokes){
+    const radius=Math.min(width,height)*size/2;
+    for(const [x,y] of points){
+      left=Math.min(left,x*width-radius);
+      top=Math.min(top,y*height-radius);
+      right=Math.max(right,x*width+radius);
+      bottom=Math.max(bottom,y*height+radius);
+    }
+  }
+  const x=Math.max(0,Math.floor(left)),y=Math.max(0,Math.floor(top));
+  return {x,y,w:Math.min(width,Math.ceil(right))-x,h:Math.min(height,Math.ceil(bottom))-y};
+}
+
+function paintRepairMask(ctx,width,height,strokes,sx,sy,tx,ty) {
+  ctx.save();
+  ctx.setTransform(sx,0,0,sy,tx,ty);
+  ctx.lineCap=ctx.lineJoin='round';
+  for(const {points:[[x,y],...rest],size} of strokes){
+    const radius=Math.min(width,height)*size/2;
+    ctx.beginPath();
+    ctx.arc(x*width,y*height,radius,0,2*Math.PI);
+    ctx.fill();
+    if(rest.length){
+      ctx.beginPath();
+      ctx.lineWidth=radius*2;
+      ctx.moveTo(x*width,y*height);
+      for(const [px,py] of rest) ctx.lineTo(px*width,py*height);
+      ctx.stroke();
+    }
+  }
+  ctx.restore();
+}
+
+function applyBrushPatch(ctx,patch,area,strokes,feather) {
+  const {width,height}=ctx.canvas;
+  const {x,y,w,h}=area;
+  const strip=new OffscreenCanvas(w,Math.min(64,h)).getContext('2d',{willReadFrequently:true});
+  const mask=new OffscreenCanvas(w+2*feather,Math.min(64,h)+2*feather).getContext('2d',{willReadFrequently:true});
+  strip.imageSmoothingQuality='high';
+  for(let top=0;top<h;top+=64){
+    const rows=Math.min(64,h-top);
+    mask.clearRect(0,0,mask.canvas.width,mask.canvas.height);
+    paintRepairMask(mask,width,height,strokes,1,1,feather-x,feather-y-top);
+    const stride=mask.canvas.width*4;
+    const weights=mask.getImageData(0,0,mask.canvas.width,rows+2*feather).data;
+    const data=ctx.getImageData(x,y+top,w,rows);
+    strip.clearRect(0,0,w,rows);
+    strip.drawImage(patch,0,-top,w,h);
+    const next=strip.getImageData(0,0,w,rows).data;
+    for(let row=0;row<rows;row++)for(let col=0;col<w;col++){
+      const m=(row+feather)*stride+(col+feather)*4+3;
+      let strength=weights[m]/255;
+      if(!strength) continue;
+      const i=(row*w+col)*4;
+      if(!data.data[i+3]) continue;
+      if(feather){
+        const d=feather*4,v=feather*stride;
+        const surrounding=(weights[m-d]+weights[m+d]+weights[m-v]+weights[m+v])/1020;
+        strength*=0.5+0.5*surrounding;
+      }
+      for(let c=0;c<3;c++) data.data[i+c]+=strength*(next[i+c]-data.data[i+c]);
+    }
+    ctx.putImageData(data,x,y+top);
+  }
+}
+
+async function repairDetail(ctx,bitmap,area,strokes,ort,session) {
+  const {width,height}=bitmap;
+  const core=128,halo=6;
+  const {x,y,w,h}=area;
+  let finished=0;
+  for(let top=y;top<y+h;top+=core)for(let left=x;left<x+w;left+=core){
+    const cw=Math.min(core,x+w-left),ch=Math.min(core,y+h-top);
+    const mask=new OffscreenCanvas(cw,ch).getContext('2d',{willReadFrequently:true});
+    paintRepairMask(mask,width,height,strokes,1,1,-left,-top);
+    const selected=mask.getImageData(0,0,cw,ch).data.some((v,i)=>(i&3)===3 && v>0);
+    if(selected){
+      const l=Math.max(0,left-halo),t=Math.max(0,top-halo);
+      const sw=Math.min(width,left+cw+halo)-l,sh=Math.min(height,top+ch+halo)-t;
+      const sample=new OffscreenCanvas(sw,sh).getContext('2d',{willReadFrequently:true});
+      sample.drawImage(bitmap,l,t,sw,sh,0,0,sw,sh);
+      const enlarged=new OffscreenCanvas(cw*2,ch*2).getContext('2d',{willReadFrequently:true});
+      enlarged.imageSmoothingQuality='high';
+      enlarged.drawImage(bitmap,left,top,cw,ch,0,0,cw*2,ch*2);
+      const tile=enlarged.getImageData(0,0,cw*2,ch*2);
+      await fsrcnnTile(ort,session,sample.getImageData(0,0,sw,sh).data,sw,sh,left-l,top-t,tile);
+      enlarged.putImageData(tile,0,0);
+      applyBrushPatch(ctx,enlarged.canvas,{x:left,y:top,w:cw,h:ch},strokes,2);
+    }
+    finished+=cw*ch;
+    self.postMessage({progress:'Reconstruyendo detalle · '+Math.round(finished/(w*h)*100)+' %'});
+  }
+}
+
+function lamaContext(area,width,height) {
+  const size=Math.max(area.w,area.h);
+  const pad=Math.max(48,Math.ceil(size*0.35));
+  const x=Math.max(0,area.x-pad),y=Math.max(0,area.y-pad);
+  return {x,y,w:Math.min(width,area.x+area.w+pad)-x,h:Math.min(height,area.y+area.h+pad)-y};
+}
+
+async function repairWithLama(ctx,bitmap,area,strokes,ort,session) {
+  const {width,height}=bitmap;
+  const crop=lamaContext(area,width,height);
+  const side=512,plane=side*side,scale=side/Math.max(crop.w,crop.h);
+  const w=Math.max(1,Math.round(crop.w*scale)),h=Math.max(1,Math.round(crop.h*scale));
+  const x=Math.floor((side-w)/2),y=Math.floor((side-h)/2);
+  const sx=w/crop.w,sy=h/crop.h;
+  const canvas=new OffscreenCanvas(side,side);
+  const sample=canvas.getContext('2d',{willReadFrequently:true});
+  sample.fillStyle='#808080';
+  sample.fillRect(0,0,side,side);
+  sample.imageSmoothingQuality='high';
+  sample.drawImage(bitmap,crop.x,crop.y,crop.w,crop.h,x,y,w,h);
+  const input=sample.getImageData(0,0,side,side).data;
+  const brush=new OffscreenCanvas(side,side).getContext('2d',{willReadFrequently:true});
+  paintRepairMask(brush,width,height,strokes,sx,sy,x-crop.x*sx,y-crop.y*sy);
+  const marks=brush.getImageData(0,0,side,side).data;
+  const mask=new Float32Array(plane), rgb=new Float32Array(plane*3);
+  for(let row=0;row<side;row++)for(let col=0;col<side;col++){
+    const i=row*side+col;
+    for(let dy=-1;dy<=1 && !mask[i];dy++){
+      if(row+dy<0 || row+dy>=side) continue;
+      for(let dx=-1;dx<=1;dx++){
+        if(col+dx>=0 && col+dx<side && marks[((row+dy)*side+col+dx)*4+3]>0){mask[i]=1;break;}
+      }
+    }
+    if(!mask[i]) for(let c=0;c<3;c++) rgb[c*plane+i]=input[i*4+c]/255;
+  }
+  const image=new ort.Tensor('float32',rgb,[1,3,side,side]);
+  const selection=new ort.Tensor('float32',mask,[1,1,side,side]);
+  let outputs;
+  try {
+    self.postMessage({progress:'LaMa está regenerando lo que hay detrás de la selección…'});
+    outputs=await session.run({image,mask:selection});
+    const output=outputs.output;
+    const values=output.location==='cpu' ? output.data : await output.getData();
+    if(output.dims.join(',')!==[1,3,side,side].join(',') || !values.every(Number.isFinite)){
+      throw Error('LaMa devolvió una imagen inválida.');
+    }
+    const result=sample.createImageData(side,side);
+    for(let i=0;i<plane;i++){
+      for(let c=0;c<3;c++) result.data[i*4+c]=values[c*plane+i];
+      result.data[i*4+3]=255;
+    }
+    sample.putImageData(result,0,0);
+    const patch=new OffscreenCanvas(Math.max(1,Math.round(area.w*sx)),Math.max(1,Math.round(area.h*sy))).getContext('2d');
+    patch.imageSmoothingQuality='high';
+    patch.drawImage(canvas,x+(area.x-crop.x)*sx,y+(area.y-crop.y)*sy,area.w*sx,area.h*sy,
+      0,0,patch.canvas.width,patch.canvas.height);
+    applyBrushPatch(ctx,patch.canvas,area,strokes,3);
+  } finally {
+    image.dispose();
+    selection.dispose();
+    for(const tensor of Object.values(outputs || {})) tensor.dispose();
+  }
+}
+
+async function repairSelection({photo,strokes,mode,fsrcnnUrl}) {
+  const bitmap=await createImageBitmap(photo);
+  try {
+    const {width,height}=bitmap;
+    if(width*height>16000000 || Math.max(width,height)>8192) throw Error('La foto supera el tamaño admitido para el pincel.');
+    const area=brushBounds(width,height,strokes);
+    if(area.w<=0 || area.h<=0) throw Error('Marcá un área de la foto.');
+    const canvas=new OffscreenCanvas(width,height);
+    const ctx=canvas.getContext('2d',{willReadFrequently:true});
+    const lama=mode==='lama';
+    const runtime='https://cdn.jsdelivr.net/npm/onnxruntime-web@'+(lama?'1.31.1':'1.22.0')+'/dist/';
+    self.postMessage({progress:lama?'Preparando LaMa · unos 106 MB la primera vez…':'Preparando reconstrucción de detalle con FSRCNN…'});
+    const model=lama
+      ? await loadVerifiedModel('https://huggingface.co/HiggityPiggity/lama-onnx-fp16/resolve/feb119a90ac45e7648aa5976559d481a5e9a4a48/lama_fp16w.onnx',
+          'e631637d760e3fa708c059ebc304c66a4867f00ad0891cf4fc0849966a42ecab')
+      : await loadVerifiedModel(fsrcnnUrl,'422da1d606efa65c9a2db14d9dc3f641fd4cdd8a71a32ba1204e3dfb7d458bb4');
+    const adapter=await navigator.gpu?.requestAdapter().catch(()=>null);
+    const backends=adapter ? ['webgpu','wasm'] : ['wasm'];
+    for(const backend of backends){
+      let session;
+      try {
+        const ort=await import(runtime+(backend==='webgpu'?'ort.webgpu.min.mjs':'ort.wasm.min.mjs'));
+        ort.env.wasm.wasmPaths=runtime;
+        ort.env.wasm.numThreads=1;
+        if(backend==='webgpu') ort.env.webgpu.adapter=adapter;
+        session=await ort.InferenceSession.create(model,{executionProviders:[backend]});
+        ctx.clearRect(0,0,width,height);
+        ctx.drawImage(bitmap,0,0);
+        if(lama) await repairWithLama(ctx,bitmap,area,strokes,ort,session);
+        else await repairDetail(ctx,bitmap,area,strokes,ort,session);
+        return {image:await canvas.convertToBlob({type:'image/png'}),backend};
+      } catch(error) {
+        if(backend==='wasm') throw error;
+        self.postMessage({progress:'WebGPU no pudo terminar. Continuando en CPU/WASM…'});
+      } finally { await session?.release(); }
+    }
+  } finally {
+    bitmap.close();
+  }
+}
+
+self.onmessage = async ({data: {cutout, background, strokes, original, generate, currentComposition, mesh, catalogBackground, standalonePhoto, frameExtension, repair}}) => {
   let subject, backdrop, originalPhoto, current;
   try {
+    if (repair) {
+      self.postMessage(await repairSelection(repair));
+      return;
+    }
     if (frameExtension) {
       self.postMessage({image:await extendFrame(frameExtension.photo,frameExtension.known)});
       return;
@@ -3045,6 +3219,8 @@ const markHair = document.querySelector('#mark-hair');
 const clearHair = document.querySelector('#clear-hair');
 const applyHair = document.querySelector('#apply-hair');
 const generateHair = document.querySelector('#generate-hair');
+const repairDetailButton=document.querySelector('#repair-detail');
+const repairLamaButton=document.querySelector('#repair-lama');
 const guideCanvas = document.querySelector('#hair-guide');
 let strokes = [];
 let activeStroke;
@@ -3058,10 +3234,12 @@ const openOriginalEdge = document.querySelector('#open-original-edge');
 
 function refreshHairControls() {
   markHair.setAttribute('aria-pressed', String(marking));
-  markHair.textContent = marking ? 'Terminar de marcar' : 'Marcar cabello';
+  markHair.textContent = marking ? 'Terminar de marcar' : 'Marcar área';
   guideCanvas.hidden = !marking;
   clearHair.disabled = composing || !strokes.length;
   generateHair.disabled = composing || !strokes.length;
+  repairDetailButton.disabled=repairLamaButton.disabled=editorBusy || generateHair.disabled ||
+    !(composedResult || (standaloneEdge && activeEditingBlob()));
   applyHair.disabled = standaloneEdge || generateHair.disabled;
   applyHair.hidden = standaloneEdge;
   markHair.disabled = composing;
@@ -3258,6 +3436,50 @@ function showComposition(image,cleanImage) {
   composite.closest('figure').hidden = false;
   saveComposite.href = compositeUrl;
   saveComposite.hidden = false;
+}
+repairDetailButton.onclick=()=>applySelectionRepair('detail');
+repairLamaButton.onclick=()=>applySelectionRepair('lama');
+
+async function applySelectionRepair(mode) {
+  const photo=composedResult || (standaloneEdge ? activeEditingBlob() : undefined);
+  if (editorBusy || !photo || !strokes.length) return;
+  const selection=strokes.slice();
+  composing=true;
+  marking=false;
+  busy(true);
+  refreshHairControls();
+  composeStatus.textContent='Preparando el área marcada…';
+  const url=URL.createObjectURL(new Blob([modelWorkerCode('compose-worker')],{type:'text/javascript'}));
+  let worker,timeout;
+  try {
+    worker=new Worker(url,{type:'module'});
+    const {image,backend}=await new Promise((resolve,reject)=>{
+      worker.onmessage=({data})=>{
+        if(data.progress) composeStatus.textContent=data.progress;
+        else if(data.image) resolve(data);
+        else reject(Error(data.error || 'El modelo no devolvió una imagen.'));
+      };
+      worker.onerror=()=>reject(Error('El navegador interrumpió el modelo.'));
+      timeout=setTimeout(()=>reject(Error('La edición superó el tiempo límite.')),300000);
+      worker.postMessage({repair:{photo,strokes:selection,mode,
+        fsrcnnUrl:new URL('models/fsrcnn-x2.onnx',document.baseURI).href}});
+    });
+    strokes=[];
+    showComposition(image,image);
+    composeStatus.textContent=(mode==='lama' ? 'Área rellenada con LaMa' : 'Detalle reconstruido con FSRCNN')+
+      ' · '+(backend==='webgpu' ? 'WebGPU' : 'CPU/WASM')+'. Podés guardar o descargar el resultado.';
+  } catch(error) {
+    composeStatus.textContent=error.message;
+    marking=true;
+  } finally {
+    clearTimeout(timeout);
+    worker?.terminate();
+    URL.revokeObjectURL(url);
+    composing=false;
+    busy(false);
+    refreshHairControls();
+    requestAnimationFrame(drawStrokes);
+  }
 }
 async function composeBackground(selectedStrokes, generate = false, currentComposition) {
   composing = true;
@@ -3778,6 +4000,7 @@ function busy(value) {
   background.disabled = catalogBackground.disabled = value;
   refreshMeshControls();
   refreshComposeControls();
+  refreshHairControls();
   picker.disabled = value;
   cut.disabled = value || !workingPhoto;
   cutCpu.disabled = cut.disabled;
@@ -4006,8 +4229,47 @@ async function loadVerifiedModel(url,expected) {
   return bytes;
 }
 
+function fsrcnnLuma(r,g,b) {
+  return 0.299*r+0.587*g+0.114*b;
+}
+
+async function fsrcnnTile(ort,session,rgba,w,h,insetX,insetY,tile) {
+  const plane=w*h;
+  const luma=new Float32Array(plane);
+  for (let i=0;i<plane;i++) luma[i]=fsrcnnLuma(rgba[4*i],rgba[4*i+1],rgba[4*i+2])/255;
+  const input=new ort.Tensor('float32',luma,[1,1,h,w]);
+  let predictions;
+  try {
+    predictions=await session.run({luma:input});
+    const prediction=predictions.phases;
+    const data=prediction.location==='cpu' ? prediction.data : await prediction.getData();
+    if (prediction.dims.join(',')!==[1,4,h,w].join(',') || !data.every(Number.isFinite)) {
+      throw Error('FSRCNN devolvió un bloque inválido.');
+    }
+    for (let dy=0;dy<tile.height;dy++) {
+      for (let dx=0;dx<tile.width;dx++) {
+        const phase=(dy%2)*2+dx%2;
+        const lumaIndex=(insetY+(dy>>1))*w+insetX+(dx>>1);
+        const i=(dy*tile.width+dx)*4;
+        if (!tile.data[i+3]) continue;
+        const r=tile.data[i],g=tile.data[i+1],b=tile.data[i+2];
+        const delta=data[phase*plane+lumaIndex]*255-fsrcnnLuma(r,g,b);
+        const bounded=Math.max(-Math.min(r,g,b),Math.min(255-Math.max(r,g,b),delta));
+        tile.data[i]=r+bounded;
+        tile.data[i+1]=g+bounded;
+        tile.data[i+2]=b+bounded;
+      }
+    }
+  } finally {
+    input.dispose();
+    for (const tensor of Object.values(predictions || {})) tensor.dispose();
+  }
+}
+
 function modelWorkerCode(id) {
-  return loadVerifiedModel.toString()+'\n'+document.getElementById(id).textContent;
+  const helpers=[loadVerifiedModel];
+  if (id==='restore-worker' || id==='compose-worker') helpers.push(fsrcnnLuma,fsrcnnTile);
+  return helpers.map(helper=>helper.toString()).join('\n')+'\n'+document.getElementById(id).textContent;
 }
 
 let workspaceTab = 'frame';
